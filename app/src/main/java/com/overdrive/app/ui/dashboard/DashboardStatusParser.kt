@@ -101,8 +101,8 @@ object DashboardStatusParser {
             return DashboardStatusResult.Loading
         }
 
-        val soc = root.optJSONObject("soc")
-            ?.finiteDouble("percent")
+        val soc = (root.optJSONObject("soc")?.finiteDouble("percent")
+            ?: root.optJSONObject("battery")?.finiteDouble("soc"))
             ?.takeIf { it in 0.0..100.0 }
 
         val rangeObject = root.optJSONObject("range")
@@ -139,7 +139,7 @@ object DashboardStatusParser {
         val gps = root.optJSONObject("gps")
         val speedKmh = gps?.finiteDouble("speed")?.let { it * 3.6 }?.takeIf { it >= 0.0 }
 
-        val hasVehicleData = soc != null || distance != null || charging != null
+        val hasVehicleData = soc != null || distance != null || charging != null || isAccOn || isGpuSurveillance || gear != null || speedKmh != null
         if (!hasVehicleData) {
             return DashboardStatusResult.Unavailable(
                 DashboardStatusResult.Reason.VEHICLE_DATA_UNAVAILABLE

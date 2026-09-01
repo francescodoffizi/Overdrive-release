@@ -27,7 +27,13 @@ struct FrameHeader {
 };
 
 static void* g_windows[MAX_CAMERAS] = { NULL, NULL, NULL, NULL };
+static void* g_handles[MAX_CAMERAS] = { NULL, NULL, NULL, NULL };
+static std::atomic<int> g_latest_buf_idx[MAX_CAMERAS]{0, 0, 0, 0};
+static std::atomic<uint64_t> g_frame_counter[MAX_CAMERAS]{0, 0, 0, 0};
 static int g_num_windows = 0;
+
+typedef int (*release_frame_fn)(void* hndl, uint32_t idx);
+static release_frame_fn real_release_frame = NULL;
 
 static int g_server_fd = -1;
 static int g_clients[MAX_CLIENTS];
@@ -133,7 +139,6 @@ static void compose_2x2_mosaic(const uint8_t* cam0, const uint8_t* cam1, const u
 static void* dma_streamer_thread(void* arg) {
     printf("[Hook] DMA streamer thread started (30 FPS target)\n");
     const uint64_t target_frame_period_ns = 33333333ULL; // 30.0 FPS
-    int s_idx = 0;
     uint64_t last_fps_log_ns = get_monotonic_time_ns();
     int frames_sent_count = 0;
 
@@ -149,8 +154,6 @@ static void* dma_streamer_thread(void* arg) {
         }
 
         if (active_clients > 0 && g_num_windows > 0) {
-            s_idx++;
-            int buf_idx = s_idx % 5;
             bool mosaic_built = false;
 
             for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -169,18 +172,19 @@ static void* dma_streamer_thread(void* arg) {
                 void* send_payload = NULL;
 
                 if (target_mode == 4) {
-                    // 2x2 Mosaic
+                    // 2x2 Mosaic: compose using the latest available buffer for each camera
                     if (!mosaic_built) {
-                        const uint8_t* c0 = (const uint8_t*)get_cam_vaddr(0, buf_idx);
-                        const uint8_t* c1 = (const uint8_t*)get_cam_vaddr(1, buf_idx);
-                        const uint8_t* c2 = (const uint8_t*)get_cam_vaddr(2, buf_idx);
-                        const uint8_t* c3 = (const uint8_t*)get_cam_vaddr(3, buf_idx);
+                        const uint8_t* c0 = (const uint8_t*)get_cam_vaddr(0, g_latest_buf_idx[0].load(std::memory_order_relaxed));
+                        const uint8_t* c1 = (const uint8_t*)get_cam_vaddr(1, g_latest_buf_idx[1].load(std::memory_order_relaxed));
+                        const uint8_t* c2 = (const uint8_t*)get_cam_vaddr(2, g_latest_buf_idx[2].load(std::memory_order_relaxed));
+                        const uint8_t* c3 = (const uint8_t*)get_cam_vaddr(3, g_latest_buf_idx[3].load(std::memory_order_relaxed));
                         compose_2x2_mosaic(c0, c1, c2, c3);
                         mosaic_built = true;
                     }
                     send_payload = g_mosaic_buf;
                 } else {
                     // Single camera
+                    int buf_idx = g_latest_buf_idx[target_mode].load(std::memory_order_relaxed);
                     send_payload = get_cam_vaddr(target_mode, buf_idx);
                 }
 
@@ -211,7 +215,10 @@ static void* dma_streamer_thread(void* arg) {
         if (frame_start_ns - last_fps_log_ns >= 3000000000ULL) {
             double secs = (double)(frame_start_ns - last_fps_log_ns) / 1000000000.0;
             double fps = (double)frames_sent_count / secs;
-            printf("[Hook] Emitting Real-Time Stream: %.1f FPS (sent %d frames in %.1fs)\n", fps, frames_sent_count, secs);
+            printf("[Hook] Emitting Real-Time Stream: %.1f FPS (sent %d frames in %.1fs, cam0_frames=%llu, cam1_frames=%llu)\n",
+                   fps, frames_sent_count, secs,
+                   (unsigned long long)g_frame_counter[0].load(std::memory_order_relaxed),
+                   (unsigned long long)g_frame_counter[1].load(std::memory_order_relaxed));
             frames_sent_count = 0;
             last_fps_log_ns = frame_start_ns;
         }
@@ -320,9 +327,41 @@ extern "C" int _Z21test_util_init_windowP16test_util_ctxt_tPP18test_util_window_
     return res;
 }
 
-// Bypass display posting in qcarcam_test to eliminate 100% of GPU/SurfaceFlinger rendering overhead
+// Bypass display posting in qcarcam_test to eliminate 100% of GPU/SurfaceFlinger rendering overhead,
+// while properly releasing the ISP buffer back to QCarCam to prevent frame starvation / freezing.
 extern "C" int _Z28test_util_post_window_bufferP16test_util_ctxt_tP18test_util_window_tjPNSt3__14listIjNS3_9allocatorIjEEEE15qcarcam_field_t(
     void* ctxt, void* window, uint32_t buf_idx, void* p_list, int field_t) {
+
+    if (!real_release_frame) {
+        real_release_frame = (release_frame_fn)dlsym(RTLD_NEXT, "qcarcam_release_frame");
+        if (!real_release_frame) {
+            void* ais_lib = dlopen("libais_client.so", RTLD_NOW);
+            if (!ais_lib) ais_lib = dlopen("/vendor/lib64/libais_client.so", RTLD_NOW);
+            if (ais_lib) real_release_frame = (release_frame_fn)dlsym(ais_lib, "qcarcam_release_frame");
+        }
+    }
+
+    void* hndl = NULL;
+    int cam_idx = -1;
+    pthread_mutex_lock(&g_mutex);
+    for (int c = 0; c < MAX_CAMERAS; c++) {
+        if (g_windows[c] == window) {
+            hndl = g_handles[c];
+            cam_idx = c;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex);
+
+    if (cam_idx >= 0) {
+        g_latest_buf_idx[cam_idx].store((int)buf_idx, std::memory_order_relaxed);
+        g_frame_counter[cam_idx].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (hndl && real_release_frame) {
+        real_release_frame(hndl, buf_idx);
+    }
+
     return 0; // Skip display blitting completely!
 }
 
@@ -333,6 +372,11 @@ extern "C" void* qcarcam_open(uint32_t input_id) {
     if (!real_open) real_open = (open_fn)dlsym(RTLD_NEXT, "qcarcam_open");
     void* res = real_open ? real_open(input_id) : NULL;
     printf("[Hook] qcarcam_open(input_id=%u) -> %p\n", input_id, res);
+    if (input_id < MAX_CAMERAS) {
+        pthread_mutex_lock(&g_mutex);
+        g_handles[input_id] = res;
+        pthread_mutex_unlock(&g_mutex);
+    }
     return res;
 }
 
@@ -382,5 +426,17 @@ extern "C" int qcarcam_get_frame(void* hndl, void* p_info, uint64_t timeout, uin
     if (timeout < 25000000ULL) {
         timeout = 33333333ULL; // 33.3ms (30 FPS)
     }
-    return real_get_frame ? real_get_frame(hndl, p_info, timeout, flags) : -1;
+    int res = real_get_frame ? real_get_frame(hndl, p_info, timeout, flags) : -1;
+    if (res == 0 && p_info) {
+        uint32_t* p_u32 = (uint32_t*)p_info;
+        uint32_t buf_idx = p_u32[0]; // idx is first field in qcarcam_frame_info_t
+        for (int c = 0; c < MAX_CAMERAS; c++) {
+            if (g_handles[c] == hndl) {
+                g_latest_buf_idx[c].store((int)buf_idx, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+    return res;
 }
+

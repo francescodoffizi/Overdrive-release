@@ -135,6 +135,9 @@ public class GearMonitor {
             if (!isValidGearMode(initialGearRead)) {
                 initialGearRead = readFromBydDataCollector();
             }
+            if (!isValidGearMode(initialGearRead) && com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                initialGearRead = readGearFromDumpsys();
+            }
             if (!isValidGearMode(initialGearRead)) {
                 initialGearRead = GEAR_P; // Safe fallback
             }
@@ -201,6 +204,15 @@ public class GearMonitor {
                                         if (isValidGearMode(g)) gear = g;
                                     }
                                 } catch (Throwable ignored) {}
+                            }
+                        }
+
+                        // 5. DiLink 5.0 HAL property / dumpsys fallback
+                        if (!isValidGearMode(gear) && com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                            int g = readGearFromDumpsys();
+                            if (isValidGearMode(g)) {
+                                gear = g;
+                                gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
                             }
                         }
 
@@ -315,6 +327,67 @@ public class GearMonitor {
             }
         } catch (Throwable ignored) {}
         return -1;
+    }
+
+    private volatile long lastDumpsysReadTime = 0;
+    private volatile int lastDumpsysGear = -1;
+
+    private int readGearFromDumpsys() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastDumpsysReadTime < 250 && isValidGearMode(lastDumpsysGear)) {
+            return lastDumpsysGear;
+        }
+        try {
+            // 1. First try CarPropertyBridge if available
+            try {
+                com.overdrive.app.byd.CarPropertyBridge bridge = com.overdrive.app.byd.CarPropertyBridge.getInstance();
+                if (bridge != null) {
+                    com.overdrive.app.byd.CarPropertyBridge.ReadResult rr = bridge.readProperty("SHIFT_MODE");
+                    if (rr != null && rr.success && rr.intValue != null) {
+                        int shift = rr.intValue;
+                        int decoded = decodeShiftMode(shift);
+                        if (isValidGearMode(decoded)) {
+                            lastDumpsysReadTime = now;
+                            lastDumpsysGear = decoded;
+                            return decoded;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            // 2. Fallback: dumpsys car_service
+            String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
+                "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
+            if (propDump != null && !propDump.isEmpty()) {
+                if (propDump.contains("0x21406407") || propDump.contains("0x21403a06") || propDump.contains("0x21403a0a")) {
+                    int decoded = -1;
+                    if (propDump.contains("int32Values: [4]")) decoded = GEAR_D;
+                    else if (propDump.contains("int32Values: [2]")) decoded = GEAR_R;
+                    else if (propDump.contains("int32Values: [3]")) decoded = GEAR_N;
+                    else if (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [0]")) decoded = GEAR_P;
+                    
+                    if (isValidGearMode(decoded)) {
+                        lastDumpsysReadTime = now;
+                        lastDumpsysGear = decoded;
+                        return decoded;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static int decodeShiftMode(int shift) {
+        switch (shift) {
+            case 0:
+            case 1: return GEAR_P;
+            case 2: return GEAR_R;
+            case 3: return GEAR_N;
+            case 4: return GEAR_D;
+            case 5: return GEAR_M;
+            case 6: return GEAR_S;
+            default: return -1;
+        }
     }
     
     /**

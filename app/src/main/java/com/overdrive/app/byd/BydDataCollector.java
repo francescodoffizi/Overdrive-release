@@ -1927,6 +1927,28 @@ public class BydDataCollector {
                 }
             } catch (Throwable t) { logger.debug("readGearNow error: " + t.getMessage()); }
         }
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            int dumpsysGear = readGearFromDumpsys();
+            if (dumpsysGear != BydVehicleData.UNAVAILABLE && dumpsysGear >= 1 && dumpsysGear <= 7) {
+                return dumpsysGear;
+            }
+        }
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    private int readGearFromDumpsys() {
+        try {
+            String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
+                "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
+            if (propDump != null && !propDump.isEmpty()) {
+                if (propDump.contains("0x21406407") || propDump.contains("0x21403a06") || propDump.contains("0x21403a0a")) {
+                    if (propDump.contains("int32Values: [4]")) return 4; // GEAR_D
+                    if (propDump.contains("int32Values: [2]")) return 2; // GEAR_R
+                    if (propDump.contains("int32Values: [3]")) return 3; // GEAR_N
+                    if (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [0]")) return 1; // GEAR_P
+                }
+            }
+        } catch (Throwable ignored) {}
         return BydVehicleData.UNAVAILABLE;
     }
 

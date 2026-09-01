@@ -761,9 +761,21 @@ public class TelemetryDataCollector {
                     lastGearValid = true;
                     lastGearReadElapsedRealtimeMs =
                             pollElapsedRealtimeMs;
+                    gearAcquired = true;
                 }
             } catch (Exception e) {
                 logger.warn("Failed to read gear mode: " + e.getMessage());
+            }
+        }
+
+        if (!gearAcquired && com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            int candidate = readGearFromDumpsys();
+            if (isValidGearMode(candidate)) {
+                gearMode = candidate;
+                lastGearMode = candidate;
+                lastGearValid = true;
+                lastGearReadElapsedRealtimeMs = pollElapsedRealtimeMs;
+                gearAcquired = true;
             }
         }
 
@@ -1447,6 +1459,36 @@ public class TelemetryDataCollector {
         if (seatbeltAlarmDevice == null) {
             logger.warn("No working seatbelt API found — seatbelt status will show as buckled");
         }
+    }
+
+    private volatile long lastDumpsysReadTime = 0;
+    private volatile int lastDumpsysGear = -1;
+
+    private int readGearFromDumpsys() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastDumpsysReadTime < 500 && isValidGearMode(lastDumpsysGear)) {
+            return lastDumpsysGear;
+        }
+        try {
+            String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
+                "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
+            if (propDump != null && !propDump.isEmpty()) {
+                if (propDump.contains("0x21406407") || propDump.contains("0x21403a06") || propDump.contains("0x21403a0a")) {
+                    int decoded = -1;
+                    if (propDump.contains("int32Values: [4]")) decoded = 4; // GEAR_D
+                    else if (propDump.contains("int32Values: [2]")) decoded = 2; // GEAR_R
+                    else if (propDump.contains("int32Values: [3]")) decoded = 3; // GEAR_N
+                    else if (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [0]")) decoded = 1; // GEAR_P
+                    
+                    if (isValidGearMode(decoded)) {
+                        lastDumpsysReadTime = now;
+                        lastDumpsysGear = decoded;
+                        return decoded;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
     }
 
     /**

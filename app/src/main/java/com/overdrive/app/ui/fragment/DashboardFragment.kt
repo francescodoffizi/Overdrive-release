@@ -520,6 +520,10 @@ class DashboardFragment : Fragment() {
         }
     }
 
+    private var consecutiveStatusFailures: Int = 0
+    private var cachedPersonalizedRange: String? = null
+    private var lastPersonalizedRangeFetchTime: Long = 0
+
     private fun refreshVehicleStatus(showLoading: Boolean) {
         if (showLoading && dashboardState.vehicle !is DashboardUiState.VehicleState.Ready) {
             dashboardState = DashboardStateReducer.statusLoading(dashboardState)
@@ -533,10 +537,27 @@ class DashboardFragment : Fragment() {
             val result = fetchVehicleStatus()
             mainHandler.post {
                 if (!isAdded || view == null || generation != viewGeneration) return@post
-                dashboardState = DashboardStateReducer.status(dashboardState, result)
-                renderVehicleState()
+                if (result is DashboardStatusResult.Available) {
+                    consecutiveStatusFailures = 0
+                    dashboardState = DashboardStateReducer.status(dashboardState, result)
+                    renderVehicleState()
+                } else if (result is DashboardStatusResult.Unavailable) {
+                    consecutiveStatusFailures += 1
+                    if (consecutiveStatusFailures >= 3 || dashboardState.vehicle !is DashboardUiState.VehicleState.Ready) {
+                        dashboardState = DashboardStateReducer.status(dashboardState, result)
+                        renderVehicleState()
+                    }
+                } else {
+                    dashboardState = DashboardStateReducer.status(dashboardState, result)
+                    renderVehicleState()
+                }
                 if (dashboardResumed) {
-                    mainHandler.postDelayed(statusRefreshRunnable, STATUS_REFRESH_MS)
+                    val nextDelay = if (dashboardState.vehicle is DashboardUiState.VehicleState.Ready) {
+                        STATUS_REFRESH_ACTIVE_MS
+                    } else {
+                        STATUS_REFRESH_IDLE_MS
+                    }
+                    mainHandler.postDelayed(statusRefreshRunnable, nextDelay)
                 }
             }
         }
@@ -557,7 +578,18 @@ class DashboardFragment : Fragment() {
                 )
             } else {
                 val body = conn.inputStream.bufferedReader().use { it.readText() }
-                DashboardStatusParser.parse(body, fetchPersonalizedRange())
+                val now = android.os.SystemClock.elapsedRealtime()
+                val rangeJson = if ((now - lastPersonalizedRangeFetchTime) > 60_000L || cachedPersonalizedRange == null) {
+                    val fetched = fetchPersonalizedRange()
+                    if (fetched != null) {
+                        cachedPersonalizedRange = fetched
+                        lastPersonalizedRangeFetchTime = now
+                    }
+                    fetched ?: cachedPersonalizedRange
+                } else {
+                    cachedPersonalizedRange
+                }
+                DashboardStatusParser.parse(body, rangeJson)
             }
         } catch (_: Throwable) {
             DashboardStatusResult.Unavailable(
@@ -1810,7 +1842,8 @@ class DashboardFragment : Fragment() {
         private const val STATE_AI_INSIGHT_EXPANDED =
             "dashboard.ai_insight_expanded"
         private const val STATE_SELECTED_TUNNEL = "dashboard.selected_tunnel"
-        private const val STATUS_REFRESH_MS = 15_000L
+        private const val STATUS_REFRESH_ACTIVE_MS = 1_000L
+        private const val STATUS_REFRESH_IDLE_MS = 5_000L
         private const val RECORDING_STATS_RETRY_MS = 1_500L
         private const val MAX_RECORDING_STATS_RETRIES = 3
         private const val STATUS_CONNECT_TIMEOUT_MS = 2_000
