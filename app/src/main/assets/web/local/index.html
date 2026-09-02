@@ -1921,50 +1921,42 @@
                         }
                     }
 
-                    // Climate — AC state · fan state · temperature, dot-separated.
-                    // Temperature shows a single value when driver/passenger
-                    // setpoints match (or only one side is known), and splits
-                    // to "D../P.." when they genuinely differ. Falls back to
-                    // cabin ambient temp if neither setpoint is available.
+                    // Climate — AC state · fan/temperature, dot-separated.
+                    // Fan speed is the actual signal for whether climate is
+                    // "on" (the AC switch can read on while idle, e.g. an
+                    // auto-mode cycle with no air moving):
+                    //  - fan > 0: "AC on · Fan {n} · {driver set temp}"
+                    //  - fan == 0 (or unknown): "AC off" only — no temp,
+                    //    a setpoint isn't meaningful when nothing's blowing
+                    //    and cabin ambient temp isn't reliably available.
                     if (data.climate) {
                         var remoteKnown = typeof data.climate.remoteClimateActive === 'boolean';
                         var localKnown = typeof data.climate.acOn === 'boolean';
                         var climateKnown = remoteKnown || localKnown;
-                        var acOn = data.climate.remoteClimateActive === true
-                            || data.climate.acOn === true;
-                        panel.classList.toggle('ac-on', acOn);
+
+                        var fanLevel = data.climate.fanLevel;
+                        var fanKnown = typeof fanLevel === 'number' && fanLevel >= 0;
+                        var fanOn = fanKnown && fanLevel > 0;
+                        panel.classList.toggle('ac-on', fanOn);
 
                         var climParts = [];
                         climParts.push(climateKnown
-                            ? (acOn
+                            ? (fanOn
                                 ? (BYD.i18n.t('dashboard.glance_ac_on') || 'AC on')
                                 : (BYD.i18n.t('dashboard.glance_ac_off') || 'AC off'))
                             : '--');
 
-                        var fanLevel = data.climate.fanLevel;
-                        if (typeof fanLevel === 'number' && fanLevel >= 0) {
+                        if (fanOn) {
                             climParts.push((BYD.i18n.t('dashboard.glance_fan') || 'Fan') + ' ' + fanLevel);
-                        }
 
-                        var dTemp = data.climate.driverTempSetC;
-                        var pTemp = data.climate.passengerTempSetC;
-                        var dTempKnown = typeof dTemp === 'number' && dTemp > 0;
-                        var pTempKnown = typeof pTemp === 'number' && pTemp > 0;
-                        if (dTempKnown && pTempKnown && dTemp !== pTemp) {
-                            climParts.push('D' + Math.round(dTemp) + '°/P' + Math.round(pTemp) + '°C');
-                        } else if (dTempKnown) {
-                            climParts.push(Math.round(dTemp) + '°C');
-                        } else if (pTempKnown) {
-                            climParts.push(Math.round(pTemp) + '°C');
-                        } else {
-                            var insideTemp = data.climate.insideTempC;
-                            if (typeof insideTemp === 'number' && insideTemp > 0) {
-                                climParts.push(Math.round(insideTemp) + '°C');
+                            var dTemp = data.climate.driverTempSetC;
+                            if (typeof dTemp === 'number' && dTemp > 0) {
+                                climParts.push(Math.round(dTemp) + '°C');
                             }
                         }
 
                         setText('glClimateText', climParts.join(' · '));
-                        setRowState('glClimateText', climateKnown && acOn ? 'good' : '');
+                        setRowState('glClimateText', climateKnown && fanOn ? 'good' : '');
                     }
 
                     // Tyres — colour the wheels, print PSI at each corner,
