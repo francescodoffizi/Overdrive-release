@@ -54,68 +54,38 @@ public class DiLink5QCarCamBackend {
 
     private static synchronized void ensureHardwareProcess() {
         try {
-            // Check if qcarcam_test is already running
-            Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "qcarcam_test"});
+            // Check if fast_cam_capture is already running
+            Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "fast_cam_capture"});
             java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkPgrep.getInputStream()));
             String line = reader.readLine();
             checkPgrep.waitFor();
             if (line != null && !line.trim().isEmpty()) {
-                logger.info("Qualcomm QCarCam hardware pipeline already running (PID: " + line.trim() + ")");
+                logger.info("Qualcomm fast_cam_capture hardware pipeline already running (PID: " + line.trim() + ")");
                 return;
             }
 
-            logger.info("Starting Qualcomm QCarCam hardware capture supervisor...");
+            logger.info("Starting Qualcomm fast_cam_capture hardware capture supervisor...");
 
-            // Ensure 4cam.xml exists in /data/local/tmp
-            java.io.File cfgFile = new java.io.File("/data/local/tmp/4cam.xml");
-            if (!cfgFile.exists()) {
-                String defaultXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
-                        "<qcarcam_inputs>\n" +
-                        "    <input_device>\n" +
-                        "        <properties input_id=\"0\"/>\n" +
-                        "        <display_setting display_id=\"0\"/>\n" +
-                        "        <output_setting nbufs=\"5\"/>\n" +
-                        "    </input_device>\n" +
-                        "    <input_device>\n" +
-                        "        <properties input_id=\"1\"/>\n" +
-                        "        <display_setting display_id=\"0\"/>\n" +
-                        "        <output_setting nbufs=\"5\"/>\n" +
-                        "    </input_device>\n" +
-                        "    <input_device>\n" +
-                        "        <properties input_id=\"2\"/>\n" +
-                        "        <display_setting display_id=\"0\"/>\n" +
-                        "        <output_setting nbufs=\"5\"/>\n" +
-                        "    </input_device>\n" +
-                        "    <input_device>\n" +
-                        "        <properties input_id=\"3\"/>\n" +
-                        "        <display_setting display_id=\"0\"/>\n" +
-                        "        <output_setting nbufs=\"5\"/>\n" +
-                        "    </input_device>\n" +
-                        "</qcarcam_inputs>\n";
-                java.io.FileWriter writer = new java.io.FileWriter(cfgFile);
-                writer.write(defaultXml);
-                writer.close();
-            }
+            // Terminate any obsolete processes
+            try {
+                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "qcarcam_test"}).waitFor();
+                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"}).waitFor();
+            } catch (Throwable ignored) {}
 
-            // Ensure libhook_qcarcam.so exists in /data/local/tmp for LD_PRELOAD
-            String hookPath = "/data/local/tmp/libhook_qcarcam.so";
-            java.io.File hookFile = new java.io.File(hookPath);
-            if (!hookFile.exists() || hookFile.length() == 0) {
-                ensureHookLibraryExtracted(hookFile);
+            // Ensure fast_cam_capture binary exists in /data/local/tmp and is executable
+            String binPath = "/data/local/tmp/fast_cam_capture";
+            java.io.File binFile = new java.io.File(binPath);
+            if (!binFile.exists() || binFile.length() == 0) {
+                ensureDaemonBinaryExtracted(binFile);
             }
-            if (hookFile.exists()) {
-                hookFile.setReadable(true, false);
-                hookFile.setExecutable(true, false);
-            }
-
-            String qcarcamBin = "/data/local/tmp/qcarcam_test";
-            if (!new java.io.File(qcarcamBin).exists()) {
-                qcarcamBin = "/vendor/bin/qcarcam_test";
+            if (binFile.exists()) {
+                binFile.setReadable(true, false);
+                binFile.setExecutable(true, false);
             }
 
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "LD_PRELOAD=" + hookPath + " " + qcarcamBin + " -config=/data/local/tmp/4cam.xml"
+                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " --all"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();
@@ -126,21 +96,43 @@ public class DiLink5QCarCamBackend {
                 try (java.io.BufferedReader streamReader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream()))) {
                     String drainLine;
                     while ((drainLine = streamReader.readLine()) != null) {
-                        logger.info("[QCarCamProc] " + drainLine);
+                        logger.info("[FastCamProc] " + drainLine);
                     }
                 } catch (Throwable ignored) {}
-            }, "qcarcam-test-drainer");
+            }, "fast-cam-capture-drainer");
             drainer.setDaemon(true);
             drainer.start();
 
-            logger.info("Qualcomm QCarCam hardware pipeline started successfully via supervisor.");
+            logger.info("Qualcomm fast_cam_capture hardware pipeline started successfully via supervisor.");
         } catch (Throwable t) {
-            logger.error("Failed to start Qualcomm QCarCam hardware supervisor: " + t.getMessage(), t);
+            logger.error("Failed to start Qualcomm fast_cam_capture hardware supervisor: " + t.getMessage(), t);
         }
     }
 
-    private static void ensureHookLibraryExtracted(java.io.File dst) {
+    private static void ensureDaemonBinaryExtracted(java.io.File dst) {
         try {
+            // 0. Try standard Android Context assets if available
+            try {
+                android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                if (ctx != null) {
+                    try (java.io.InputStream in = ctx.getAssets().open("dilink5/fast_cam_capture");
+                         java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                        byte[] buf = new byte[8192];
+                        int len;
+                        while ((len = in.read(buf)) > 0) {
+                            out.write(buf, 0, len);
+                        }
+                        out.flush();
+                        dst.setReadable(true, false);
+                        dst.setExecutable(true, false);
+                        logger.info("Extracted fast_cam_capture from Context assets");
+                        return;
+                    }
+                }
+            } catch (Throwable t) {
+                logger.warn("Context assets extraction skipped: " + t.getMessage());
+            }
+
             // 1. Search via environment CLASSPATH (app_process daemon primary mechanism)
             String envClasspath = System.getenv("CLASSPATH");
             if (envClasspath != null && !envClasspath.isEmpty()) {
@@ -148,9 +140,8 @@ public class DiLink5QCarCamBackend {
                     if (cpEntry.endsWith(".apk") && (cpEntry.contains("com.overdrive.app") || new java.io.File(cpEntry).exists())) {
                         java.io.File apkFile = new java.io.File(cpEntry);
                         if (apkFile.exists() && apkFile.canRead()) {
-                            if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
-                                extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
-                                logger.info("Extracted libhook_qcarcam.so from CLASSPATH APK: " + cpEntry);
+                            if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
+                                logger.info("Extracted fast_cam_capture from CLASSPATH APK: " + cpEntry);
                                 return;
                             }
                         }
@@ -158,27 +149,16 @@ public class DiLink5QCarCamBackend {
                 }
             }
 
-            // 2. Check Context package code path / native library dir
+            // 2. Check Context package code path
             try {
                 android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
                 if (ctx != null) {
-                    if (ctx.getApplicationInfo() != null && ctx.getApplicationInfo().nativeLibraryDir != null) {
-                        java.io.File candidate = new java.io.File(ctx.getApplicationInfo().nativeLibraryDir, "libhook_qcarcam.so");
-                        if (candidate.exists() && candidate.length() > 0) {
-                            copyFile(candidate, dst);
-                            if (dst.exists() && dst.length() > 0) {
-                                logger.info("Copied libhook_qcarcam.so from nativeLibraryDir: " + candidate.getAbsolutePath());
-                                return;
-                            }
-                        }
-                    }
                     String pkgCodePath = ctx.getPackageCodePath();
                     if (pkgCodePath != null) {
                         java.io.File apkFile = new java.io.File(pkgCodePath);
                         if (apkFile.exists() && apkFile.canRead()) {
-                            if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
-                                extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
-                                logger.info("Extracted libhook_qcarcam.so from Context package code path: " + pkgCodePath);
+                            if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
+                                logger.info("Extracted fast_cam_capture from Context package code path: " + pkgCodePath);
                                 return;
                             }
                         }
@@ -199,9 +179,8 @@ public class DiLink5QCarCamBackend {
                             String apkPath = line.substring("package:".length()).trim();
                             java.io.File apkFile = new java.io.File(apkPath);
                             if (apkFile.exists() && apkFile.canRead()) {
-                                if (extractFromZip(apkFile, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
-                                    extractFromZip(apkFile, "lib/arm64/libhook_qcarcam.so", dst)) {
-                                    logger.info("Extracted libhook_qcarcam.so from pm path: " + apkPath);
+                                if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
+                                    logger.info("Extracted fast_cam_capture from pm path: " + apkPath);
                                     return;
                                 }
                             }
@@ -218,7 +197,7 @@ public class DiLink5QCarCamBackend {
             if (dataApp.exists() && dataApp.isDirectory()) {
                 findAndExtractInDir(dataApp, dst, 0, 3);
                 if (dst.exists() && dst.length() > 0) {
-                    logger.info("Extracted libhook_qcarcam.so via /data/app recursive scan");
+                    logger.info("Extracted fast_cam_capture via /data/app recursive scan");
                     return;
                 }
             }
@@ -228,16 +207,15 @@ public class DiLink5QCarCamBackend {
             if (propClasspath != null && !propClasspath.isEmpty()) {
                 for (String cpEntry : propClasspath.split(":")) {
                     if (cpEntry.endsWith(".apk") && new java.io.File(cpEntry).exists()) {
-                        if (extractFromZip(new java.io.File(cpEntry), "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
-                            extractFromZip(new java.io.File(cpEntry), "lib/arm64/libhook_qcarcam.so", dst)) {
-                            logger.info("Extracted libhook_qcarcam.so from java.class.path: " + cpEntry);
+                        if (extractFromZip(new java.io.File(cpEntry), "assets/dilink5/fast_cam_capture", dst)) {
+                            logger.info("Extracted fast_cam_capture from java.class.path: " + cpEntry);
                             return;
                         }
                     }
                 }
             }
         } catch (Throwable t) {
-            logger.warn("ensureHookLibraryExtracted failed: " + t.getMessage());
+            logger.warn("ensureDaemonBinaryExtracted failed: " + t.getMessage());
         }
     }
 
@@ -247,17 +225,9 @@ public class DiLink5QCarCamBackend {
         if (files == null) return false;
         for (java.io.File f : files) {
             if (f.isDirectory()) {
-                if (f.getName().equals("lib") || f.getName().equals("arm64") || f.getName().equals("arm64-v8a")) {
-                    java.io.File candidate = new java.io.File(f, "libhook_qcarcam.so");
-                    if (candidate.exists() && candidate.length() > 0) {
-                        copyFile(candidate, dst);
-                        if (dst.exists() && dst.length() > 0) return true;
-                    }
-                }
                 if (findAndExtractInDir(f, dst, depth + 1, maxDepth)) return true;
             } else if (f.getName().endsWith(".apk") && f.getAbsolutePath().contains("com.overdrive.app")) {
-                if (extractFromZip(f, "lib/arm64-v8a/libhook_qcarcam.so", dst) ||
-                    extractFromZip(f, "lib/arm64/libhook_qcarcam.so", dst)) {
+                if (extractFromZip(f, "assets/dilink5/fast_cam_capture", dst)) {
                     return true;
                 }
             }
@@ -329,8 +299,9 @@ public class DiLink5QCarCamBackend {
                 sHardwareProcess.destroy();
                 sHardwareProcess = null;
             }
+            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"});
             Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "qcarcam_test"});
-            logger.info("Qualcomm QCarCam hardware supervisor stopped.");
+            logger.info("Qualcomm fast_cam_capture hardware supervisor stopped.");
         } catch (Throwable t) {
             logger.warn("Error stopping hardware supervisor: " + t.getMessage());
         }

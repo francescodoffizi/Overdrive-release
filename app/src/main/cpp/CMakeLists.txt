@@ -47,6 +47,17 @@ else()
     set(OPENCV_AVAILABLE FALSE)
 endif()
 
+# ==================== FastCamClient Precompiled Client ====================
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    add_library(fast_cam_client SHARED IMPORTED)
+    set_target_properties(fast_cam_client PROPERTIES
+        IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libfast_cam_client.so"
+    )
+    set(FAST_CAM_AVAILABLE TRUE)
+else()
+    set(FAST_CAM_AVAILABLE FALSE)
+endif()
+
 # ==================== Surveillance Library ====================
 set(SURVEILLANCE_SOURCES
     surveillance/native_motion.cpp
@@ -65,10 +76,15 @@ target_include_directories(surveillance PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/surveillance
     ${CMAKE_SOURCE_DIR}/camera
+    ${CMAKE_SOURCE_DIR}/include
 )
 
 # Base libraries — `EGL` and `GLESv2` added for HardwareBufferTextureBinder.
 set(SURVEILLANCE_LIBS android log m EGL GLESv2)
+
+if(FAST_CAM_AVAILABLE)
+    list(APPEND SURVEILLANCE_LIBS fast_cam_client)
+endif()
 
 # Add OpenCV if available
 if(OPENCV_AVAILABLE)
@@ -149,23 +165,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/od/od.cpp)
 else()
     message(STATUS "od/od.cpp not present — skipping 'od' target; prebuilt libod.so in jniLibs/ is used at runtime.")
 endif()
-
-# ==================== DiLink 5 Camera Sidecar Executable & Hook ====================
-add_executable(dilink5_cam_sidecar
-    camera/dilink5_cam_sidecar.cpp
-)
-target_link_libraries(dilink5_cam_sidecar
-    dl
-    log
-)
-
-add_library(hook_qcarcam SHARED
-    camera/hook_qcarcam.cpp
-)
-target_link_libraries(hook_qcarcam
-    dl
-    log
-)
 
 # ==================== NEON SIMD Optimization ====================
 # Enable NEON for ARM architectures
