@@ -652,6 +652,33 @@ public class VehicleControlApiHandler {
             }
         }
 
+        // car_service (dumpsys) fallback for the base layer above. Only engages when
+        // BOTH: (a) BYD cloud telemetry merge is off (cloudDataMerge — the same
+        // Settings toggle CarSvcTelemetry.isCloudEnabled() reads), so it can never
+        // fight the cloud overlay logic below, and (b) the local SDK array just above
+        // produced nothing usable. CarSvcTelemetry.doorsArray() itself no-ops (all -1)
+        // off the DiLink5/Sealion7 platform this was verified on, so on every other
+        // platform/config this block is a pure no-op — see CarSvcTelemetry's own
+        // platform gate. Raw car_service door-lock encoding (2=locked, 1=unlocked)
+        // matches BYD cloud's per-door semantics exactly, so we translate through the
+        // SAME cloudLockToApi() helper the cloud overlay below already uses, rather
+        // than duplicating that mapping.
+        if (sdkOverall == -1 && !com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.isCloudEnabled()) {
+            int[] carSvcRaw = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.doorsArray();
+            // carSvcRaw = [rf, lf, rr, lr, trunk, hood, overall] (raw car_service encoding)
+            int carSvcOverall = cloudLockToApi(carSvcRaw[6]);
+            if (carSvcOverall == 1 || carSvcOverall == 2) {
+                doors.put("rf", cloudLockToApi(carSvcRaw[0]));
+                doors.put("lf", cloudLockToApi(carSvcRaw[1]));
+                doors.put("rr", cloudLockToApi(carSvcRaw[2]));
+                doors.put("lr", cloudLockToApi(carSvcRaw[3]));
+                doors.put("overall", carSvcOverall);
+                sdkOverall = carSvcOverall;
+                doors.put("source", "carsvc");
+                doors.put("scope", "vehicle");
+            }
+        }
+
         // Track which source authoritatively set LF so we can derive `overall`
         // correctly when cloud is missing. -1 = no authoritative LF yet.
         int otaLf = -1;
