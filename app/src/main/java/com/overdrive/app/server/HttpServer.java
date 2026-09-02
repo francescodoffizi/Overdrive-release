@@ -1378,8 +1378,30 @@ public class HttpServer {
         // Recording mode details (for status overlay)
         try {
             JSONObject recordingStatus = new JSONObject();
+            // Always-live 12V reading, no staleness/caching layer (unlike the
+            // BatteryMonitor-backed "battery" block below, whose 30s update
+            // gate + 60s staleness cutoff cause a fresh/stale flicker on a
+            // platform that only has this car_service source). Unconditional
+            // (not inside the rmm != null branch below) since it doesn't
+            // depend on RecordingModeManager at all. -1 when unavailable
+            // (including simply not being on the DiLink5 platform
+            // CarSvcTelemetry targets) — the web UI falls back to the
+            // "battery" block in that case.
+            recordingStatus.put("voltage12v",
+                    (double) com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.batteryVoltage12v());
             com.overdrive.app.recording.RecordingModeManager rmm = CameraDaemon.getRecordingModeManager();
             if (rmm != null) {
+                // car_service (dumpsys) gear fallback — no-op everywhere except the
+                // DiLink5 platform this was verified on (see CarSvcTelemetry). On
+                // platforms where the vendor gearbox HAL is dead, this corrects the
+                // upstream gear value RecordingModeManager already trusts before we
+                // read it below, so gearToString (and DRIVE_MODE's own gear gate)
+                // pick it up with zero further changes. onGearChanged() is
+                // idempotent — a no-op when the gear hasn't actually changed.
+                int carSvcGear = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.gearValue();
+                if (carSvcGear >= 1) {
+                    rmm.onGearChanged(carSvcGear);
+                }
                 recordingStatus.put("configuredMode", rmm.getCurrentMode().name());
                 recordingStatus.put("isRecording", pipeline != null && pipeline.isRecording());
                 recordingStatus.put("pipelineRunning", pipeline != null && pipeline.isRunning());
