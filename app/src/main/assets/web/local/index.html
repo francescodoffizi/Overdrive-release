@@ -2500,6 +2500,29 @@
                 setChip('dashSurvChip', survLabel, status.gpuSurveillance ? 'good' : '');
                 setText('dashAcc', tOnOff(driveState.powerOn));
 
+                // recordingStatus.dilink5 is the same DiLink5Platform.isActive()
+                // gate the backend uses to decide which read path to even
+                // attempt. On a DiLink5 car we go car_service-only for
+                // 12V/SOC (falling back only to cache/estimate during the
+                // rare gap where car_service's lastEvent hasn't fired yet),
+                // and never touch the stock fields -- their vendor data
+                // sources (BatteryMonitor, BatterySocMonitor's
+                // BYDAutoStatisticDevice reflection) are flaky/slow-to-bind
+                // on this vehicle and shouldn't ever be allowed to shadow a
+                // working car_service reading, or worse, blank the tile
+                // while car_service had the answer the whole time. Off
+                // DiLink5 (dumpsysText() always unavailable there), stock is
+                // the only path that ever had data, same as before. This is
+                // the dashboard "Main info" card's own copy of the cascade
+                // core.js already applies to the sidebar's #batteryValue --
+                // they render independently and both need the same fix.
+                var rsDash = status.recordingStatus;
+                var isDiLink5Dash = !!(rsDash && rsDash.dilink5 === true);
+
+                var carSvcVoltageDash = (rsDash && rsDash.voltage12v !== undefined)
+                    ? Number(rsDash.voltage12v) : NaN;
+                var carSvcValidDash = isFinite(carSvcVoltageDash) && carSvcVoltageDash > 0;
+
                 var batteryVoltage = status.battery
                     ? Number(status.battery.voltage) : NaN;
                 var batteryFresh = status.battery
@@ -2507,8 +2530,61 @@
                     && status.battery.isStale !== true
                     && isFinite(batteryVoltage)
                     && batteryVoltage > 0;
-                setText('dash12v', batteryFresh
-                    ? batteryVoltage.toFixed(1) + 'V' : '--');
+
+                if (isDiLink5Dash) {
+                    if (carSvcValidDash) {
+                        setText('dash12v', carSvcVoltageDash.toFixed(1) + 'V');
+                        try { localStorage.setItem('cachedVoltage12v', String(carSvcVoltageDash)); } catch (e) {}
+                    } else {
+                        var dash12vEl = document.getElementById('dash12v');
+                        if (dash12vEl && !dash12vEl.textContent) {
+                            var cachedDash12v = null;
+                            try { cachedDash12v = localStorage.getItem('cachedVoltage12v'); } catch (e) {}
+                            setText('dash12v', cachedDash12v ? Number(cachedDash12v).toFixed(1) + 'V' : '--');
+                        }
+                    }
+                } else if (batteryFresh) {
+                    setText('dash12v', batteryVoltage.toFixed(1) + 'V');
+                    try { localStorage.setItem('cachedVoltage12v', String(batteryVoltage)); } catch (e) {}
+                } else {
+                    var dash12vEl2 = document.getElementById('dash12v');
+                    if (dash12vEl2 && !dash12vEl2.textContent) {
+                        var cachedDash12v2 = null;
+                        try { cachedDash12v2 = localStorage.getItem('cachedVoltage12v'); } catch (e) {}
+                        setText('dash12v', cachedDash12v2 ? Number(cachedDash12v2).toFixed(1) + 'V' : '--');
+                    } else if (!dash12vEl2) {
+                        setText('dash12v', '--');
+                    }
+                }
+
+                // Same DiLink5-exclusive treatment for main-battery SOC: if
+                // the stock BatterySocMonitor path (VehicleDataMonitor,
+                // reflection into vendor BYDAutoStatisticDevice) hasn't come
+                // up yet, synthesize status.soc from the live car_service
+                // SOC_VALUER reading (recordingStatus.carSvcSoc) instead of
+                // leaving it blank -- this feeds dashSoc/dashHeroSoc below
+                // AND renderHalRange()'s glance ring transparently. Also
+                // synthesize a rough range estimate (soc * 4 km, same
+                // approximation core.js already uses for the sidebar) when
+                // stock range is absent too, so Range doesn't blank in
+                // lockstep with a flaky stock SOC monitor.
+                if (isDiLink5Dash && (!status.soc || status.soc.percent === undefined)
+                        && typeof rsDash.carSvcSoc === 'number' && rsDash.carSvcSoc >= 0) {
+                    var carSvcSocPct = rsDash.carSvcSoc;
+                    status.soc = {
+                        percent: carSvcSocPct,
+                        isLow: carSvcSocPct <= 20,
+                        isCritical: carSvcSocPct <= 10,
+                        status: carSvcSocPct <= 10 ? 'CRITICAL' : (carSvcSocPct <= 20 ? 'LOW' : 'NORMAL')
+                    };
+                    if (!status.range || !(status.range.elecRangeKm > 0)) {
+                        var estRangeKm = Math.round(carSvcSocPct * 4);
+                        status.range = status.range || {};
+                        status.range.elecRangeKm = status.range.elecRangeKm || estRangeKm;
+                        status.range.totalRangeKm = status.range.totalRangeKm || estRangeKm;
+                    }
+                }
+
                 var socPercent = (status.soc && status.soc.percent !== undefined) ? status.soc.percent : null;
                 if (socPercent !== null) {
                     var socText = socPercent.toFixed(1) + '%';
