@@ -85,7 +85,7 @@ public class DiLink5QCarCamBackend {
 
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " --all"
+                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " --all --time 0"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();

@@ -141,12 +141,53 @@ void convert_uyvy_to_rgba(const uint8_t* __restrict__ uyvy, int width, int heigh
     }
 }
 
+// 2x2 grid compositor in UYVY (4 cameras combined into 1920x1300 at 30 FPS)
+static void compose_2x2_uyvy(
+    const uint8_t* cam0, const uint8_t* cam1,
+    const uint8_t* cam3, const uint8_t* cam2,
+    uint8_t* out_grid
+) {
+    const int half_w = FRAME_WIDTH / 2; // 960
+    const int half_h = FRAME_HEIGHT / 2; // 650
+    const int out_stride = FRAME_WIDTH * 2; // 3840 bytes per row
+    const int in_stride  = FRAME_WIDTH * 2; // 3840 bytes per row
+
+    for (int y = 0; y < half_h; y++) {
+        int src_y = y * 2;
+        const uint32_t* src0 = (const uint32_t*)(cam0 + src_y * in_stride);
+        const uint32_t* src1 = (const uint32_t*)(cam1 + src_y * in_stride);
+        uint32_t* dst_top = (uint32_t*)(out_grid + y * out_stride);
+
+        // Top-Left: Cam 0 (Front)
+        for (int x = 0; x < half_w / 2; x++) {
+            dst_top[x] = src0[x * 2];
+        }
+        // Top-Right: Cam 1 (Right)
+        for (int x = 0; x < half_w / 2; x++) {
+            dst_top[half_w / 2 + x] = src1[x * 2];
+        }
+
+        // Bottom-Left: Cam 3 (Left)
+        const uint32_t* src3 = (const uint32_t*)(cam3 + src_y * in_stride);
+        const uint32_t* src2 = (const uint32_t*)(cam2 + src_y * in_stride);
+        uint32_t* dst_bot = (uint32_t*)(out_grid + (half_h + y) * out_stride);
+
+        for (int x = 0; x < half_w / 2; x++) {
+            dst_bot[x] = src3[x * 2];
+        }
+        // Bottom-Right: Cam 2 (Rear)
+        for (int x = 0; x < half_w / 2; x++) {
+            dst_bot[half_w / 2 + x] = src2[x * 2];
+        }
+    }
+}
+
 void* streamClientLoop(void* arg) {
     LOGI("FastCamClient thread started.");
 
     FastCamClient client;
 
-    // Connect to the local daemon socket
+    // Connect to the local daemon socket (filesystem or abstract fallback)
     while (g_streaming.load() && !client.connect("/data/local/tmp/fast_cam.sock")) {
         usleep(300000); // Retry connection every 300ms
     }
@@ -157,29 +198,60 @@ void* streamClientLoop(void* arg) {
         return nullptr;
     }
 
-    LOGI("FastCamClient connected successfully to /data/local/tmp/fast_cam.sock");
+    LOGI("FastCamClient connected successfully to fast_cam IPC stream!");
 
     FastCamFrame frame;
+    const uint8_t* cam_ptrs[4] = { nullptr, nullptr, nullptr, nullptr };
+    static uint8_t mosaic_buf[FRAME_WIDTH * FRAME_HEIGHT * 2];
+    uint32_t rendered_frames = 0;
+
     while (g_streaming.load()) {
         // Wait for next available hardware frame (timeout 100ms)
         if (!client.waitForFrame(&frame, 100)) {
             continue;
         }
 
-        // Filter by requested camera ID (0: Front, 1: Right, 2: Rear, 3: Left; or -1 for all)
-        int desired_cam = g_active_camera.load();
-        if (desired_cam >= 0 && frame.cam_id != (uint32_t)desired_cam) {
-            continue;
+        if (frame.cam_id < 4 && frame.pixels) {
+            cam_ptrs[frame.cam_id] = frame.pixels;
         }
 
-        std::lock_guard<std::mutex> lock(g_winMutex);
-        if (g_nativeWindow) {
-            ANativeWindow_Buffer winBuffer;
-            if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
-                // Color conversion UYVY to RGBA8888 onto Android Surface buffer
-                convert_uyvy_to_rgba(frame.pixels, frame.width, frame.height,
-                                     (uint32_t*)winBuffer.bits, winBuffer.stride);
-                ANativeWindow_unlockAndPost(g_nativeWindow);
+        int desired_cam = g_active_camera.load();
+        const uint8_t* render_pixels = nullptr;
+
+        if (desired_cam == 4) {
+            // Mode 4 = 2x2 Mosaic (all 4 cameras composed)
+            const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
+            const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
+            const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
+            const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
+
+            compose_2x2_uyvy(p0, p1, p3, p2, mosaic_buf);
+            render_pixels = mosaic_buf;
+        } else if (desired_cam >= 0 && desired_cam < 4) {
+            // Specific single camera channel requested
+            if ((int)frame.cam_id == desired_cam) {
+                render_pixels = frame.pixels;
+            }
+        } else {
+            // Desired cam < 0: render whatever frame arrives
+            render_pixels = frame.pixels;
+        }
+
+        if (render_pixels) {
+            std::lock_guard<std::mutex> lock(g_winMutex);
+            if (g_nativeWindow) {
+                ANativeWindow_Buffer winBuffer;
+                if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
+                    // Color conversion UYVY to RGBA8888 onto Android Surface buffer
+                    convert_uyvy_to_rgba(render_pixels, FRAME_WIDTH, FRAME_HEIGHT,
+                                         (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    ANativeWindow_unlockAndPost(g_nativeWindow);
+                    rendered_frames++;
+                    if (rendered_frames % 300 == 1) {
+                        LOGI("Rendered %u frames to Surface (desiredCam=%d, lastCamId=%u)",
+                             rendered_frames, desired_cam, frame.cam_id);
+                    }
+                }
             }
         }
     }
