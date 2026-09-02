@@ -536,7 +536,9 @@ class DashboardFragment : Fragment() {
                 dashboardState = DashboardStateReducer.status(dashboardState, result)
                 renderVehicleState()
                 if (dashboardResumed) {
-                    mainHandler.postDelayed(statusRefreshRunnable, STATUS_REFRESH_MS)
+                    val isAccOn = (dashboardState.vehicle as? DashboardUiState.VehicleState.Ready)?.snapshot?.isAccOn == true
+                    val refreshMs = if (isAccOn) STATUS_REFRESH_ACTIVE_MS else STATUS_REFRESH_IDLE_MS
+                    mainHandler.postDelayed(statusRefreshRunnable, refreshMs)
                 }
             }
         }
@@ -1810,7 +1812,8 @@ class DashboardFragment : Fragment() {
         private const val STATE_AI_INSIGHT_EXPANDED =
             "dashboard.ai_insight_expanded"
         private const val STATE_SELECTED_TUNNEL = "dashboard.selected_tunnel"
-        private const val STATUS_REFRESH_MS = 15_000L
+        private const val STATUS_REFRESH_ACTIVE_MS = 2_000L
+        private const val STATUS_REFRESH_IDLE_MS = 15_000L
         private const val RECORDING_STATS_RETRY_MS = 1_500L
         private const val MAX_RECORDING_STATS_RETRIES = 3
         private const val STATUS_CONNECT_TIMEOUT_MS = 2_000
