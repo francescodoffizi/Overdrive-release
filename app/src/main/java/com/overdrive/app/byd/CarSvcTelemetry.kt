@@ -72,6 +72,13 @@ object CarSvcTelemetry {
     private const val PROP_WINDOW_SUNROOF = 0x2140501d            // WINDOW_OPEN_PERCENT_SUN_R (glass)
     private const val PROP_AC_WORK_MODE = 0x214010a4              // A_C_WORK_MODE_R, 1=on/2=off
     private const val PROP_AC_FAN_LEVEL = 0x21401027              // AC_CONTROLLER_WIND_LEVEL, 0=no airflow
+    // AC temperature setpoints, degrees C. Both confirmed live reading 17 at
+    // the same moment on this vehicle -- a same-value reading on both is
+    // consistent with a non-dual-zone/synced setting, not independent proof
+    // each property maps to the side its name implies. Lower-confidence
+    // mapping than the rest of this file's properties.
+    private const val PROP_AC_DRIVER_TEMP_SET = 0x21401023        // AC_CONTROLLER_DRIVER_TEMP_SET
+    private const val PROP_AC_TEMP_DEPUTY = 0x2140104b            // AC_TEMP_DEPUTY ("deputy" = passenger)
 
     /** Raw gear value meaning "Park" — matches RecordingModeManager.GEAR_P. */
     private const val GEAR_PARK = 1
@@ -373,10 +380,10 @@ object CarSvcTelemetry {
      * user wants that shown as off. Returns 1=on (mode==1 AND fanLevel>0),
      * 0=off, -1=unavailable/not DiLink5.
      *
-     * Fan-only (no AC compressor) and temperature setpoint properties
-     * (AC_TEMP_DEPUTY 0x2140104b, AC_CONTROLLER_DRIVER_TEMP_SET 0x21401023)
-     * were flagged as candidates during this investigation but NOT yet
-     * verified live — left as a follow-up, not implemented here.
+     * Fan-only (no AC compressor) is not distinguished here — see
+     * [climateTempsRaw] for the driver/passenger temperature setpoints,
+     * which were flagged as candidates during the same investigation and
+     * are now confirmed live.
      */
     fun climateAcOnRaw(): Int {
         if (!DiLink5Platform.isActive()) return -1
@@ -393,6 +400,35 @@ object CarSvcTelemetry {
         }
         if (mode == -1) return -1
         return if (mode == 1 && fan > 0) 1 else 0
+    }
+
+    /**
+     * Single-pass read of the driver/passenger AC temperature setpoints:
+     * [PROP_AC_DRIVER_TEMP_SET] and [PROP_AC_TEMP_DEPUTY] ("deputy" =
+     * passenger). Both confirmed live reading 17 (degrees C, plausible AC
+     * setpoint) at the same moment on this vehicle -- see the caveat on
+     * those constants above: a same-value reading on both is consistent
+     * with a non-dual-zone/synced setting, not independent proof each
+     * property maps to the side its name implies.
+     *
+     * Returns `[driverTempC, passengerTempC]`, each -1 if not
+     * found/not DiLink5.
+     */
+    fun climateTempsRaw(): IntArray {
+        val unavailable = intArrayOf(-1, -1)
+        if (!DiLink5Platform.isActive()) return unavailable
+        val text = dumpsysText() ?: return unavailable
+
+        val driverKey = buildSearchKey(PROP_AC_DRIVER_TEMP_SET)
+        val passengerKey = buildSearchKey(PROP_AC_TEMP_DEPUTY)
+        var driver = -1
+        var passenger = -1
+        for (line in text.lineSequence()) {
+            if (driver == -1 && line.contains(driverKey)) driver = parseValueLine(line)?.toInt() ?: -1
+            if (passenger == -1 && line.contains(passengerKey)) passenger = parseValueLine(line)?.toInt() ?: -1
+            if (driver != -1 && passenger != -1) break
+        }
+        return intArrayOf(driver, passenger)
     }
 
     /**

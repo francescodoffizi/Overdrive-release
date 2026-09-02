@@ -2725,6 +2725,7 @@
     "toast_no_location": "Car location not available",
     "glance_ac_off": "AC off",
     "glance_ac_on": "AC on",
+    "glance_fan": "Fan",
     "glance_climate": "Climate",
     "glance_sentry": "Sentry",
     "glance_sentry_count": "{n} today",

@@ -1003,6 +1003,16 @@ public class VehicleControlApiHandler {
             if (carSvcAcOn >= 0) {
                 climate.put("acOn", carSvcAcOn == 1);
             }
+            // Driver/passenger AC temperature setpoints -- never tracked
+            // anywhere in this app before, native or web. See
+            // CarSvcTelemetry.climateTempsRaw()'s doc comment for the
+            // driver-vs-passenger mapping confidence caveat. Added
+            // independently of each other (unlike acOn above, either or
+            // both can be present) so the web UI's glance row can still
+            // show one side even if the other has no reading.
+            int[] carSvcTemps = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.climateTempsRaw();
+            if (carSvcTemps[0] >= 0) climate.put("driverTempSetC", carSvcTemps[0]);
+            if (carSvcTemps[1] >= 0) climate.put("passengerTempSetC", carSvcTemps[1]);
         }
         response.put("climate", climate);
 
