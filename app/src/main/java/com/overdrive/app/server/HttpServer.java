@@ -1412,6 +1412,23 @@ public class HttpServer {
                 int carSvcGear = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.gearValue();
                 if (carSvcGear >= 1) {
                     rmm.onGearChanged(carSvcGear);
+                    // Also feed the shared gear dispatcher (CameraDaemon.
+                    // onGearChanged), NOT just RecordingModeManager directly
+                    // above. That call only updates the displayed gear —
+                    // trip start/stop is driven independently by
+                    // GearMonitor's own dedicated poll thread (reflection
+                    // into the same vendor gearbox HAL that's dead here),
+                    // which is what actually calls onGearChanged() and was
+                    // never reached by the direct rmm call. Without this,
+                    // the dashboard could show the correct DiLink5 gear
+                    // while trips silently never started or stopped, since
+                    // GearMonitor's own reads never produced anything
+                    // valid (see rmm.getGearMonitorRetryFailures(), often
+                    // nonzero). Purely additive: does not replace or
+                    // disable GearMonitor, and CameraDaemon.onGearChanged
+                    // already dedups a same-value gear internally, so
+                    // whichever path fires first/each time is harmless.
+                    com.overdrive.app.daemon.CameraDaemon.onGearChanged(carSvcGear);
                 }
                 recordingStatus.put("configuredMode", rmm.getCurrentMode().name());
                 recordingStatus.put("isRecording", pipeline != null && pipeline.isRecording());
