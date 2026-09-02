@@ -47,6 +47,12 @@ else()
     set(OPENCV_AVAILABLE FALSE)
 endif()
 
+# ==================== Precompiled FastCam Client ====================
+add_library(fast_cam_client SHARED IMPORTED)
+set_target_properties(fast_cam_client PROPERTIES
+    IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libfast_cam_client.so"
+)
+
 # ==================== Surveillance Library ====================
 set(SURVEILLANCE_SOURCES
     surveillance/native_motion.cpp
@@ -55,8 +61,7 @@ set(SURVEILLANCE_SOURCES
     # Camera/EGL: AHardwareBuffer → EGLImage → GL_TEXTURE_EXTERNAL_OES
     # binding for the ImageReader-based zero-copy camera path.
     camera/HardwareBufferTextureBinder.cpp
-    # DiLink 5 Qualcomm fast_cam_capture IPC client bridge
-    camera/fast_cam_bridge.cpp
+    # DiLink 5 Qualcomm fast_cam_capture JNI bridge
     camera/qcarcam_bridge.cpp
 )
 
@@ -70,7 +75,7 @@ target_include_directories(surveillance PRIVATE
 )
 
 # Base libraries — `EGL` and `GLESv2` added for HardwareBufferTextureBinder.
-set(SURVEILLANCE_LIBS android log m EGL GLESv2)
+set(SURVEILLANCE_LIBS android log m EGL GLESv2 fast_cam_client)
 
 # Add OpenCV if available
 if(OPENCV_AVAILABLE)

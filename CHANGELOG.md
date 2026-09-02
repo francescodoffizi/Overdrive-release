@@ -4,6 +4,14 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Architettura Ibrida Dual-Pipeline 4K Ultra-HD & Streaming Web 720p (`video_Improve.md`, `qcarcam_bridge.cpp`, `GpuPipelineConfig.java`, `GpuSurveillancePipeline.java`, `DiLink5QCarCamBackend.java`, `CMakeLists.txt`)**:
+  - **Integrazione Nuovi Binari Precompilati `fast_cam_capture` & `libfast_cam_client.so`**: Sostituiti gli asset e le librerie native con la build ARM64 compilata da `frame_grabber_light/fast_cam_capture/` (binario 21.912 bytes con supporto `--all --time 0` e libreria client da 8.344 bytes con `SONAME: libfast_cam_client.so`).
+  - **Doppia Pipeline Indipendente & Zero-Copy**:
+    - **Storage Locale Dashcam/Sentinella (4K Ultra-HD HEVC)**: Implementata la codifica hardware a piena risoluzione nativa dei sensori ($3840 \times 2600$ o $3840 \times 2160$ a 30 FPS) tramite encoder hardware `c2.qti.hevc.encoder` (H.265) a 12 Mbps, garantendo il 100% dei pixel nativi senza downsampling per targhe e dettagli forensi.
+    - **Streaming Remoto Web & Display Pad (720p H.264)**: Mantenuta in parallelo la pipeline `streamEncoder` a 720p ($1280 \times 720$) H.264 a 1.5 Mbps per la fruizione fluida via WebSocket/JMuxer su reti 4G/Web a basso consumo dati.
+  - **Compositore Nativo Mosaico 4K & Geometria Dinamica (`qcarcam_bridge.cpp`)**: Aggiornato il thread client IPC per invocare `FastCamClient::compose4K` (Mode 5) su buffer 4K dedicati e `FastCamClient::compose2x2` (Mode 4 per 1080p), con adattamento dinamico runtime della geometria del buffer `ANativeWindow` (`ANativeWindow_setBuffersGeometry`).
+  - **Supporto Configurazione & Profilo `ULTRA_4K` (`GpuPipelineConfig.java`, `GpuSurveillancePipeline.java`, `DiLink5QCarCamBackend.java`)**: Aggiunto l'enum `RecordingQuality.ULTRA_4K` (12 Mbps HEVC / 18 Mbps H.264) e il metodo `is4K()`. All'attivazione del profilo, la pipeline alloca dinamicamente il canvas 4K e attiva la modalità 4K sul backend nativo (`DiLink5QCarCamBackend.set4KUltraEnabled(true)`).
+
 - **Interblocco Ricarica Hardware & Soppressione Falso Movimento GPS in Ricarica (`GearMonitor.java`, `RecordingModeManager.java`)**:
   - **Blocco Hardware Marcia in Ricarica (`GearMonitor.java`)**: Integrato il controllo prioritario `ChargingDetector.getInstance().isCharging()`. Quando la vettura è in ricarica (cavo inserito / potenza attiva), la marcia viene bloccata tassativamente su `GEAR_P` (Park), eliminando all'origine qualsiasi lettura spuria.
   - **Soppressione Promozione Marcia da Drift/Jitter GPS (`RecordingModeManager.java`)**: Inibito il fallback di velocità GPS in caso di ricarica attiva, impedendo che le oscillazioni delle coordinate GPS all'interno del box/garage promuovano erroneamente la marcia da `P` a `D`.

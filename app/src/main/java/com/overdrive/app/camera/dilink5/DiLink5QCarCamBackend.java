@@ -18,9 +18,15 @@ public class DiLink5QCarCamBackend {
 
     static {
         try {
+            try {
+                System.loadLibrary("fast_cam_client");
+            } catch (Throwable ignored) {}
             System.loadLibrary("surveillance");
         } catch (Throwable t) {
             try {
+                try {
+                    System.load("/data/local/tmp/libfast_cam_client.so");
+                } catch (Throwable ignored) {}
                 System.load("/data/local/tmp/libsurveillance.so");
             } catch (Throwable t2) {
                 logger.warn("Failed to load libsurveillance.so: " + t2.getMessage());
@@ -413,6 +419,10 @@ public class DiLink5QCarCamBackend {
         } catch (Throwable t) {
             logger.warn("Failed to set active camera: " + t.getMessage());
         }
+    }
+
+    public static void set4KUltraEnabled(boolean enabled) {
+        setActiveCamera(enabled ? 5 : 4);
     }
 
     // --- Native JNI Interface ---
