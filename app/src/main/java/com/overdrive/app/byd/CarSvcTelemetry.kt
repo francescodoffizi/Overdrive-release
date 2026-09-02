@@ -403,6 +403,23 @@ object CarSvcTelemetry {
     }
 
     /**
+     * Reads AC_CONTROLLER_WIND_LEVEL directly and unconditionally — unlike
+     * the stock `BydVehicleData` fan-level field, which the vendor code only
+     * reports when its own AC-power-level gate is true, so the field goes
+     * missing ENTIRELY (not 0) whenever AC is off. That made "fan genuinely
+     * at 0" and "no reading available" indistinguishable downstream. This
+     * property was already confirmed live to read independently of AC power
+     * state (it read 0 while AC was actually on, via [climateAcOnRaw]'s use
+     * of the same property as an internal AND-condition), and separately
+     * confirmed to now populate a `fanLevel` reading even with AC off.
+     * Returns 0-N (raw fan level), or -1 if unavailable/not DiLink5.
+     */
+    fun climateFanLevelRaw(): Int {
+        val raw = getInt(PROP_AC_FAN_LEVEL)
+        return if (raw >= 0) raw else -1
+    }
+
+    /**
      * Single-pass read of the driver/passenger AC temperature setpoints:
      * [PROP_AC_DRIVER_TEMP_SET] and [PROP_AC_TEMP_DEPUTY] ("deputy" =
      * passenger). Both confirmed live reading 17 (degrees C, plausible AC

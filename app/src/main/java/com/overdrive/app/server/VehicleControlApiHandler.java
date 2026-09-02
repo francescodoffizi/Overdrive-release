@@ -1013,6 +1013,15 @@ public class VehicleControlApiHandler {
             int[] carSvcTemps = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.climateTempsRaw();
             if (carSvcTemps[0] >= 0) climate.put("driverTempSetC", carSvcTemps[0]);
             if (carSvcTemps[1] >= 0) climate.put("passengerTempSetC", carSvcTemps[1]);
+
+            // Fan level, read directly and unconditionally -- unlike the
+            // stock data.acFanLevel above, which the vendor code only
+            // reports while vehiclePoweredOn/its own AC-power-level gate is
+            // true, so the key goes missing entirely (not 0) whenever AC is
+            // off. Always overwrites the stock value (when present) so "fan
+            // genuinely at 0" and "no reading" stay distinguishable.
+            int carSvcFanLevel = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.climateFanLevelRaw();
+            if (carSvcFanLevel >= 0) climate.put("fanLevel", carSvcFanLevel);
         }
         response.put("climate", climate);
 
