@@ -138,6 +138,13 @@ public class GearMonitor {
             if (!isValidGearMode(initialGearRead) && com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
                 initialGearRead = readGearFromDumpsys();
             }
+            // Hardware interlock: if the vehicle is charging, gear is unconditionally P
+            try {
+                if (com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging()) {
+                    initialGearRead = GEAR_P;
+                }
+            } catch (Throwable ignored) {}
+
             if (!isValidGearMode(initialGearRead)) {
                 initialGearRead = GEAR_P; // Safe fallback
             }
@@ -158,11 +165,20 @@ public class GearMonitor {
                         int gear = -1;
                         long gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
 
+                        // Hardware interlock: if the vehicle is charging, gear is unconditionally P
+                        try {
+                            if (com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging()) {
+                                gear = GEAR_P;
+                            }
+                        } catch (Throwable ignored) {}
+
                         // 1. Try CarAdapterManager / CarBodyManager (DiLink 5.0 / TS framework)
-                        int carAdapterGear = readFromCarAdapter();
-                        if (isValidGearMode(carAdapterGear)) {
-                            gear = carAdapterGear;
-                            gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
+                        if (!isValidGearMode(gear)) {
+                            int carAdapterGear = readFromCarAdapter();
+                            if (isValidGearMode(carAdapterGear)) {
+                                gear = carAdapterGear;
+                                gearObservedAtElapsedRealtimeMs = SystemClock.elapsedRealtime();
+                            }
                         }
 
                         // 2. Prefer TelemetryDataCollector's cached snapshot
@@ -333,6 +349,12 @@ public class GearMonitor {
     private volatile int lastDumpsysGear = -1;
 
     private int readGearFromDumpsys() {
+        try {
+            if (com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging()) {
+                return GEAR_P;
+            }
+        } catch (Throwable ignored) {}
+
         long now = SystemClock.elapsedRealtime();
         if (now - lastDumpsysReadTime < 250 && isValidGearMode(lastDumpsysGear)) {
             return lastDumpsysGear;

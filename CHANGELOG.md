@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Interblocco Ricarica Hardware & Soppressione Falso Movimento GPS in Ricarica (`GearMonitor.java`, `RecordingModeManager.java`)**:
+  - **Blocco Hardware Marcia in Ricarica (`GearMonitor.java`)**: Integrato il controllo prioritario `ChargingDetector.getInstance().isCharging()`. Quando la vettura è in ricarica (cavo inserito / potenza attiva), la marcia viene bloccata tassativamente su `GEAR_P` (Park), eliminando all'origine qualsiasi lettura spuria.
+  - **Soppressione Promozione Marcia da Drift/Jitter GPS (`RecordingModeManager.java`)**: Inibito il fallback di velocità GPS in caso di ricarica attiva, impedendo che le oscillazioni delle coordinate GPS all'interno del box/garage promuovano erroneamente la marcia da `P` a `D`.
+  - **Disattivazione Automatica Registrazione di Guida in Carica (`RecordingModeManager.java`)**: Sottoscritto `FusedStateListener` di `ChargingDetector`. All'avvio della sessione di ricarica o al risveglio del display, le modalità di registrazione di guida (`CONTINUOUS` e `DRIVE_MODE`) vengono automaticamente disattivate e soppresse, evitando sprechi di memoria, cicli di scrittura inutili su SD e falsi allarmi di guida a vettura parcheggiata alla colonnina/wallbox.
+
 - **Integrazione Demone Nativo Zero-Copy `fast_cam_capture` & `libfast_cam_client.so` su DiLink 5.0 (`qcarcam_bridge.cpp`, `DiLink5QCarCamBackend.java`, `DiLink5PowerDiagnostics.java`, `CMakeLists.txt`)**:
   - **Sostituzione Pipeline Hardware Legacy (`qcarcam_test` + `libhook_qcarcam.so`)**: Dismesso l'utilizzo del binario diagnostico vendor `/vendor/bin/qcarcam_test`, dell'iniezione LD_PRELOAD `libhook_qcarcam.so` e dei file di configurazione XML (`4cam.xml`, `1cam.xml`).
   - **Composizione Nativa Mosaico 2x2 & Switch Canali (`qcarcam_bridge.cpp`)**: Implementato in C++ l'algoritmo di composizione 2x2 grid in UYVY (`compose_2x2_uyvy`), assemblando contemporaneamente le 4 telecamere (Front, Right, Rear, Left) in un unico frame 1920x1300 a 30 FPS quando la pipeline richiede la modalità mosaico (`desired_cam == 4`), oltre al routing istantaneo a singola camera a piena risoluzione per i canali 0, 1, 2, 3.
