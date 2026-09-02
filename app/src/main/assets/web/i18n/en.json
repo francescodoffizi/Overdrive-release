@@ -2420,7 +2420,8 @@
   "map": {
     "your_vehicle": "Your Vehicle",
     "your_vehicle_sub": "OverDrive Surveillance",
-    "you_are_here": "You are here"
+    "you_are_here": "You are here",
+    "recenter": "Recenter on vehicle"
   },
   "pip": {
     "select_camera": "Select Camera",
