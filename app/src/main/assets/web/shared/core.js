@@ -1024,16 +1024,40 @@ BYD.core = {
                 if (el) el.textContent = status.appVersion;
             }
 
-            // 12V Battery
-            if (status.battery) {
+            // 12V Battery — 3-way cascade, in priority order:
+            //  1. Live car_service reading (status.recordingStatus.voltage12v) —
+            //     added for platforms (e.g. DiLink 5 / Sealion 7) where the normal
+            //     battery.voltage path below is dead. No staleness gate: it's a
+            //     bare live read, cached to localStorage as a last-resort fallback.
+            //  2. The ORIGINAL battery.voltage path, fully intact — the fallback
+            //     for any platform where that path works fine and the new one
+            //     doesn't (or isn't available at all).
+            //  3. First paint only (el has no text yet): the localStorage cache,
+            //     else '--'. On later polls, if neither source is valid this poll,
+            //     leave whatever was already showing — a transient invalid reading
+            //     shouldn't flicker the display back to '--'.
+            {
                 const el = document.getElementById('batteryValue');
-                const voltage = Number(status.battery.voltage);
-                const voltageFresh = status.battery.available !== false
-                    && status.battery.isStale !== true
-                    && isFinite(voltage)
-                    && voltage > 0;
-                if (el) el.textContent = voltageFresh
-                    ? voltage.toFixed(1) + 'V' : '--';
+                if (el) {
+                    const carSvcVoltage = Number(status.recordingStatus && status.recordingStatus.voltage12v);
+                    const carSvcFresh = isFinite(carSvcVoltage) && carSvcVoltage > 0;
+                    const stockVoltage = Number(status.battery && status.battery.voltage);
+                    const stockFresh = !!status.battery
+                        && status.battery.available !== false
+                        && status.battery.isStale !== true
+                        && isFinite(stockVoltage)
+                        && stockVoltage > 0;
+                    if (carSvcFresh) {
+                        el.textContent = carSvcVoltage.toFixed(1) + 'V';
+                        try { localStorage.setItem('cachedVoltage12v', carSvcVoltage.toFixed(1)); } catch (e) {}
+                    } else if (stockFresh) {
+                        el.textContent = stockVoltage.toFixed(1) + 'V';
+                    } else if (!el.textContent) {
+                        let cached = null;
+                        try { cached = localStorage.getItem('cachedVoltage12v'); } catch (e) {}
+                        el.textContent = cached ? cached + 'V' : '--';
+                    }
+                }
             }
 
             // ACC status
