@@ -328,7 +328,7 @@
                         <div class="dash-card-head">
                             <div>
                                 <span class="dash-card-kicker" data-i18n="charge.kicker">Energy</span>
-                                <h2 data-i18n="charge.card_title">Charging</h2>
+                                <h2 id="dashChargeTitle" data-i18n="charge.card_title">Charging</h2>
                             </div>
                             <button class="dash-card-grip" type="button" aria-label="Drag to reorder" tabindex="-1">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg>
@@ -2582,21 +2582,32 @@
                 // powerKw/socPercent/timeToFullMin). Absent on non-EV reads.
                 var c = status.charging;
                 this.glance.setCharging(c || null);
+
+                // Title: independent Unplugged/Plugged in state (previously folded
+                // into the single 5-way badge below). Set whether or not `c` is
+                // present so a non-EV read still shows a coherent "Unplugged".
+                var plugged = !!(c && c.plugged);
+                setText('dashChargeTitle',
+                    BYD.i18n.t(plugged ? 'charge.title_plugged' : 'charge.title_unplugged')
+                        || (plugged ? 'Plugged in' : 'Unplugged'));
+
                 if (c) {
+                    // Badge now independently reflects charging/full/fault only —
+                    // `plugged` moved to the title above, so this is a binary
+                    // Charging/Not charging (plus the Full/Charge fault specials),
+                    // not the old 5-way fault/charging/full/plugged/idle state.
                     var stateKey = c.fault ? 'charge.state_fault'
-                                 : c.charging ? 'charge.state_charging'
                                  : c.full ? 'charge.state_full'
-                                 : c.plugged ? 'charge.state_plugged'
-                                 : 'charge.state_idle';
+                                 : c.charging ? 'charge.state_charging'
+                                 : 'charge.state_not_charging';
                     var dotCls = c.fault ? 'dot-danger'
-                               : c.charging ? 'dot-active'
                                : c.full ? 'dot-good'
-                               : c.plugged ? 'dot-warn'
+                               : c.charging ? 'dot-active'
                                : 'dot-idle';
                     var dot = document.getElementById('dashChargeDot');
                     if (dot) dot.className = 'ic_status_dot ' + dotCls;
-                    var fallbackState = c.fault ? 'Charge fault' : c.charging ? 'Charging'
-                                      : c.full ? 'Full' : c.plugged ? 'Plugged in' : 'Idle';
+                    var fallbackState = c.fault ? 'Charge fault' : c.full ? 'Full'
+                                      : c.charging ? 'Charging' : 'Not charging';
                     setText('dashChargeState', BYD.i18n.t(stateKey) || fallbackState);
 
                     if (c.socPercent !== undefined && c.socPercent !== null) {
