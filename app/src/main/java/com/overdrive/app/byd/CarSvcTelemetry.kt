@@ -61,6 +61,17 @@ object CarSvcTelemetry {
     private const val PROP_CHARGING_POWER = 0x21603408            // CHARGING_POWERR (float, kW)
     private const val PROP_CHARGING_RESTTIME_HOUR = 0x21403440    // CHARGING_RESTTIME_HOURR
     private const val PROP_CHARGING_RESTTIME_MIN = 0x21403441     // CHARGING_RESTTIME_MINUTER
+    private const val PROP_TYRE_LEFT_FRONT = 0x2160801d           // LEFTFRONTTIREPRESSURE, raw 0.1psi
+    private const val PROP_TYRE_RIGHT_FRONT = 0x2160801e          // RIGHTFRONTTIREPRESSURE, raw 0.1psi
+    private const val PROP_TYRE_LEFT_REAR = 0x2160801f            // LEFTREARTIREPRESSURE, raw 0.1psi
+    private const val PROP_TYRE_RIGHT_REAR = 0x21608020           // RIGHTREARTIREPRESSURE, raw 0.1psi
+    private const val PROP_WINDOW_LEFT_FRONT = 0x21405018         // WINDOW_OPEN_PERCENT_LEFT_FRONT_R
+    private const val PROP_WINDOW_RIGHT_FRONT = 0x2140501a        // WINDOW_OPEN_PERCENT_RIGHT_FRONT_R
+    private const val PROP_WINDOW_LEFT_REAR = 0x21405019          // WINDOW_OPEN_PERCENT_LEFT_REAR_R
+    private const val PROP_WINDOW_RIGHT_REAR = 0x2140501b         // WINDOW_OPEN_PERCENT_RIGHT_REAR_R
+    private const val PROP_WINDOW_SUNROOF = 0x2140501d            // WINDOW_OPEN_PERCENT_SUN_R (glass)
+    private const val PROP_AC_WORK_MODE = 0x214010a4              // A_C_WORK_MODE_R, 1=on/2=off
+    private const val PROP_AC_FAN_LEVEL = 0x21401027              // AC_CONTROLLER_WIND_LEVEL, 0=no airflow
 
     /** Raw gear value meaning "Park" — matches RecordingModeManager.GEAR_P. */
     private const val GEAR_PARK = 1
@@ -233,6 +244,155 @@ object CarSvcTelemetry {
             else -> -1
         }
         return intArrayOf(rf, lf, rr, lr, -1, -1, overall)
+    }
+
+    /**
+     * Single-pass read of the 4 TPMS tyre pressure properties, `[fl, fr, rl,
+     * rr]`, each in raw car_service units confirmed empirically to be
+     * 0.1 psi (e.g. raw 456 == 45.6 psi, matching the vendor SDK's own psi
+     * reading for the same corner at the same moment), or -1 if not found.
+     */
+    fun tyrePressuresRaw(): IntArray {
+        val unavailable = intArrayOf(-1, -1, -1, -1)
+        if (!DiLink5Platform.isActive()) return unavailable
+        val text = dumpsysText() ?: return unavailable
+
+        val flKey = buildSearchKey(PROP_TYRE_LEFT_FRONT)
+        val frKey = buildSearchKey(PROP_TYRE_RIGHT_FRONT)
+        val rlKey = buildSearchKey(PROP_TYRE_LEFT_REAR)
+        val rrKey = buildSearchKey(PROP_TYRE_RIGHT_REAR)
+        var fl = -1
+        var fr = -1
+        var rl = -1
+        var rr = -1
+        for (line in text.lineSequence()) {
+            if (fl == -1 && line.contains(flKey)) fl = parseValueLine(line)?.toInt() ?: -1
+            if (fr == -1 && line.contains(frKey)) fr = parseValueLine(line)?.toInt() ?: -1
+            if (rl == -1 && line.contains(rlKey)) rl = parseValueLine(line)?.toInt() ?: -1
+            if (rr == -1 && line.contains(rrKey)) rr = parseValueLine(line)?.toInt() ?: -1
+            if (fl != -1 && fr != -1 && rl != -1 && rr != -1) break
+        }
+        return intArrayOf(fl, fr, rl, rr)
+    }
+
+    /**
+     * `{"fl":{"kPa":N,"psi":N,"available":true},"fr":{...},"rl":{...},
+     * "rr":{...},"available":true}` from [tyrePressuresRaw], matching the
+     * existing stock tyre-pressure JSON schema's field names so
+     * VehicleControlApiHandler can drop this straight in ahead of the stock
+     * `BydVehicleData` arrays. A corner with no reading is
+     * `{"available":false}`. Returns null (no override) if none of the 4
+     * corners have a reading, so the caller falls through to stock.
+     */
+    fun tyrePressuresJson(): JSONObject? {
+        val raw = tyrePressuresRaw()
+        val keys = arrayOf("fl", "fr", "rl", "rr")
+        val obj = JSONObject()
+        var any = false
+        for (i in keys.indices) {
+            val corner = JSONObject()
+            val r = raw[i]
+            if (r > 0) {
+                val psi = r / 10.0
+                corner.put("psi", psi)
+                corner.put("kPa", Math.round(psi * 6.89476).toInt())
+                corner.put("available", true)
+                any = true
+            } else {
+                corner.put("available", false)
+            }
+            obj.put(keys[i], corner)
+        }
+        if (!any) return null
+        obj.put("available", true)
+        return obj
+    }
+
+    /**
+     * Single-pass read of the 5 WINDOW_OPEN_PERCENT_*_R properties
+     * (front/rear side windows + sunroof glass; sunshade has no confirmed
+     * car_service mapping so it's left to the stock path). `[lf, rf, lr,
+     * rr, sunroof]`, each 0-100 (percent open, 0 = closed, confirmed
+     * empirically against the vendor SDK's all-closed 0 reading for the
+     * same corners at the same moment), or -1 if not found.
+     */
+    fun windowPercentsRaw(): IntArray {
+        val unavailable = intArrayOf(-1, -1, -1, -1, -1)
+        if (!DiLink5Platform.isActive()) return unavailable
+        val text = dumpsysText() ?: return unavailable
+
+        val lfKey = buildSearchKey(PROP_WINDOW_LEFT_FRONT)
+        val rfKey = buildSearchKey(PROP_WINDOW_RIGHT_FRONT)
+        val lrKey = buildSearchKey(PROP_WINDOW_LEFT_REAR)
+        val rrKey = buildSearchKey(PROP_WINDOW_RIGHT_REAR)
+        val sunKey = buildSearchKey(PROP_WINDOW_SUNROOF)
+        var lf = -1
+        var rf = -1
+        var lr = -1
+        var rr = -1
+        var sun = -1
+        for (line in text.lineSequence()) {
+            if (lf == -1 && line.contains(lfKey)) lf = parseValueLine(line)?.toInt() ?: -1
+            if (rf == -1 && line.contains(rfKey)) rf = parseValueLine(line)?.toInt() ?: -1
+            if (lr == -1 && line.contains(lrKey)) lr = parseValueLine(line)?.toInt() ?: -1
+            if (rr == -1 && line.contains(rrKey)) rr = parseValueLine(line)?.toInt() ?: -1
+            if (sun == -1 && line.contains(sunKey)) sun = parseValueLine(line)?.toInt() ?: -1
+            if (lf != -1 && rf != -1 && lr != -1 && rr != -1 && sun != -1) break
+        }
+        return intArrayOf(lf, rf, lr, rr, sun)
+    }
+
+    /**
+     * `{"lf":N,"rf":N,"lr":N,"rr":N,"sunroof":N}` from [windowPercentsRaw].
+     * Sunshade is intentionally omitted (no confirmed car_service mapping).
+     * A corner missing a reading is omitted rather than set to -1. Returns
+     * null (no override) if none of the 5 properties have a reading, so the
+     * caller falls through to stock.
+     */
+    fun windowsJson(): JSONObject? {
+        val raw = windowPercentsRaw()
+        val keys = arrayOf("lf", "rf", "lr", "rr", "sunroof")
+        val obj = JSONObject()
+        var any = false
+        for (i in keys.indices) {
+            val r = raw[i]
+            if (r >= 0) {
+                obj.put(keys[i], r)
+                any = true
+            }
+        }
+        return if (any) obj else null
+    }
+
+    /**
+     * Reads A_C_WORK_MODE_R (confirmed 1=on/2=off by watching it flip live
+     * in exact sync with the AC switch being toggled, twice in a row) AND
+     * AC_CONTROLLER_WIND_LEVEL (fan speed, 0=no airflow). "Climate on" means
+     * actual airflow, not just the AC switch state — the switch can read
+     * "on" while the fan is idle (e.g. between auto-mode cycles), and the
+     * user wants that shown as off. Returns 1=on (mode==1 AND fanLevel>0),
+     * 0=off, -1=unavailable/not DiLink5.
+     *
+     * Fan-only (no AC compressor) and temperature setpoint properties
+     * (AC_TEMP_DEPUTY 0x2140104b, AC_CONTROLLER_DRIVER_TEMP_SET 0x21401023)
+     * were flagged as candidates during this investigation but NOT yet
+     * verified live — left as a follow-up, not implemented here.
+     */
+    fun climateAcOnRaw(): Int {
+        if (!DiLink5Platform.isActive()) return -1
+        val text = dumpsysText() ?: return -1
+
+        val modeKey = buildSearchKey(PROP_AC_WORK_MODE)
+        val fanKey = buildSearchKey(PROP_AC_FAN_LEVEL)
+        var mode = -1
+        var fan = -1
+        for (line in text.lineSequence()) {
+            if (mode == -1 && line.contains(modeKey)) mode = parseValueLine(line)?.toInt() ?: -1
+            if (fan == -1 && line.contains(fanKey)) fan = parseValueLine(line)?.toInt() ?: -1
+            if (mode != -1 && fan != -1) break
+        }
+        if (mode == -1) return -1
+        return if (mode == 1 && fan > 0) 1 else 0
     }
 
     /**
