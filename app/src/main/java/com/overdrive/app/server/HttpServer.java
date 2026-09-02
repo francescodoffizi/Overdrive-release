@@ -1389,6 +1389,17 @@ public class HttpServer {
             // "battery" block in that case.
             recordingStatus.put("voltage12v",
                     (double) com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.batteryVoltage12v());
+            // Lets the web UI tell "this device is DiLink5" apart from "this
+            // device just happens to have no stock SOC/12V reading right
+            // now" — see BYD.core.isDiLink5()/isDiLink5Dash() in the web
+            // assets, which gate the car_service-exclusive 12V/SOC cascade
+            // on this flag rather than falling back whenever stock is null.
+            recordingStatus.put("dilink5", com.overdrive.app.byd.DiLink5Platform.isActive());
+            // Fallback-only main-battery SOC (see CarSvcTelemetry.socPercent) —
+            // the web UI only synthesizes a status.soc object from this when
+            // the stock BatterySocMonitor reading is missing on a DiLink5
+            // platform. -1 when unavailable.
+            recordingStatus.put("carSvcSoc", com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.socPercent());
             com.overdrive.app.recording.RecordingModeManager rmm = CameraDaemon.getRecordingModeManager();
             if (rmm != null) {
                 // car_service (dumpsys) gear fallback — no-op everywhere except the

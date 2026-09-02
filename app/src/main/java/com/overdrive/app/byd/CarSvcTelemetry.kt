@@ -52,6 +52,7 @@ object CarSvcTelemetry {
     private const val PROP_GEAR_R = 0x21403a0a                    // GEAR_R
     private const val PROP_BATTERY_VOLTAGE_SECOND = 0x2140461e    // 12V/secondary battery voltage
     private const val PROP_SPEED_VALUE = 0x21406006               // vehicle speed, km/h
+    private const val PROP_SOC_VALUER = 0x21404622                // SOC_VALUER, main HV battery %
     private const val PROP_RIGHT_FRONT_LOCK = 0x2140506e          // door lock: right-front
     private const val PROP_LEFT_FRONT_LOCK = 0x21404627           // door lock: left-front
     private const val PROP_RIGHT_REAR_LOCK = 0x21405070           // door lock: right-rear
@@ -184,6 +185,20 @@ object CarSvcTelemetry {
 
     /** Vehicle speed in km/h, or -1 if unavailable. */
     fun speedValue(): Int = getInt(PROP_SPEED_VALUE)
+
+    /**
+     * Main HV battery state-of-charge percent (SOC_VALUER), or -1 if
+     * unavailable or out of the sane 0-100 range. Only exists as a
+     * fallback for when the stock BatterySocMonitor path (vendor
+     * BYDAutoStatisticDevice reflection, in VehicleDataMonitor) is
+     * unavailable — e.g. that vendor binder service is slow/flaky to bind.
+     * [getInt] already gates on [DiLink5Platform] via [dumpsysText], so this
+     * returns -1 on non-DiLink5 platforms without ever shelling out.
+     */
+    fun socPercent(): Int {
+        val raw = getInt(PROP_SOC_VALUER)
+        return if (raw in 0..100) raw else -1
+    }
 
     /**
      * Door lock state as `[rf, lf, rr, lr, trunk, hood, overall]`, raw
