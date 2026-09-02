@@ -463,12 +463,26 @@ object CarSvcTelemetry {
             val state = snapshot[0].toInt()
             if (state == -1) return // car_service unavailable -- leave json completely untouched
 
-            val charging = (state == CHARGE_STATE_ACTIVE)
+            val rawCharging = (state == CHARGE_STATE_ACTIVE)
             val pluggedBase = (state == 2 || state == 3 || state == 4)
-            // state==4 alone is ambiguous between "plugged, idle" and "driving,
-            // coasting/regen", so also require gear==Park or speed==0 before
-            // calling it plugged.
-            val notDriving = (gearValue() == GEAR_PARK) || (speedValue() == 0)
+            // CHARGE_AND_DISCHARGE_SYSTEM_STATE==2 was originally assumed to
+            // always mean "actively charging", but live user reports showed
+            // sessions opening while the car was actually driving between
+            // two different GPS locations, 0% SOC change, 1-13 min
+            // durations -- not real charging. The property name covers both
+            // charge AND discharge, and state 2 apparently also fires
+            // during driving events (regen braking / high discharge). Both
+            // `charging` and `plugged` (state==4 is separately ambiguous
+            // between "plugged, idle" and "driving, coasting/regen") must
+            // therefore be gated on the car genuinely not driving: gear ==
+            // Park, or speed == 0, or -- right after a reboot, before
+            // either has populated -- both still unknown (-1), which we
+            // fail toward "not driving" rather than blocking charging
+            // detection during that gap.
+            val gear = gearValue()
+            val speed = speedValue()
+            val notDriving = (gear == GEAR_PARK) || (speed == 0) || (gear == -1 && speed == -1)
+            val charging = rawCharging && notDriving
             val plugged = pluggedBase && notDriving
 
             // Debounced feed into the app's own session-tracking manager. Only the
