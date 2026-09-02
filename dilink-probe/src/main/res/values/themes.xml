@@ -1,8 +1,0 @@
-<resources>
-    <style name="Theme.DiLinkProbe" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/primary_accent</item>
-        <item name="colorSecondary">@color/primary_accent</item>
-        <item name="android:statusBarColor">@color/bg_dark</item>
-        <item name="android:windowBackground">@color/bg_dark</item>
-    </style>
-</resources>

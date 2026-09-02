@@ -1,9 +1,0 @@
-<resources>
-    <string name="app_name">DiLink 5 Camera Dumper</string>
-    <string name="btn_run_diagnostics">Avvia Diagnostica Completa</string>
-    <string name="btn_share_export">Condividi / Apri Cartella</string>
-    <string name="status_ready">Pronto per raccogliere la diagnostica DiLink 5 (EVS / QCarCam / V4L2 / APK).</string>
-    <string name="status_running">Raccolta dati in corso… Attendi qualche secondo.</string>
-    <string name="status_done">Diagnostica completata con successo!</string>
-    <string name="status_error">Errore durante la raccolta:</string>
-</resources>
