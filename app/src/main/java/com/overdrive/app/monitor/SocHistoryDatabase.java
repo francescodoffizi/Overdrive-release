@@ -7014,8 +7014,41 @@ public class SocHistoryDatabase {
      * seconds-long label transient is not a trade worth making.
      */
     static int deriveIsDc(int gunState, double peakKw) {
-        return ChargingTypeClassifier.classify(gunState, peakKw);
+        int verdict = ChargingTypeClassifier.classify(gunState, peakKw);
+        if (verdict != ChargingTypeClassifier.UNKNOWN) return verdict;
+        // The gun-based classifier above has nothing to go on -- most
+        // commonly a car_service-fed session (CarSvcTelemetry never
+        // populates gun_state at all), where it lands on UNKNOWN unless
+        // peak happens to clear the conservative 25kW power-only DC floor.
+        // Without this fallback, a session like that stays classified as
+        // UNKNOWN/null forever once it closes: every one of the close
+        // paths below calls deriveIsDc() fresh and persists whatever it
+        // returns, so a perfectly good peak_power_kw reading (e.g. a
+        // 1.4kW AC session) would otherwise never turn into a real AC/DC
+        // verdict. Reuse the SAME >=11kW peak-only threshold
+        // updateOpenSessionPeakAvgPower() already applies live for this
+        // exact no-gun-state situation, so a session that closes (normal
+        // SESSION END, or the startup sweep for one abandoned mid-charge
+        // by an app restart) before ever revisiting that live update still
+        // ends up classified instead of stuck.
+        if (peakKw > 0) {
+            return peakKw >= LIVE_PEAK_ONLY_DC_THRESHOLD_KW
+                    ? ChargingTypeClassifier.DC : ChargingTypeClassifier.AC;
+        }
+        return ChargingTypeClassifier.UNKNOWN;
     }
+
+    /**
+     * Peak-only AC/DC threshold used when no gun-state evidence exists at
+     * all (see {@link #deriveIsDc} and {@link #updateOpenSessionPeakAvgPower}).
+     * Deliberately far below {@link ChargingTypeClassifier#DC_POWER_ONLY_MIN_PEAK_KW}
+     * -- that 25kW floor exists to avoid misreading a genuine high-power AC
+     * session as DC when SOME gun evidence (even if unreliable) is
+     * available; this threshold instead only ever applies when there is
+     * NO gun evidence whatsoever, where a much lower bar is the best
+     * available signal.
+     */
+    private static final double LIVE_PEAK_ONLY_DC_THRESHOLD_KW = 11.0;
 
     private int currentChargingTypeVerdict() {
         if (chargingTypeVerdict != ChargingTypeClassifier.AC
@@ -8974,7 +9007,7 @@ public class SocHistoryDatabase {
         if (avg <= 0 && peak <= 0) return false;
         double finalAvg = avg;
         double finalPeak = peak;
-        Integer isDc = peak > 0 ? (peak >= 11.0 ? 1 : 0) : null;
+        Integer isDc = peak > 0 ? (peak >= LIVE_PEAK_ONLY_DC_THRESHOLD_KW ? 1 : 0) : null;
         try {
             runInTransaction(() -> {
                 try (PreparedStatement pstmt = connection.prepareStatement(
