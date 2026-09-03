@@ -19,3 +19,7 @@ dilink5_camera_dump*
 .DS_Store
 
 ref
+device_backup
+logs_debug
+downloaded_logs
+frame_grabber_light
