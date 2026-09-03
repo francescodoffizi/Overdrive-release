@@ -67,6 +67,20 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    private static volatile boolean sShutdownHookRegistered = false;
+
+    public static synchronized void terminateHardwareProcess() {
+        if (sHardwareProcess != null) {
+            try {
+                sHardwareProcess.destroy();
+            } catch (Throwable ignored) {}
+            sHardwareProcess = null;
+        }
+        try {
+            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"}).waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {}
+    }
+
     private static synchronized void ensureHardwareProcess() {
         try {
             // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
@@ -74,27 +88,24 @@ public class DiLink5QCarCamBackend {
             java.io.File binFile = new java.io.File(binPath);
             boolean wasUpdated = ensureDaemonBinaryExtracted(binFile);
 
-            // Check if fast_cam_capture is already running
-            Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "fast_cam_capture"});
-            java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkPgrep.getInputStream()));
-            String line = reader.readLine();
-            checkPgrep.waitFor();
-            if (line != null && !line.trim().isEmpty()) {
-                if (!wasUpdated) {
-                    logger.info("Qualcomm fast_cam_capture hardware pipeline already running (PID: " + line.trim() + ")");
+            // If we already hold an alive supervised process and the binary wasn't updated, keep it
+            if (sHardwareProcess != null) {
+                boolean isAlive = false;
+                try {
+                    sHardwareProcess.exitValue();
+                } catch (IllegalThreadStateException e) {
+                    isAlive = true; // Process is still running
+                }
+                if (isAlive && !wasUpdated) {
                     return;
-                } else {
-                    logger.info("fast_cam_capture binary was updated from APK; restarting process (old PID: " + line.trim() + ")...");
                 }
             }
 
-            logger.info("Starting Qualcomm fast_cam_capture hardware capture supervisor...");
+            logger.info("Preparing fresh Qualcomm fast_cam_capture hardware capture supervisor...");
 
-            // Terminate any obsolete processes
-            try {
-                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "qcarcam_test"}).waitFor();
-                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"}).waitFor();
-            } catch (Throwable ignored) {}
+            // Terminate any existing or orphan instances to prevent duplicate services
+            terminateHardwareProcess();
+            Thread.sleep(300);
 
             if (binFile.exists()) {
                 binFile.setReadable(true, false);
@@ -108,6 +119,14 @@ public class DiLink5QCarCamBackend {
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();
+
+            // Register shutdown hook once so termination on daemon shutdown or reinstall is guaranteed
+            if (!sShutdownHookRegistered) {
+                sShutdownHookRegistered = true;
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    terminateHardwareProcess();
+                }, "fast-cam-shutdown-hook"));
+            }
 
             // Asynchronously drain stdout/stderr to prevent pipe buffer saturation (64KB deadlock)
             final Process proc = sHardwareProcess;
@@ -446,6 +465,7 @@ public class DiLink5QCarCamBackend {
             }
             nativeHandle = 0;
         }
+        terminateHardwareProcess();
     }
 
     public boolean isStreaming() {

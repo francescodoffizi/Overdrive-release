@@ -21,8 +21,11 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+#define SENSOR_WIDTH 1920
+#define SENSOR_HEIGHT 1300
+
 #define FRAME_WIDTH 1920
-#define FRAME_HEIGHT 1300
+#define FRAME_HEIGHT 1080
 
 namespace {
 
@@ -152,9 +155,77 @@ void convert_uyvy_to_rgba(const uint8_t* __restrict__ uyvy, int width, int heigh
 }
 
 #define FRAME_WIDTH_1080P 1920
-#define FRAME_HEIGHT_1080P 1300
+#define FRAME_HEIGHT_1080P 1080
 #define FRAME_WIDTH_4K 3840
-#define FRAME_HEIGHT_4K 2600
+#define FRAME_HEIGHT_4K 2160
+
+// Fast 2x2 grid compositor in UYVY (4 cameras decimated into 1920x1080 16:9 canvas)
+// Center crops vertical dimension from 1300 to 1080 (110 rows top/bottom),
+// and decimates 2:1 horizontally (1920 -> 960) and vertically (1080 -> 540).
+static void compose_2x2_1080p_uyvy(
+    const uint8_t* cam0, const uint8_t* cam1,
+    const uint8_t* cam3, const uint8_t* cam2,
+    uint8_t* __restrict__ out_grid
+) {
+    const int crop_y_start = 110;
+    const int in_stride_bytes = 1920 * 2; // 3840
+    const int out_stride_bytes = 1920 * 2; // 3840
+
+    // Top half: Cam 0 (Front, Left) and Cam 1 (Right, Right) -> 540 rows
+    for (int y = 0; y < 540; ++y) {
+        int src_y = crop_y_start + (y * 2);
+        const uint32_t* src0 = (const uint32_t*)(cam0 + src_y * in_stride_bytes);
+        const uint32_t* src1 = (const uint32_t*)(cam1 + src_y * in_stride_bytes);
+        uint32_t* dst_row = (uint32_t*)(out_grid + y * out_stride_bytes);
+
+        for (int x = 0; x < 480; ++x) {
+            dst_row[x] = src0[x * 2];
+            dst_row[480 + x] = src1[x * 2];
+        }
+    }
+
+    // Bottom half: Cam 3 (Left, Left) and Cam 2 (Rear, Right) -> 540 rows
+    for (int y = 0; y < 540; ++y) {
+        int src_y = crop_y_start + (y * 2);
+        const uint32_t* src3 = (const uint32_t*)(cam3 + src_y * in_stride_bytes);
+        const uint32_t* src2 = (const uint32_t*)(cam2 + src_y * in_stride_bytes);
+        uint32_t* dst_row = (uint32_t*)(out_grid + (540 + y) * out_stride_bytes);
+
+        for (int x = 0; x < 480; ++x) {
+            dst_row[x] = src3[x * 2];
+            dst_row[480 + x] = src2[x * 2];
+        }
+    }
+}
+
+// 4K Ultra-HD Native Grid in UYVY (3840x2160 standard 16:9 canvas)
+static void compose_4k_2160p_uyvy(
+    const uint8_t* cam0, const uint8_t* cam1,
+    const uint8_t* cam3, const uint8_t* cam2,
+    uint8_t* __restrict__ out_grid
+) {
+    const int crop_y_start = 110;
+    const int in_stride_bytes = 1920 * 2; // 3840
+    const int out_stride_bytes = 3840 * 2; // 7680
+
+    for (int y = 0; y < 1080; ++y) {
+        int src_y = crop_y_start + y;
+        const uint8_t* src0 = cam0 + src_y * in_stride_bytes;
+        const uint8_t* src1 = cam1 + src_y * in_stride_bytes;
+        uint8_t* dst_row = out_grid + y * out_stride_bytes;
+        memcpy(dst_row, src0, in_stride_bytes);
+        memcpy(dst_row + in_stride_bytes, src1, in_stride_bytes);
+    }
+
+    for (int y = 0; y < 1080; ++y) {
+        int src_y = crop_y_start + y;
+        const uint8_t* src3 = cam3 + src_y * in_stride_bytes;
+        const uint8_t* src2 = cam2 + src_y * in_stride_bytes;
+        uint8_t* dst_row = out_grid + (1080 + y) * out_stride_bytes;
+        memcpy(dst_row, src3, in_stride_bytes);
+        memcpy(dst_row + in_stride_bytes, src2, in_stride_bytes);
+    }
+}
 
 void* streamClientLoop(void* arg) {
     LOGI("FastCamClient thread started.");
@@ -218,7 +289,7 @@ void* streamClientLoop(void* arg) {
         int target_h = FRAME_HEIGHT_1080P;
 
         if (desired_cam == 5) {
-            // Mode 5 = 4K Ultra-HD Native Grid (3840x2600, 100% native sensor pixels)
+            // Mode 5 = 4K Ultra-HD Native Grid (3840x2160, 100% native sensor pixels 16:9)
             if (!mosaic_buf_4k) {
                 mosaic_buf_4k = std::make_unique<uint8_t[]>(FRAME_WIDTH_4K * FRAME_HEIGHT_4K * 2);
             }
@@ -227,31 +298,32 @@ void* streamClientLoop(void* arg) {
             const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
             const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
 
-            FastCamClient::compose4K(p0, p1, p3, p2, mosaic_buf_4k.get());
+            compose_4k_2160p_uyvy(p0, p1, p3, p2, mosaic_buf_4k.get());
             render_pixels = mosaic_buf_4k.get();
             target_w = FRAME_WIDTH_4K;
             target_h = FRAME_HEIGHT_4K;
         } else if (desired_cam == 4) {
-            // Mode 4 = 2x2 Decimated Mosaic (1920x1300)
+            // Mode 4 = 2x2 Decimated Mosaic (1920x1080)
             const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
             const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
             const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
             const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
 
-            FastCamClient::compose2x2(p0, p1, p3, p2, mosaic_buf_2x2);
+            compose_2x2_1080p_uyvy(p0, p1, p3, p2, mosaic_buf_2x2);
             render_pixels = mosaic_buf_2x2;
             target_w = FRAME_WIDTH_1080P;
             target_h = FRAME_HEIGHT_1080P;
         } else if (desired_cam >= 0 && desired_cam < FAST_CAM_MAX_CAMS) {
             // Specific single camera channel requested (0..3 surround or 6 internal dashcam)
             if (slot == desired_cam) {
-                render_pixels = frame.pixels;
+                // Vertical center-crop 1920x1300 to 1920x1080 (110 rows margin top/bottom)
+                render_pixels = frame.pixels + (110 * 1920 * 2);
             }
             target_w = FRAME_WIDTH_1080P;
             target_h = FRAME_HEIGHT_1080P;
         } else {
-            // Desired cam < 0: render whatever frame arrives
-            render_pixels = frame.pixels;
+            // Desired cam < 0: render whatever frame arrives with 16:9 center crop
+            render_pixels = frame.pixels + (110 * 1920 * 2);
             target_w = FRAME_WIDTH_1080P;
             target_h = FRAME_HEIGHT_1080P;
         }
