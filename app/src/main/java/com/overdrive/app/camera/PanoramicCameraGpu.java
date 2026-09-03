@@ -1646,7 +1646,7 @@ public class PanoramicCameraGpu {
         }
         cameraSurfaceTexture = new SurfaceTexture(cameraTextureId);
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1024);
+            cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1080);
         }
         ensureCameraCallbackThread();
         cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
