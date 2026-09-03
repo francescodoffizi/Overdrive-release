@@ -435,31 +435,57 @@ public class DiLink5QCarCamBackend {
         }
     }
 
-    public static String getCameraMappingArgs() {
-        // Check for manual system property override first: persist.overdrive.cams
-        String propCams = null;
+    public static String getCameraMappingProperty() {
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"getprop", "persist.overdrive.cams"});
             try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
                 String line = r.readLine();
                 if (line != null && !line.trim().isEmpty()) {
-                    propCams = line.trim();
+                    return line.trim();
                 }
             }
         } catch (Throwable ignored) {}
+        return "";
+    }
 
-        if (propCams != null && !propCams.isEmpty()) {
+    public static boolean setCameraMappingProperty(String camsCsv) {
+        String val = camsCsv != null ? camsCsv.trim() : "";
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"setprop", "persist.overdrive.cams", val});
+            p.waitFor(1000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            logger.info("Executed setprop persist.overdrive.cams " + val + " (exitCode=" + p.exitValue() + ")");
+            if (!val.isEmpty()) {
+                parseAndApplyMapping(val);
+            }
+            return true;
+        } catch (Throwable t) {
+            logger.warn("Failed to execute setprop persist.overdrive.cams: " + t.getMessage());
+            return false;
+        }
+    }
+
+    public static String getCameraMappingArgs() {
+        // Check for manual system property override first: persist.overdrive.cams
+        String propCams = getCameraMappingProperty();
+        if (!propCams.isEmpty()) {
             logger.info("Using camera mapping override from persist.overdrive.cams: " + propCams);
             parseAndApplyMapping(propCams);
             return "--cams " + propCams;
         }
 
-        // Automatic platform detection: BYD Shark (DMO / SA8155P)
+        // Automatic platform detection: BYD Shark (DMO / SA8155P) via Build or selected vehicle model
         String model = android.os.Build.MODEL != null ? android.os.Build.MODEL.toLowerCase() : "";
         String product = android.os.Build.PRODUCT != null ? android.os.Build.PRODUCT.toLowerCase() : "";
+        String configuredModel = "";
+        try {
+            org.json.JSONObject vehicle = com.overdrive.app.config.UnifiedConfigManager.getVehicle();
+            if (vehicle != null) {
+                configuredModel = vehicle.optString("modelId", "").toLowerCase();
+            }
+        } catch (Throwable ignored) {}
 
-        if (model.contains("shark") || product.contains("shark") || model.contains("dmo") || product.contains("dmo")) {
-            logger.info("Detected BYD Shark platform: configuring camera mapping 8,9,5,4");
+        if (configuredModel.contains("shark") || model.contains("shark") || product.contains("shark") || model.contains("dmo") || product.contains("dmo")) {
+            logger.info("Detected BYD Shark platform (model=" + model + ", product=" + product + ", config=" + configuredModel + "): configuring camera mapping 8,9,5,4");
             try {
                 nativeSetCameraMapping(8, 9, 5, 4, -1);
             } catch (Throwable t) {
