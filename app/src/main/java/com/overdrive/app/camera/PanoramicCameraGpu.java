@@ -235,13 +235,21 @@ public class PanoramicCameraGpu {
     // Don't hammer close+reopen: a single-client HAL that refuses the second
     // client would otherwise spin. One attempt per this interval.
     private static final long WINDSHIELD_REOPEN_MIN_INTERVAL_MS = 10_000;
-    // Dedicated handler for ImageReader.OnImageAvailableListener. MUST be
-    // separate from glHandler — renderLoop blocks the GL thread on
-    // frameSync.wait(), which would starve the listener if it ran on the
-    // same looper. The callback hops to glHandler.post for the actual GL
-    // bind work via onHalImageAvailable.
+    // Dedicated handler for camera frame-arrival listeners (both ImageReader
+    // and SurfaceTexture). MUST be separate from glHandler — renderLoop blocks
+    // the GL thread on frameSync.wait(250); if the listener ran on glHandler,
+    // the HAL's frame notification could never dispatch while waiting, forcing
+    // the GL thread to freeze for the full 250ms timeout.
     private HandlerThread imageReaderThread;
     private Handler imageReaderHandler;
+
+    private synchronized void ensureCameraCallbackThread() {
+        if (imageReaderThread == null) {
+            imageReaderThread = new HandlerThread("CamFrameCb");
+            imageReaderThread.start();
+            imageReaderHandler = new Handler(imageReaderThread.getLooper());
+        }
+    }
     
     // Camera object (via reflection).
     // volatile because reopenCamera() runs on the daemon thread and writes
@@ -1326,7 +1334,7 @@ public class PanoramicCameraGpu {
         // disabled — kept around for FPS-ceiling investigations on Seal
         // (verified ~26 fps by AvmImageReaderFpsProbe vs SurfaceFlinger's
         // ~8.5 fps clamp on legacy SurfaceTexture wiring).
-        if (USE_OEM_SURFACE_TEXTURE_PATH) {
+        if (USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             createCameraSurfaceTexture();
         } else {
             createCameraImageReader();
@@ -1621,10 +1629,11 @@ public class PanoramicCameraGpu {
      *        → renderLoop sees stFramePending, calls updateTexImage()
      *  Mirrors oem's gl.C5920a path: addTexture/setTexture/rmTexture.
      *  cameraTextureId is created in initializeGl() and is the EXTERNAL_OES
-     *  texture the SurfaceTexture writes into. We attach the listener on
-     *  glHandler so the renderLoop wakeup happens on the same thread that
-     *  later calls updateTexImage — the HAL ping/notify race that motivates
-     *  imagePending on the ImageReader path applies the same way here.
+     *  texture the SurfaceTexture writes into. The listener MUST run on
+     *  imageReaderHandler (separate HandlerThread) because renderLoop blocks
+     *  the GL thread on frameSync.wait(250). If the listener ran on glHandler,
+     *  the HAL's notification could never dispatch while waiting, forcing the
+     *  GL thread to freeze for the full 250ms timeout.
      *
      *  We do NOT call attachToGLContext / detachFromGLContext on this
      *  SurfaceTexture: the SurfaceTexture(int) ctor already attaches it to
@@ -1639,6 +1648,7 @@ public class PanoramicCameraGpu {
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1024);
         }
+        ensureCameraCallbackThread();
         cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
             // Cheap signalling — the actual updateTexImage happens on the GL
             // thread inside renderLoop. Ride frameSync so the wait/notify
@@ -1655,7 +1665,7 @@ public class PanoramicCameraGpu {
                 stFramePending = true;
                 frameSync.notify();
             }
-        }, glHandler);
+        }, imageReaderHandler);
         if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
             cameraSurface = new Surface(cameraSurfaceTexture);
             ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
@@ -2418,11 +2428,7 @@ public class PanoramicCameraGpu {
      *  listener would starve and the HAL queue would back up, dropping
      *  frames the way we observed at boot (Stats: 0 frames). */
     private void createCameraImageReader() {
-        if (imageReaderThread == null) {
-            imageReaderThread = new HandlerThread("CamImageReaderCb");
-            imageReaderThread.start();
-            imageReaderHandler = new Handler(imageReaderThread.getLooper());
-        }
+        ensureCameraCallbackThread();
         // Pool size 6 (vs the typical 3) absorbs GL-thread stalls during
         // surveillance heavy work (YOLO inference, foveated readback) without
         // throttling the HAL producer rate. At 5120×960 NV12 = 7.4 MB/buf,
@@ -2546,11 +2552,7 @@ public class PanoramicCameraGpu {
     }
 
     private void createWindshieldImageReader() {
-        if (imageReaderThread == null) {
-            imageReaderThread = new HandlerThread("CamImageReaderCb");
-            imageReaderThread.start();
-            imageReaderHandler = new Handler(imageReaderThread.getLooper());
-        }
+        ensureCameraCallbackThread();
         try {
             windshieldImageReader = ImageReader.newInstance(
                 1920, 1080,
@@ -4065,19 +4067,14 @@ public class PanoramicCameraGpu {
                     boolean drawStreamFrame = sStride <= 1 || (streamStrideCounter % sStride) == 0;
                     streamStrideCounter++;
                     if (drawStreamFrame) {
-                        if (USE_OEM_SURFACE_TEXTURE_PATH) {
+                        if (USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
                             localStreamScaler.setTextureMatrix(currentTexMatrix);
-                            // Stamp the presentation time on dilink4 ONLY.
+                            // Stamp the presentation time on dilink4 & dilink5.
                             //
-                            // This HAL emits at its own fixed rate (~4.5 fps
-                            // observed) and refuses setCameraFps outright — it
-                            // returns false for every value, and both the OEM app
-                            // (gl/a.java:402) and other OEM-derived players discard that return, so
-                            // false is simply normal here. An encoder configured
-                            // for a higher KEY_FRAME_RATE and fed UNSTAMPED buffers
-                            // has to invent timing: most ticks see an identical
-                            // image, yielding near-empty P-frames and a picture
-                            // that looks frozen after the first keyframe.
+                            // An encoder configured for a higher KEY_FRAME_RATE and
+                            // fed UNSTAMPED buffers has to invent timing: most ticks
+                            // see an identical image, yielding near-empty P-frames and
+                            // a picture that looks frozen after the first keyframe.
                             //
                             // currentFrameTimestampNs is the same single-domain
                             // System.nanoTime() PTS the recorder lane already
@@ -6567,9 +6564,9 @@ public class PanoramicCameraGpu {
         // while the encoder is clamped to 10, giving stride 2 and halving an
         // already-slow feed.) Legacy keeps the full stride behaviour, where
         // targetFps is genuinely honoured by the HAL and skipping saves real work.
-        if (USE_OEM_SURFACE_TEXTURE_PATH && stride > 1) {
-            logger.info("dilink4: forcing stream stride 1 (was " + stride
-                + ") — HAL rate is fixed and below the request, so decimating"
+        if ((USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) && stride > 1) {
+            logger.info("dilink4/5: forcing stream stride 1 (was " + stride
+                + ") — source rate is fixed or passthrough, so decimating"
                 + " would drop real frames");
             stride = 1;
         }

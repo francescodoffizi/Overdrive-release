@@ -4702,6 +4702,7 @@ public class GpuSurveillancePipeline {
         int effectiveStreamFps = streamFps;
         try {
             if (camera != null && camera.isUsingOemSurfaceTexturePath()
+                    && !com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()
                     && streamFps > DILINK4_STREAM_FPS_CAP) {
                 effectiveStreamFps = DILINK4_STREAM_FPS_CAP;
                 logger.info("dilink4: clamping stream encoder fps " + streamFps + " → "
@@ -8873,6 +8874,7 @@ public class GpuSurveillancePipeline {
             else if (mode == 2) hookMode = 1; // Destra (Right)
             else if (mode == 3) hookMode = 2; // Posteriore (Rear)
             else if (mode == 4) hookMode = 3; // Sinistra (Left)
+            else if (mode == 6) hookMode = 6; // Internal Dashcam / Cabin Camera
             com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setActiveCamera(hookMode);
         }
         if (streamScaler != null) {
