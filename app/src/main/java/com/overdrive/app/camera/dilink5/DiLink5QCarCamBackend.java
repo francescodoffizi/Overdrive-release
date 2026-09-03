@@ -89,9 +89,10 @@ public class DiLink5QCarCamBackend {
                 binFile.setExecutable(true, false);
             }
 
+            String camArgs = getCameraMappingArgs();
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " --all --time 0"
+                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --time 0"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();
@@ -425,9 +426,75 @@ public class DiLink5QCarCamBackend {
         setActiveCamera(enabled ? 5 : 4);
     }
 
+    public static void setCameraMapping(int front, int right, int rear, int left, int dashcam) {
+        try {
+            nativeSetCameraMapping(front, right, rear, left, dashcam);
+            logger.info("Configured camera hardware mapping: Front=" + front + ", Right=" + right + ", Rear=" + rear + ", Left=" + left + ", Dashcam=" + dashcam);
+        } catch (Throwable t) {
+            logger.warn("Failed to set camera mapping: " + t.getMessage());
+        }
+    }
+
+    public static String getCameraMappingArgs() {
+        // Check for manual system property override first: persist.overdrive.cams
+        String propCams = null;
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"getprop", "persist.overdrive.cams"});
+            try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                String line = r.readLine();
+                if (line != null && !line.trim().isEmpty()) {
+                    propCams = line.trim();
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        if (propCams != null && !propCams.isEmpty()) {
+            logger.info("Using camera mapping override from persist.overdrive.cams: " + propCams);
+            parseAndApplyMapping(propCams);
+            return "--cams " + propCams;
+        }
+
+        // Automatic platform detection: BYD Shark (DMO / SA8155P)
+        String model = android.os.Build.MODEL != null ? android.os.Build.MODEL.toLowerCase() : "";
+        String product = android.os.Build.PRODUCT != null ? android.os.Build.PRODUCT.toLowerCase() : "";
+
+        if (model.contains("shark") || product.contains("shark") || model.contains("dmo") || product.contains("dmo")) {
+            logger.info("Detected BYD Shark platform: configuring camera mapping 8,9,5,4");
+            try {
+                nativeSetCameraMapping(8, 9, 5, 4, -1);
+            } catch (Throwable t) {
+                logger.warn("Failed to set native camera mapping: " + t.getMessage());
+            }
+            return "--cams 8,9,5,4";
+        }
+
+        // Standard DiLink 5.0 default (Sealion 7, Song, Han, etc.)
+        try {
+            nativeSetCameraMapping(0, 1, 2, 3, -1);
+        } catch (Throwable t) {
+            logger.warn("Failed to set native camera mapping: " + t.getMessage());
+        }
+        return "--cams 0,1,2,3";
+    }
+
+    private static void parseAndApplyMapping(String csv) {
+        try {
+            String[] parts = csv.split(",");
+            int front = parts.length > 0 ? Integer.parseInt(parts[0].trim()) : 0;
+            int right = parts.length > 1 ? Integer.parseInt(parts[1].trim()) : 1;
+            int rear  = parts.length > 2 ? Integer.parseInt(parts[2].trim()) : 2;
+            int left  = parts.length > 3 ? Integer.parseInt(parts[3].trim()) : 3;
+            int dashcam = parts.length > 4 ? Integer.parseInt(parts[4].trim()) : -1;
+            nativeSetCameraMapping(front, right, rear, left, dashcam);
+        } catch (Throwable t) {
+            logger.warn("Error parsing camera mapping CSV '" + csv + "': " + t.getMessage());
+        }
+    }
+
     // --- Native JNI Interface ---
     private static native boolean nativeIsSupported();
     private static native void nativeSetActiveCamera(int camIdx);
+    private static native void nativeSetCameraMapping(int front, int right, int rear, int left, int dashcam);
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);
     private native boolean nativeStartSurface(android.view.Surface surface);
