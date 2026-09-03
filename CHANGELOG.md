@@ -4,6 +4,13 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Throttling Adattivo Polling ACC & Abbattimento Carico CPU Parassita in Sentry Mode (`AccMonitorController.kt`)**:
+  - **Risoluzione Carico CPU 83.3% su `grep Power Mute State` e `com.android.car`**: Il thread `PowerLevelPoller` eseguiva un loop fisso a 500 ms con fork continui di shell e query invasive a `dumpsys car_service` e `dumpsys power`.
+  - **Throttling Adattivo (3.000 ms Sentry / 1.500 ms Marcia)**: Introdotto un intervallo adattivo differenziato: a veicolo parcheggiato in Sentry Mode (ACC OFF) il polling rallenta a 3 secondi (riduzione dell'83% delle esecuzioni), mentre a veicolo acceso (ACC ON) si attesta a 1,5 secondi.
+  - **Fast-Path Zero-Fork con Binder Android**: Integrata la verifica dello stato interattivo dello schermo tramite chiamata IPC diretta a `PowerManager.isInteractive()` (0 fork di processi), eliminando le doppie chiamate a `dumpsys power`.
+  - **Cadenzamento Intelligente `dumpsys car_service`**: A schermo spento e veicolo già in Sentry, il controllo pesante su `Power Mute State` viene saltato o cadenzato ogni 9 secondi, evitando di risvegliare inutilmente il processo di sistema `com.android.car`.
+  - **Throttling Debug Logging**: Eliminata l'esecuzione periodica aggressiva ogni 30s di `logAllPowerSources()`, riservandola ai cambi di stato effettivi o a intervalli distanziati (ogni ~10 minuti).
+
 - **Selezione Veicolo BYD Shark & Gestione Property `persist.overdrive.cams` da UI Dashboard (`DashboardFragment.kt`, `MainActivity.kt`, `manifest.json`, `ModelsApiHandler.java`, `DiLink5QCarCamBackend.java`)**:
   - **Inclusione Ufficiale BYD Shark nel Catalogo Modelli**: Aggiunta la specifica per `BYD Shark` (DMO Super Hybrid Platform, 29.6 kWh Blade) in `manifest.json` e abilitata la risoluzione del nome in `DashboardFragment.kt` e `MainActivity.kt`.
   - **Controllo e Sincronizzazione Property `persist.overdrive.cams` da App**: Introdotto nel dialog veicolo della Dashboard il campo dedicato **"Canali Telecamere (QCarCam)"** visibile sui veicoli DiLink 5.0, precompilato automaticamente a `8,9,5,4` per BYD Shark e `0,1,2,3` per Sealion 7 / standard.
