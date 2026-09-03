@@ -1326,7 +1326,7 @@ public class PanoramicCameraGpu {
         // disabled — kept around for FPS-ceiling investigations on Seal
         // (verified ~26 fps by AvmImageReaderFpsProbe vs SurfaceFlinger's
         // ~8.5 fps clamp on legacy SurfaceTexture wiring).
-        if (USE_OEM_SURFACE_TEXTURE_PATH) {
+        if (USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             createCameraSurfaceTexture();
         } else {
             createCameraImageReader();
@@ -4065,19 +4065,14 @@ public class PanoramicCameraGpu {
                     boolean drawStreamFrame = sStride <= 1 || (streamStrideCounter % sStride) == 0;
                     streamStrideCounter++;
                     if (drawStreamFrame) {
-                        if (USE_OEM_SURFACE_TEXTURE_PATH) {
+                        if (USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
                             localStreamScaler.setTextureMatrix(currentTexMatrix);
-                            // Stamp the presentation time on dilink4 ONLY.
+                            // Stamp the presentation time on dilink4 & dilink5.
                             //
-                            // This HAL emits at its own fixed rate (~4.5 fps
-                            // observed) and refuses setCameraFps outright — it
-                            // returns false for every value, and both the OEM app
-                            // (gl/a.java:402) and other OEM-derived players discard that return, so
-                            // false is simply normal here. An encoder configured
-                            // for a higher KEY_FRAME_RATE and fed UNSTAMPED buffers
-                            // has to invent timing: most ticks see an identical
-                            // image, yielding near-empty P-frames and a picture
-                            // that looks frozen after the first keyframe.
+                            // An encoder configured for a higher KEY_FRAME_RATE and
+                            // fed UNSTAMPED buffers has to invent timing: most ticks
+                            // see an identical image, yielding near-empty P-frames and
+                            // a picture that looks frozen after the first keyframe.
                             //
                             // currentFrameTimestampNs is the same single-domain
                             // System.nanoTime() PTS the recorder lane already
@@ -6567,9 +6562,9 @@ public class PanoramicCameraGpu {
         // while the encoder is clamped to 10, giving stride 2 and halving an
         // already-slow feed.) Legacy keeps the full stride behaviour, where
         // targetFps is genuinely honoured by the HAL and skipping saves real work.
-        if (USE_OEM_SURFACE_TEXTURE_PATH && stride > 1) {
-            logger.info("dilink4: forcing stream stride 1 (was " + stride
-                + ") — HAL rate is fixed and below the request, so decimating"
+        if ((USE_OEM_SURFACE_TEXTURE_PATH || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) && stride > 1) {
+            logger.info("dilink4/5: forcing stream stride 1 (was " + stride
+                + ") — source rate is fixed or passthrough, so decimating"
                 + " would drop real frames");
             stride = 1;
         }

@@ -276,10 +276,20 @@ tasks.register("extractWebAssets") {
 android {
     signingConfigs {
         create("release") {
-            storeFile = file(System.getenv("KEYSTORE_FILE") ?: "release.jks")
-            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
-            keyPassword = System.getenv("KEY_PASSWORD") ?: ""
-            keyAlias = System.getenv("KEY_ALIAS") ?: "key0"
+            val envKs = System.getenv("KEYSTORE_FILE")
+            val releaseKs = if (envKs != null) file(envKs) else file("release.jks")
+            if (releaseKs.exists()) {
+                storeFile = releaseKs
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+                keyPassword = System.getenv("KEY_PASSWORD") ?: ""
+                keyAlias = System.getenv("KEY_ALIAS") ?: "key0"
+            } else {
+                val debugKs = file("${System.getProperty("user.home")}/.android/debug.keystore")
+                storeFile = debugKs
+                storePassword = "android"
+                keyPassword = "android"
+                keyAlias = "androiddebugkey"
+            }
         }
     }
     namespace = "com.overdrive.app"

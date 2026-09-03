@@ -4702,6 +4702,7 @@ public class GpuSurveillancePipeline {
         int effectiveStreamFps = streamFps;
         try {
             if (camera != null && camera.isUsingOemSurfaceTexturePath()
+                    && !com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()
                     && streamFps > DILINK4_STREAM_FPS_CAP) {
                 effectiveStreamFps = DILINK4_STREAM_FPS_CAP;
                 logger.info("dilink4: clamping stream encoder fps " + streamFps + " → "

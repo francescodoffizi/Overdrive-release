@@ -4,6 +4,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Collo di Bottiglia FPS Streaming Web & Ripristino Modalità Sentinella su DiLink 5 (`PanoramicCameraGpu.java`, `GpuSurveillancePipeline.java`, `AccSentryDaemon.java`)**:
+  - **Eliminazione Stride Decimation su DiLink 5 (`PanoramicCameraGpu.java`)**: Su DiLink 5 la pipeline opera in passthrough 1:1 dei sensori hardware. Esteso il bypass stride in `updateStreamFrameStride()` (`stride = 1`) per evitare che l'algoritmo di decimazione scarti 2 frame ogni 3, ripristinando il pieno framerate a 15-30 FPS.
+  - **Timestamps di Presentazione Monotoni (`PanoramicCameraGpu.java`)**: Nel PASS 1B del `renderLoop`, inoltrato `currentFrameTimestampNs` anche su DiLink 5 (`localStreamScaler.drawFrame(cameraTextureId, currentFrameTimestampNs)`), prevenendo frame dropping e instabilità di timing nell'encoder H.264 e nei player web.
+  - **Esclusione DiLink 5 dal Clamp FPS DiLink 4 (`GpuSurveillancePipeline.java`)**: Rimosso il cap forzato a 10 FPS (`DILINK4_STREAM_FPS_CAP`) quando il backend è DiLink 5, consentendo allo streaming encoder di erogare la cadenza impostata dal profilo utente (fino a 25-30 FPS).
+  - **Rilevamento Autonomo Power State in `AccSentryDaemon.java` per DiLink 5**: Integrato in `readPowerLevel()` il metodo dedicato `readPowerLevelDiLink5()` basato su `dumpsys car_service PowerMode` (Standby, Sleep, Pre StartUp, Off vs StartUp, Display On) e `PowerManager.isInteractive()`. Risolto il blocco continuo `ACC HAL snapshot unavailable` causato dall'assenza della classe legacy `BYDAutoBodyworkDevice`, ripristinando la commutazione automatica in `InSentryMode: true` e l'armamento della Sentinella su transizione ACC-OFF.
+
 - **Allineamento con Upstream `origin/main` & Risoluzione Conflitti PR**:
   - Eseguito il merge dei commit più recenti di `origin/main` (`ead978a4`).
   - Risolto il conflitto `modify/delete` causato dalla dismissione upstream della cartella `dilink-probe/`.
