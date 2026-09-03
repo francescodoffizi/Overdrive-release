@@ -58,16 +58,34 @@ public class DiLink5QCarCamBackend {
         this.cameraId = cameraId;
     }
 
+    private static class ExtractResult {
+        final boolean found;
+        final boolean updated;
+        ExtractResult(boolean found, boolean updated) {
+            this.found = found;
+            this.updated = updated;
+        }
+    }
+
     private static synchronized void ensureHardwareProcess() {
         try {
+            // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
+            String binPath = "/data/local/tmp/fast_cam_capture";
+            java.io.File binFile = new java.io.File(binPath);
+            boolean wasUpdated = ensureDaemonBinaryExtracted(binFile);
+
             // Check if fast_cam_capture is already running
             Process checkPgrep = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", "fast_cam_capture"});
             java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkPgrep.getInputStream()));
             String line = reader.readLine();
             checkPgrep.waitFor();
             if (line != null && !line.trim().isEmpty()) {
-                logger.info("Qualcomm fast_cam_capture hardware pipeline already running (PID: " + line.trim() + ")");
-                return;
+                if (!wasUpdated) {
+                    logger.info("Qualcomm fast_cam_capture hardware pipeline already running (PID: " + line.trim() + ")");
+                    return;
+                } else {
+                    logger.info("fast_cam_capture binary was updated from APK; restarting process (old PID: " + line.trim() + ")...");
+                }
             }
 
             logger.info("Starting Qualcomm fast_cam_capture hardware capture supervisor...");
@@ -78,12 +96,6 @@ public class DiLink5QCarCamBackend {
                 Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"}).waitFor();
             } catch (Throwable ignored) {}
 
-            // Ensure fast_cam_capture binary exists in /data/local/tmp and is executable
-            String binPath = "/data/local/tmp/fast_cam_capture";
-            java.io.File binFile = new java.io.File(binPath);
-            if (!binFile.exists() || binFile.length() == 0) {
-                ensureDaemonBinaryExtracted(binFile);
-            }
             if (binFile.exists()) {
                 binFile.setReadable(true, false);
                 binFile.setExecutable(true, false);
@@ -116,24 +128,46 @@ public class DiLink5QCarCamBackend {
         }
     }
 
-    private static void ensureDaemonBinaryExtracted(java.io.File dst) {
+    private static boolean ensureDaemonBinaryExtracted(java.io.File dst) {
         try {
             // 0. Try standard Android Context assets if available
             try {
                 android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
                 if (ctx != null) {
+                    long assetLen = -1;
+                    try (android.content.res.AssetFileDescriptor afd = ctx.getAssets().openFd("dilink5/fast_cam_capture")) {
+                        assetLen = afd.getLength();
+                    } catch (Throwable ignored) {}
+
+                    if (dst.exists() && dst.length() > 0 && assetLen > 0 && dst.length() == assetLen) {
+                        dst.setReadable(true, false);
+                        dst.setExecutable(true, false);
+                        return false;
+                    }
+
+                    java.io.File tmpDst = new java.io.File(dst.getParentFile(), dst.getName() + ".tmp." + System.currentTimeMillis());
                     try (java.io.InputStream in = ctx.getAssets().open("dilink5/fast_cam_capture");
-                         java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+                         java.io.OutputStream out = new java.io.FileOutputStream(tmpDst)) {
                         byte[] buf = new byte[8192];
                         int len;
                         while ((len = in.read(buf)) > 0) {
                             out.write(buf, 0, len);
                         }
                         out.flush();
+                    }
+                    if (tmpDst.exists() && tmpDst.length() > 0) {
+                        if (dst.exists() && dst.length() == tmpDst.length()) {
+                            tmpDst.delete();
+                            dst.setReadable(true, false);
+                            dst.setExecutable(true, false);
+                            return false;
+                        }
+                        if (dst.exists()) dst.delete();
+                        tmpDst.renameTo(dst);
                         dst.setReadable(true, false);
                         dst.setExecutable(true, false);
-                        logger.info("Extracted fast_cam_capture from Context assets");
-                        return;
+                        logger.info("Extracted and deployed fast_cam_capture from Context assets (" + dst.length() + " bytes)");
+                        return true;
                     }
                 }
             } catch (Throwable t) {
@@ -147,9 +181,10 @@ public class DiLink5QCarCamBackend {
                     if (cpEntry.endsWith(".apk") && (cpEntry.contains("com.overdrive.app") || new java.io.File(cpEntry).exists())) {
                         java.io.File apkFile = new java.io.File(cpEntry);
                         if (apkFile.exists() && apkFile.canRead()) {
-                            if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
-                                logger.info("Extracted fast_cam_capture from CLASSPATH APK: " + cpEntry);
-                                return;
+                            ExtractResult res = extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst);
+                            if (res.found) {
+                                if (res.updated) logger.info("Updated fast_cam_capture from CLASSPATH APK: " + cpEntry);
+                                return res.updated;
                             }
                         }
                     }
@@ -164,9 +199,10 @@ public class DiLink5QCarCamBackend {
                     if (pkgCodePath != null) {
                         java.io.File apkFile = new java.io.File(pkgCodePath);
                         if (apkFile.exists() && apkFile.canRead()) {
-                            if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
-                                logger.info("Extracted fast_cam_capture from Context package code path: " + pkgCodePath);
-                                return;
+                            ExtractResult res = extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst);
+                            if (res.found) {
+                                if (res.updated) logger.info("Updated fast_cam_capture from Context package code path: " + pkgCodePath);
+                                return res.updated;
                             }
                         }
                     }
@@ -186,9 +222,10 @@ public class DiLink5QCarCamBackend {
                             String apkPath = line.substring("package:".length()).trim();
                             java.io.File apkFile = new java.io.File(apkPath);
                             if (apkFile.exists() && apkFile.canRead()) {
-                                if (extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst)) {
-                                    logger.info("Extracted fast_cam_capture from pm path: " + apkPath);
-                                    return;
+                                ExtractResult res = extractFromZip(apkFile, "assets/dilink5/fast_cam_capture", dst);
+                                if (res.found) {
+                                    if (res.updated) logger.info("Updated fast_cam_capture from pm path: " + apkPath);
+                                    return res.updated;
                                 }
                             }
                         }
@@ -202,10 +239,10 @@ public class DiLink5QCarCamBackend {
             // 4. Recursive scan in /data/app (handling Android 11+ ~~hash/ subdirectories)
             java.io.File dataApp = new java.io.File("/data/app");
             if (dataApp.exists() && dataApp.isDirectory()) {
-                findAndExtractInDir(dataApp, dst, 0, 3);
-                if (dst.exists() && dst.length() > 0) {
-                    logger.info("Extracted fast_cam_capture via /data/app recursive scan");
-                    return;
+                ExtractResult res = findAndExtractInDir(dataApp, dst, 0, 3);
+                if (res.found) {
+                    if (res.updated) logger.info("Updated fast_cam_capture via /data/app recursive scan");
+                    return res.updated;
                 }
             }
 
@@ -214,9 +251,10 @@ public class DiLink5QCarCamBackend {
             if (propClasspath != null && !propClasspath.isEmpty()) {
                 for (String cpEntry : propClasspath.split(":")) {
                     if (cpEntry.endsWith(".apk") && new java.io.File(cpEntry).exists()) {
-                        if (extractFromZip(new java.io.File(cpEntry), "assets/dilink5/fast_cam_capture", dst)) {
-                            logger.info("Extracted fast_cam_capture from java.class.path: " + cpEntry);
-                            return;
+                        ExtractResult res = extractFromZip(new java.io.File(cpEntry), "assets/dilink5/fast_cam_capture", dst);
+                        if (res.found) {
+                            if (res.updated) logger.info("Updated fast_cam_capture from java.class.path: " + cpEntry);
+                            return res.updated;
                         }
                     }
                 }
@@ -224,25 +262,26 @@ public class DiLink5QCarCamBackend {
         } catch (Throwable t) {
             logger.warn("ensureDaemonBinaryExtracted failed: " + t.getMessage());
         }
-    }
-
-    private static boolean findAndExtractInDir(java.io.File dir, java.io.File dst, int depth, int maxDepth) {
-        if (dir == null || !dir.exists() || !dir.isDirectory() || depth > maxDepth) return false;
-        java.io.File[] files = dir.listFiles();
-        if (files == null) return false;
-        for (java.io.File f : files) {
-            if (f.isDirectory()) {
-                if (findAndExtractInDir(f, dst, depth + 1, maxDepth)) return true;
-            } else if (f.getName().endsWith(".apk") && f.getAbsolutePath().contains("com.overdrive.app")) {
-                if (extractFromZip(f, "assets/dilink5/fast_cam_capture", dst)) {
-                    return true;
-                }
-            }
-        }
         return false;
     }
 
-    private static boolean extractFromZip(java.io.File zipFile, String entryPath, java.io.File dst) {
+    private static ExtractResult findAndExtractInDir(java.io.File dir, java.io.File dst, int depth, int maxDepth) {
+        if (dir == null || !dir.exists() || !dir.isDirectory() || depth > maxDepth) return new ExtractResult(false, false);
+        java.io.File[] files = dir.listFiles();
+        if (files == null) return new ExtractResult(false, false);
+        for (java.io.File f : files) {
+            if (f.isDirectory()) {
+                ExtractResult res = findAndExtractInDir(f, dst, depth + 1, maxDepth);
+                if (res.found) return res;
+            } else if (f.getName().endsWith(".apk") && f.getAbsolutePath().contains("com.overdrive.app")) {
+                ExtractResult res = extractFromZip(f, "assets/dilink5/fast_cam_capture", dst);
+                if (res.found) return res;
+            }
+        }
+        return new ExtractResult(false, false);
+    }
+
+    private static ExtractResult extractFromZip(java.io.File zipFile, String entryPath, java.io.File dst) {
         try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(zipFile)) {
             java.util.zip.ZipEntry entry = zf.getEntry(entryPath);
             if (entry != null) {
@@ -250,7 +289,7 @@ public class DiLink5QCarCamBackend {
                 if (dst.exists() && dst.length() == entry.getSize() && entry.getSize() > 0) {
                     dst.setReadable(true, false);
                     dst.setExecutable(true, false);
-                    return true;
+                    return new ExtractResult(true, false);
                 }
                 // Overwrite stale/mismatched file
                 java.io.File tmpDst = new java.io.File(dst.getParentFile(), dst.getName() + ".tmp." + System.currentTimeMillis());
@@ -269,13 +308,13 @@ public class DiLink5QCarCamBackend {
                     dst.setReadable(true, false);
                     dst.setExecutable(true, false);
                     logger.info("Extracted and deployed " + dst.getName() + " (" + dst.length() + " bytes, mode 755)");
-                    return true;
+                    return new ExtractResult(true, true);
                 }
             }
         } catch (Throwable t) {
             logger.warn("extractFromZip failed for " + entryPath + ": " + t.getMessage());
         }
-        return false;
+        return new ExtractResult(false, false);
     }
 
     private static void copyFile(java.io.File src, java.io.File dst) {

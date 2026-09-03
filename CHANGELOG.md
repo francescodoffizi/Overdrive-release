@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Auto-Aggiornamento Trasparente `fast_cam_capture` & Riavvio Coordinato Sidecar/Demoni (`DiLink5QCarCamBackend.java`, `CameraDaemonController.kt`, `UpdateLifecycle.java`, `AppUpdater.java`)**:
+  - **Sostituzione Automatica da Asset APK senza ADB Push Manuale**: Risolto il blocco per cui il file esistente `/data/local/tmp/fast_cam_capture` non veniva aggiornato alla reinstallazione dell'app se già presente. Il backend `DiLink5QCarCamBackend` ora confronta sempre la dimensione dell'asset interno all'APK con il file su disco (`dst.length() == entry.getSize()`), estraendo e sovrascrivendo automaticamente il binario via file temporaneo atomico (modalità 755) in caso di nuova versione o discrepanza.
+  - **Auto-Respawn Intelligente del Sidecar Hardware**: Qualora il binario venga aggiornato, `ensureHardwareProcess()` termina la vecchia istanza in esecuzione (`pkill -9 -f fast_cam_capture`) e rilancia immediatamente il nuovo processo con gli argomenti aggiornati (`--cams ... --time 0`).
+  - **Inclusione nel Kill Cascade e Lifecycle**: Aggiunto `fast_cam_capture` alla lista `RELATED_PROCESSES` in `CameraDaemonController.kt` e agli script di pulizia pre-installazione in `UpdateLifecycle.java` e `AppUpdater.java`, garantendo che lo stop/restart del Camera Daemon o un aggiornamento APK chiuda e riavvii in modo sincrono l'intera catena sidecar/demoni.
+
 - **Throttling Adattivo Polling ACC & Abbattimento Carico CPU Parassita in Sentry Mode (`AccMonitorController.kt`)**:
   - **Risoluzione Carico CPU 83.3% su `grep Power Mute State` e `com.android.car`**: Il thread `PowerLevelPoller` eseguiva un loop fisso a 500 ms con fork continui di shell e query invasive a `dumpsys car_service` e `dumpsys power`.
   - **Throttling Adattivo (3.000 ms Sentry / 1.500 ms Marcia)**: Introdotto un intervallo adattivo differenziato: a veicolo parcheggiato in Sentry Mode (ACC OFF) il polling rallenta a 3 secondi (riduzione dell'83% delle esecuzioni), mentre a veicolo acceso (ACC ON) si attesta a 1,5 secondi.
