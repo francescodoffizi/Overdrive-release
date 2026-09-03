@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Allineamento con Upstream `origin/main` & Risoluzione Conflitti PR**:
+  - Eseguito il merge dei commit più recenti di `origin/main` (`ead978a4`).
+  - Risolto il conflitto `modify/delete` causato dalla dismissione upstream della cartella `dilink-probe/`.
+  - Verificata la completa compatibilità di compilazione con Gradle e Corretto 17 (`BUILD SUCCESSFUL`).
+
 - **Architettura Ibrida Dual-Pipeline 4K Ultra-HD & Streaming Web 720p (`video_Improve.md`, `qcarcam_bridge.cpp`, `GpuPipelineConfig.java`, `GpuSurveillancePipeline.java`, `DiLink5QCarCamBackend.java`, `CMakeLists.txt`)**:
   - **Integrazione Nuovi Binari Precompilati `fast_cam_capture` & `libfast_cam_client.so`**: Sostituiti gli asset e le librerie native con la build ARM64 compilata da `frame_grabber_light/fast_cam_capture/` (binario 21.912 bytes con supporto `--all --time 0` e libreria client da 8.344 bytes con `SONAME: libfast_cam_client.so`).
   - **Doppia Pipeline Indipendente & Zero-Copy**:
