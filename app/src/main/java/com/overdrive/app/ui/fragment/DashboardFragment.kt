@@ -1442,6 +1442,14 @@ class DashboardFragment : Fragment() {
         val modelDropdown = dialogView.findViewById<
             com.google.android.material.textfield.MaterialAutoCompleteTextView>(
             R.id.vehicleModelDropdown)
+        val camMappingLayout = dialogView.findViewById<
+            com.google.android.material.textfield.TextInputLayout>(R.id.vehicleCameraMappingLayout)
+        val camMappingInput = dialogView.findViewById<
+            com.google.android.material.textfield.TextInputEditText>(R.id.vehicleCameraMappingInput)
+        val isDiLink5 = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()
+        if (isDiLink5) {
+            camMappingLayout.visibility = View.VISIBLE
+        }
 
         // Track the selected model's id locally (the dropdown's text holds
         // the user-facing title; the id is what we POST). Each entry also
@@ -1463,6 +1471,13 @@ class DashboardFragment : Fragment() {
                 if (entry.nominalKwh > 0) {
                     capInput.setText(String.format("%.1f", entry.nominalKwh))
                 }
+                if (isDiLink5) {
+                    if (entry.id.equals("shark", ignoreCase = true)) {
+                        camMappingInput.setText("8,9,5,4")
+                    } else if (entry.id.equals("sealion7", ignoreCase = true)) {
+                        camMappingInput.setText("0,1,2,3")
+                    }
+                }
             }
         }
 
@@ -1471,6 +1486,10 @@ class DashboardFragment : Fragment() {
             .also { metricsExecutor = it }
         executor.execute {
             var initialKwh = 0.0
+            var initialCamMapping = ""
+            if (isDiLink5) {
+                initialCamMapping = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.getCameraMappingProperty()
+            }
             val modelIds = mutableListOf<ModelEntry>()
             var initialModelId: String? = null
 
@@ -1605,6 +1624,15 @@ class DashboardFragment : Fragment() {
                         selectedModelId = initialModelId
                     }
                 }
+                if (isDiLink5) {
+                    if (initialCamMapping.isNotEmpty()) {
+                        camMappingInput.setText(initialCamMapping)
+                    } else if (selectedModelId.equals("shark", ignoreCase = true)) {
+                        camMappingInput.setText("8,9,5,4")
+                    } else {
+                        camMappingInput.setText("0,1,2,3")
+                    }
+                }
 
                 // Populate summary section. Each line shows only when its data
                 // is meaningful — keeps the dialog tight when the daemon is
@@ -1685,7 +1713,8 @@ class DashboardFragment : Fragment() {
                     return@setOnClickListener
                 }
                 completionDeferred = true
-                postNominalAndModel(kwh, selectedModelId) { finishOnce() }
+                val customMapping = if (isDiLink5) camMappingInput.text?.toString()?.trim().orEmpty() else null
+                postNominalAndModel(kwh, selectedModelId, customMapping) { finishOnce() }
                 dialog.dismiss()
             }
             dialog.getButton(android.content.DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
@@ -1753,11 +1782,20 @@ class DashboardFragment : Fragment() {
     private fun postNominalAndModel(
         kwh: Double,
         modelId: String?,
+        cameraMapping: String? = null,
         onComplete: (() -> Unit)? = null,
     ) {
         val executor = metricsExecutor ?: Executors.newSingleThreadExecutor()
             .also { metricsExecutor = it }
         executor.execute {
+            if (!cameraMapping.isNullOrEmpty()) {
+                com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setCameraMappingProperty(cameraMapping)
+            } else if (modelId.equals("shark", ignoreCase = true)) {
+                com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setCameraMappingProperty("8,9,5,4")
+            } else if (modelId.equals("sealion7", ignoreCase = true)) {
+                com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setCameraMappingProperty("0,1,2,3")
+            }
+
             try {
                 val conn = com.overdrive.app.util.DaemonHttpClient.open(
                     "/api/performance/soh/nominal", "POST", 3000, 5000)
@@ -1774,7 +1812,13 @@ class DashboardFragment : Fragment() {
                         "/api/models/selected", "POST", 3000, 5000)
                     conn.doOutput = true
                     conn.setRequestProperty("Content-Type", "application/json")
-                    conn.outputStream.use { it.write("{\"modelId\":\"$modelId\"}".toByteArray()) }
+                    val payload = org.json.JSONObject().apply {
+                        put("modelId", modelId)
+                        if (!cameraMapping.isNullOrEmpty()) {
+                            put("cameraMapping", cameraMapping)
+                        }
+                    }
+                    conn.outputStream.use { it.write(payload.toString().toByteArray()) }
                     conn.responseCode
                     conn.disconnect()
                 } catch (_: Throwable) {}
@@ -1802,6 +1846,7 @@ class DashboardFragment : Fragment() {
             "seagull" -> getString(R.string.vehicle_model_seagull)
             "sealion6" -> "BYD Sealion 6"
             "sealion7" -> "BYD Sealion 7"
+            "shark" -> "BYD Shark"
             "sealu", "seal-u" -> "BYD Seal U"
             else -> modelId.replaceFirstChar { it.uppercase() }
         }

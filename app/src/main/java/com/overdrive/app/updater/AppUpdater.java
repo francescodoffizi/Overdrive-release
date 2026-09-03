@@ -1825,6 +1825,8 @@ public class AppUpdater {
                 + "echo \"disabled for update at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n");
         script.append("chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n");
         script.append(psAwkKillLine("cam_daemon"));
+        script.append(psAwkKillLine("fast_cam_capture"));
+        script.append("killall -9 fast_cam_capture 2>/dev/null\n");
         script.append(psAwkKillLine("acc_sentry"));
         script.append(psAwkKillLine("start_telegram"));
         script.append("killall -9 byd_cam_daemon 2>/dev/null\n");
@@ -2261,6 +2263,7 @@ public class AppUpdater {
                 "rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/start_acc_sentry.sh /data/local/tmp/start_zrok.sh /data/local/tmp/start_telegram.sh 2>/dev/null\n" +
                 psAwkKillLine("cam_daemon") +
+                psAwkKillLine("fast_cam_capture") +
                 psAwkKillLine("acc_sentry") +
                 psAwkKillLine("sentry_daemon") +
                 psAwkKillLine("telegram_bot_daemon") +
@@ -2269,6 +2272,7 @@ public class AppUpdater {
                 psAwkKillLine("zrok") +
                 psAwkKillLine("sing-box") +
                 psAwkKillLine("tailscaled") +
+                "killall -9 fast_cam_capture 2>/dev/null\n" +
                 "killall -9 cloudflared 2>/dev/null\n" +
                 "killall -9 zrok 2>/dev/null\n" +
                 "killall -9 tailscaled 2>/dev/null\n" +

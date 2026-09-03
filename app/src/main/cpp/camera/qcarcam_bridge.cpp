@@ -14,6 +14,7 @@
 #include <atomic>
 #include <mutex>
 #include "fast_cam_bridge.h"
+#include "fast_cam_ipc.h"
 
 #define TAG "QCarCamBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -24,6 +25,15 @@
 #define FRAME_HEIGHT 1300
 
 namespace {
+
+struct CameraMapping {
+    std::atomic<int> hw_front{0};
+    std::atomic<int> hw_right{1};
+    std::atomic<int> hw_rear{2};
+    std::atomic<int> hw_left{3};
+    std::atomic<int> hw_dashcam{-1};
+};
+static CameraMapping g_camMapping;
 
 std::atomic<bool> g_streaming{false};
 std::atomic<int> g_active_camera{0};
@@ -169,7 +179,7 @@ void* streamClientLoop(void* arg) {
     LOGI("FastCamClient connected successfully to fast_cam IPC stream (@fast_cam.sock)!");
 
     FastCamFrame frame;
-    const uint8_t* cam_ptrs[4] = { nullptr, nullptr, nullptr, nullptr };
+    const uint8_t* cam_ptrs[FAST_CAM_MAX_CAMS] = { nullptr };
     static uint8_t mosaic_buf_2x2[FRAME_WIDTH_1080P * FRAME_HEIGHT_1080P * 2];
     std::unique_ptr<uint8_t[]> mosaic_buf_4k;
     int current_win_w = 0;
@@ -182,8 +192,24 @@ void* streamClientLoop(void* arg) {
             continue;
         }
 
-        if (frame.cam_id < 4 && frame.pixels) {
-            cam_ptrs[frame.cam_id] = frame.pixels;
+        // Map incoming frame.cam_id to canonical semantic slot:
+        // Slot 0 = Front, Slot 1 = Right, Slot 2 = Rear, Slot 3 = Left, Slot 6 = Internal Dashcam
+        int slot = -1;
+        int hw_f  = g_camMapping.hw_front.load();
+        int hw_r  = g_camMapping.hw_right.load();
+        int hw_re = g_camMapping.hw_rear.load();
+        int hw_l  = g_camMapping.hw_left.load();
+        int hw_dc = g_camMapping.hw_dashcam.load();
+
+        if (frame.cam_id == (uint32_t)hw_f)        slot = 0;
+        else if (frame.cam_id == (uint32_t)hw_r)   slot = 1;
+        else if (frame.cam_id == (uint32_t)hw_re)  slot = 2;
+        else if (frame.cam_id == (uint32_t)hw_l)   slot = 3;
+        else if (hw_dc >= 0 && frame.cam_id == (uint32_t)hw_dc) slot = 6;
+        else if (frame.cam_id < FAST_CAM_MAX_CAMS) slot = (int)frame.cam_id;
+
+        if (slot >= 0 && slot < FAST_CAM_MAX_CAMS && frame.pixels) {
+            cam_ptrs[slot] = frame.pixels;
         }
 
         int desired_cam = g_active_camera.load();
@@ -216,9 +242,9 @@ void* streamClientLoop(void* arg) {
             render_pixels = mosaic_buf_2x2;
             target_w = FRAME_WIDTH_1080P;
             target_h = FRAME_HEIGHT_1080P;
-        } else if (desired_cam >= 0 && desired_cam < 4) {
-            // Specific single camera channel requested
-            if ((int)frame.cam_id == desired_cam) {
+        } else if (desired_cam >= 0 && desired_cam < FAST_CAM_MAX_CAMS) {
+            // Specific single camera channel requested (0..3 surround or 6 internal dashcam)
+            if (slot == desired_cam) {
                 render_pixels = frame.pixels;
             }
             target_w = FRAME_WIDTH_1080P;
@@ -330,6 +356,18 @@ JNIEXPORT void JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeSetActiveCamera(
     JNIEnv* env, jclass clazz, jint camIdx) {
     g_active_camera.store(camIdx);
+}
+
+JNIEXPORT void JNICALL
+Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeSetCameraMapping(
+    JNIEnv* env, jclass clazz, jint front, jint right, jint rear, jint left, jint dashcam) {
+    g_camMapping.hw_front.store(front);
+    g_camMapping.hw_right.store(right);
+    g_camMapping.hw_rear.store(rear);
+    g_camMapping.hw_left.store(left);
+    g_camMapping.hw_dashcam.store(dashcam);
+    LOGI("Hardware camera mapping set: Front=%d, Right=%d, Rear=%d, Left=%d, Dashcam=%d",
+         front, right, rear, left, dashcam);
 }
 
 JNIEXPORT void JNICALL
