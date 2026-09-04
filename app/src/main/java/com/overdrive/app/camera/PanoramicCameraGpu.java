@@ -3698,6 +3698,15 @@ public class PanoramicCameraGpu {
                     + " confirm content before anything is persisted");
             }
 
+            // On DiLink 5, cameras are handled natively via DiLink5QCarCamBackend (Qualcomm AIS).
+            // NEVER probe, downscale or sweep camera IDs on DiLink 5 — doing so cycles the HAL and
+            // triggers a system watchdog reboot of the head unit / pad.
+            if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+                probeComplete = true;
+                autoProbeCameras = false;
+                skipFrameValidation = true;
+            }
+
             // SOTA: Full-matrix auto-probe at frame 15 (~2 sec).
             // Sweeps camera IDs 0-5 × surface modes 0-5 to find the first
             // combination that produces panoramic image data. Each combo gets
@@ -3710,7 +3719,8 @@ public class PanoramicCameraGpu {
             // suspenders (this check), because the dead-slot walk resets
             // skipFrameValidation=false in advanceToNextCandidateCameraId.
             if (frameCounter == 15 && downscaler != null && downscaler.isInitialized()
-                    && !skipFrameValidation) {
+                    && !skipFrameValidation
+                    && !com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
                 try {
                     byte[] probe = downscaler.readPixels(cameraTextureId, 8, 8);
                     boolean hasData = false;
@@ -3784,6 +3794,7 @@ public class PanoramicCameraGpu {
             // black frame; without isInitialized() this recheck would re-probe
             // a working camera whenever the downscaler thread failed init.
             if (frameCounter == 50 && !autoProbeCameras && !skipFrameValidation
+                    && !com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()
                     && downscaler != null && downscaler.isInitialized()) {
                 try {
                     byte[] probe = downscaler.readPixels(cameraTextureId, 8, 8);
@@ -4356,6 +4367,12 @@ public class PanoramicCameraGpu {
      * @param skipId Camera ID to skip (the one we just tested). -1 to start fresh.
      */
     private void advanceProbeToNext(int skipId) {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            logger.info("DiLink 5: advanceProbeToNext suppressed — native QCarCam backend active");
+            probeComplete = true;
+            autoProbeCameras = false;
+            return;
+        }
         // Close current camera cleanly
         if (cameraObj != null) {
             try {
@@ -6620,6 +6637,12 @@ public class PanoramicCameraGpu {
      * with non-black frames.
      */
     public void setAutoProbeCameras(boolean enabled) {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            this.autoProbeCameras = false;
+            this.probeComplete = true;
+            logger.info("Camera auto-probe: DISABLED (DiLink 5 native QCarCam platform)");
+            return;
+        }
         this.autoProbeCameras = enabled;
         if (enabled) {
             probeComplete = false;
