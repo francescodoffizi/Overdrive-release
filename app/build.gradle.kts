@@ -483,6 +483,10 @@ android {
                 "lib/x86/**",
                 "lib/x86_64/**"
             )
+
+            pickFirsts += listOf(
+                "**/libfast_cam_client.so"
+            )
         }
     }
 }

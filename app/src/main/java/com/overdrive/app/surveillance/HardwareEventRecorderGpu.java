@@ -1816,11 +1816,23 @@ public class HardwareEventRecorderGpu {
         logger.info("Creating MediaCodec encoder...");
         final MediaCodec[] encoderResult = {null};
         final Exception[] createError = {null};
+        final String[] effectiveMimeType = {finalCodecMimeType};
         Thread createThread = new Thread(() -> {
             try {
                 encoderResult[0] = MediaCodec.createEncoderByType(finalCodecMimeType);
             } catch (Exception e) {
-                createError[0] = e;
+                if (!"video/avc".equalsIgnoreCase(finalCodecMimeType)) {
+                    logger.warn("Failed to create encoder for " + finalCodecMimeType + " (" + e.getMessage() + "), falling back to video/avc");
+                    try {
+                        encoderResult[0] = MediaCodec.createEncoderByType("video/avc");
+                        effectiveMimeType[0] = "video/avc";
+                        finalFormat.setString(MediaFormat.KEY_MIME, "video/avc");
+                    } catch (Exception e2) {
+                        createError[0] = e;
+                    }
+                } else {
+                    createError[0] = e;
+                }
             }
         }, "EncoderCreate");
         createThread.start();
@@ -1838,6 +1850,7 @@ public class HardwareEventRecorderGpu {
             throw createError[0];
         }
         encoder = encoderResult[0];
+        this.codecMimeType = effectiveMimeType[0];
         // Confirm the negotiated codec name on this device, not just our intent.
         // If the device-side codec selection silently downgraded HEVC→AVC (rare,
         // but possible if the platform encoder list rejects HEVC for our params),

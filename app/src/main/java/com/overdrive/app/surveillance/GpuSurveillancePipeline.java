@@ -1606,6 +1606,20 @@ public class GpuSurveillancePipeline {
         }
     }
 
+    private static boolean isHevcEncoderSupported() {
+        try {
+            android.media.MediaCodecList list = new android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS);
+            for (android.media.MediaCodecInfo info : list.getCodecInfos()) {
+                if (info.isEncoder()) {
+                    for (String type : info.getSupportedTypes()) {
+                        if (type.equalsIgnoreCase("video/hevc")) return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     /**
      * Reinitializes the encoder with current config settings.
      * This is a synchronous operation that waits for completion.
@@ -1675,7 +1689,7 @@ public class GpuSurveillancePipeline {
             if (config != null && config.is4K()) {
                 this.encoderWidth = 3840;
                 this.encoderHeight = 2160;
-                codecMimeType = "video/hevc";
+                codecMimeType = isHevcEncoderSupported() ? "video/hevc" : "video/avc";
                 com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.set4KUltraEnabled(true);
             } else {
                 this.encoderWidth = 1920;
@@ -1989,7 +2003,7 @@ public class GpuSurveillancePipeline {
             if (config != null && config.is4K()) {
                 this.encoderWidth = 3840;
                 this.encoderHeight = 2160;
-                codecMimeType = "video/hevc";
+                codecMimeType = isHevcEncoderSupported() ? "video/hevc" : "video/avc";
                 com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.set4KUltraEnabled(true);
             } else {
                 this.encoderWidth = 1920;

@@ -67,6 +67,18 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    private static final java.util.Set<DiLink5QCarCamBackend> sActiveInstances =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    public static boolean hasActiveStreamingBackend() {
+        for (DiLink5QCarCamBackend backend : sActiveInstances) {
+            if (backend.isStreaming.get() || backend.nativeHandle != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static volatile boolean sShutdownHookRegistered = false;
 
     public static synchronized void terminateHardwareProcess() {
@@ -137,6 +149,27 @@ public class DiLink5QCarCamBackend {
                         logger.info("[FastCamProc] " + drainLine);
                     }
                 } catch (Throwable ignored) {}
+
+                int exitCode = -1;
+                try {
+                    exitCode = proc.exitValue();
+                } catch (Throwable ignored) {}
+
+                if (sHardwareProcess == proc) {
+                    sHardwareProcess = null;
+                }
+
+                if (hasActiveStreamingBackend()) {
+                    logger.warn("Qualcomm fast_cam_capture process exited unexpectedly (code " + exitCode + "). Triggering auto-recovery supervisor in 500ms...");
+                    try {
+                        Thread.sleep(500);
+                        if (hasActiveStreamingBackend()) {
+                            ensureHardwareProcess();
+                        }
+                    } catch (Throwable t) {
+                        logger.error("Auto-recovery supervisor failed: " + t.getMessage(), t);
+                    }
+                }
             }, "fast-cam-capture-drainer");
             drainer.setDaemon(true);
             drainer.start();
@@ -397,6 +430,7 @@ public class DiLink5QCarCamBackend {
                 logger.error("nativeInit(" + cameraId + ") failed to open camera handle.");
                 return false;
             }
+            sActiveInstances.add(this);
             logger.info("DiLink 5 QCarCam handle opened successfully: 0x" + Long.toHexString(nativeHandle));
             return true;
         } catch (Throwable t) {
@@ -406,6 +440,7 @@ public class DiLink5QCarCamBackend {
     }
 
     public synchronized boolean start() {
+        ensureHardwareProcess();
         if (nativeHandle == 0 && !open()) return false;
         if (isStreaming.get()) return true;
 
@@ -413,6 +448,7 @@ public class DiLink5QCarCamBackend {
             boolean ok = nativeStart(nativeHandle);
             if (ok) {
                 isStreaming.set(true);
+                sActiveInstances.add(this);
                 logger.info("DiLink 5 QCarCam stream started on camera " + cameraId);
             } else {
                 logger.warn("nativeStart failed on camera " + cameraId);
@@ -425,6 +461,7 @@ public class DiLink5QCarCamBackend {
     }
 
     public synchronized boolean startSurface(android.view.Surface surface) {
+        ensureHardwareProcess();
         if (nativeHandle == 0 && !open()) return false;
         if (isStreaming.get()) return true;
 
@@ -432,13 +469,14 @@ public class DiLink5QCarCamBackend {
             boolean ok = nativeStartSurface(surface);
             if (ok) {
                 isStreaming.set(true);
-                logger.info("DiLink 5 QCarCam stream started on Surface for camera " + cameraId);
+                sActiveInstances.add(this);
+                logger.info("DiLink 5 QCarCam Surface stream started on camera " + cameraId);
             } else {
                 logger.warn("nativeStartSurface failed on camera " + cameraId);
             }
             return ok;
         } catch (Throwable t) {
-            logger.error("Error starting DiLink 5 QCarCam stream on Surface", t);
+            logger.error("Error starting DiLink 5 QCarCam Surface stream", t);
             return false;
         }
     }
@@ -465,7 +503,10 @@ public class DiLink5QCarCamBackend {
             }
             nativeHandle = 0;
         }
-        terminateHardwareProcess();
+        sActiveInstances.remove(this);
+        if (sActiveInstances.isEmpty()) {
+            terminateHardwareProcess();
+        }
     }
 
     public boolean isStreaming() {

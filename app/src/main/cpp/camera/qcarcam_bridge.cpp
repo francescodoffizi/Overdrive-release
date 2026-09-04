@@ -258,6 +258,18 @@ void* streamClientLoop(void* arg) {
     uint32_t rendered_frames = 0;
 
     while (g_streaming.load()) {
+        if (!client.isConnected()) {
+            LOGW("FastCamClient disconnected from @fast_cam.sock. Reconnecting...");
+            while (g_streaming.load() && !client.connect("@fast_cam.sock")) {
+                if (client.connect("/data/local/tmp/fast_cam.sock")) {
+                    break;
+                }
+                usleep(300000); // Retry connection every 300ms
+            }
+            if (!g_streaming.load()) break;
+            LOGI("FastCamClient reconnected successfully to fast_cam IPC stream (@fast_cam.sock)!");
+        }
+
         // Wait for next available hardware frame (timeout 100ms)
         if (!client.waitForFrame(&frame, 100)) {
             continue;
