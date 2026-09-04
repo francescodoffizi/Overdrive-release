@@ -114,6 +114,10 @@ public class BydDataCollector {
     private volatile long activeChargingListenerGeneration = -1L;
     private volatile long activeInstrumentListenerGeneration = -1L;
     private volatile long activeEngineListenerGeneration = -1L;
+    private volatile long lastDiLink5ChargingDumpMs = 0;
+    private volatile int cachedDiLink5GunState = BydVehicleData.UNAVAILABLE;
+    private volatile int cachedDiLink5ChargingState = BydVehicleData.UNAVAILABLE;
+    private static final long DILINK5_CHARGING_DUMP_THROTTLE_MS = 10000L;
     /**
      * Serializes the complete drivetrain probe/establishment transaction. This is deliberately not
      * the collector monitor: charging callbacks may probe while holding chargingEdgePublishLock,
@@ -5421,48 +5425,55 @@ public class BydDataCollector {
         b.chargingPowerKw(Double.NaN);
         if (chargingDevice == null) {
             if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-                try {
-                    String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
-                        "dumpsys car_service 2>/dev/null | grep -E '0x21403407|0x2140461c' | grep 'lastEvent'");
-                    if (!propDump.isEmpty()) {
-                        long gunObs = chargingObservationOrder.begin();
-                        if (propDump.contains("Property:0x21403407")) {
-                            if (propDump.contains("Property:0x21403407,status: 0") && (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [2]"))) {
-                                chargingObservationOrder.recordGunPoll(gunObs);
-                                b.chargingGunState(2); // Gun Connected
-                                evidence.connectionObserved = true;
-                                evidence.gunObservation = gunObs;
-                            } else if (propDump.contains("int32Values: [0]")) {
-                                chargingObservationOrder.recordGunPoll(gunObs);
-                                b.chargingGunState(1); // Gun Disconnected
-                                evidence.connectionObserved = true;
-                                evidence.gunObservation = gunObs;
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastDiLink5ChargingDumpMs >= DILINK5_CHARGING_DUMP_THROTTLE_MS) {
+                    lastDiLink5ChargingDumpMs = now;
+                    try {
+                        String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
+                            "dumpsys car_service 2>/dev/null | grep -E '0x21403407|0x2140461c' | grep 'lastEvent'");
+                        if (!propDump.isEmpty()) {
+                            if (propDump.contains("Property:0x21403407")) {
+                                if (propDump.contains("Property:0x21403407,status: 0") && (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [2]"))) {
+                                    cachedDiLink5GunState = 2; // Gun Connected
+                                } else if (propDump.contains("int32Values: [0]")) {
+                                    cachedDiLink5GunState = 1; // Gun Disconnected
+                                }
+                            }
+                            if (propDump.contains("Property:0x2140461c")) {
+                                if (propDump.contains("int32Values: [4]")) {
+                                    cachedDiLink5ChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_SCHEDULE; // 9 = SCHEDULED
+                                } else if (propDump.contains("int32Values: [1]")) {
+                                    cachedDiLink5ChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARGING; // 1 = CHARGING
+                                } else if (propDump.contains("int32Values: [2]")) {
+                                    cachedDiLink5ChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH; // 2 = FINISHED
+                                } else if (propDump.contains("int32Values: [0]")) {
+                                    cachedDiLink5ChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE; // 15 = IDLE
+                                }
                             }
                         }
-                        if (propDump.contains("Property:0x2140461c")) {
-                            if (propDump.contains("int32Values: [4]")) {
-                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_SCHEDULE; // 9 = SCHEDULED
-                            } else if (propDump.contains("int32Values: [1]")) {
-                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARGING; // 1 = CHARGING
-                                evidence.powerIsCharging = Boolean.TRUE;
-                            } else if (propDump.contains("int32Values: [2]")) {
-                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARG_FINISH; // 2 = FINISHED
-                            } else if (propDump.contains("int32Values: [0]")) {
-                                observedChargingState = com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE; // 15 = IDLE
-                            }
-                        }
-                        if (observedChargingState != BydVehicleData.UNAVAILABLE) {
-                            b.chargingState(observedChargingState);
-                        } else if (b.chargingGunState == 1) {
-                            b.chargingState(com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE);
-                        }
-                        b.chargingType(1); // AC charging
-                        b.vtolCharging(false);
-                        return evidence;
+                    } catch (Throwable t) {
+                        logger.debug("DiLink5 charging probe error: " + t.getMessage());
                     }
-                } catch (Throwable t) {
-                    logger.debug("DiLink5 charging probe error: " + t.getMessage());
                 }
+
+                if (cachedDiLink5GunState != BydVehicleData.UNAVAILABLE) {
+                    long gunObs = chargingObservationOrder.begin();
+                    chargingObservationOrder.recordGunPoll(gunObs);
+                    b.chargingGunState(cachedDiLink5GunState);
+                    evidence.connectionObserved = true;
+                    evidence.gunObservation = gunObs;
+                }
+                if (cachedDiLink5ChargingState != BydVehicleData.UNAVAILABLE) {
+                    b.chargingState(cachedDiLink5ChargingState);
+                    if (cachedDiLink5ChargingState == com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_CHARGING) {
+                        evidence.powerIsCharging = Boolean.TRUE;
+                    }
+                } else if (b.chargingGunState == 1) {
+                    b.chargingState(com.overdrive.app.monitor.ChargingStateData.CHARGING_BATTERY_STATE_IDLE);
+                }
+                b.chargingType(1); // AC charging
+                b.vtolCharging(false);
+                return evidence;
             }
             b.chargingState(BydVehicleData.UNAVAILABLE)
                     .chargingGunState(BydVehicleData.UNAVAILABLE)

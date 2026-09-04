@@ -348,6 +348,8 @@ public class GearMonitor {
     private volatile long lastDumpsysReadTime = 0;
     private volatile int lastDumpsysGear = -1;
 
+    private static final long DUMPSYS_GEAR_THROTTLE_MS = 3000L;
+
     private int readGearFromDumpsys() {
         try {
             if (com.overdrive.app.monitor.ChargingDetector.getInstance().isCharging()) {
@@ -356,11 +358,13 @@ public class GearMonitor {
         } catch (Throwable ignored) {}
 
         long now = SystemClock.elapsedRealtime();
-        if (now - lastDumpsysReadTime < 250 && isValidGearMode(lastDumpsysGear)) {
-            return lastDumpsysGear;
+        if (now - lastDumpsysReadTime < DUMPSYS_GEAR_THROTTLE_MS) {
+            return isValidGearMode(lastDumpsysGear) ? lastDumpsysGear : -1;
         }
+        lastDumpsysReadTime = now;
+
         try {
-            // 1. First try CarPropertyBridge if available
+            // 1. First try CarPropertyBridge if available (zero-fork Binder call)
             try {
                 com.overdrive.app.byd.CarPropertyBridge bridge = com.overdrive.app.byd.CarPropertyBridge.getInstance();
                 if (bridge != null) {
@@ -369,7 +373,6 @@ public class GearMonitor {
                         int shift = rr.intValue;
                         int decoded = decodeShiftMode(shift);
                         if (isValidGearMode(decoded)) {
-                            lastDumpsysReadTime = now;
                             lastDumpsysGear = decoded;
                             return decoded;
                         }
@@ -377,7 +380,7 @@ public class GearMonitor {
                 }
             } catch (Throwable ignored) {}
 
-            // 2. Fallback: dumpsys car_service
+            // 2. Fallback: dumpsys car_service (throttled to 3 seconds to avoid CPU/IPC saturation)
             String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
                 "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
             if (propDump != null && !propDump.isEmpty()) {
@@ -389,14 +392,13 @@ public class GearMonitor {
                     else if (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [0]")) decoded = GEAR_P;
                     
                     if (isValidGearMode(decoded)) {
-                        lastDumpsysReadTime = now;
                         lastDumpsysGear = decoded;
                         return decoded;
                     }
                 }
             }
         } catch (Throwable ignored) {}
-        return -1;
+        return isValidGearMode(lastDumpsysGear) ? lastDumpsysGear : -1;
     }
 
     private static int decodeShiftMode(int shift) {
