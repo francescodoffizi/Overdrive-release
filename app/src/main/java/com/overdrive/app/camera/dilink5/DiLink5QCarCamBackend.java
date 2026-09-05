@@ -81,16 +81,48 @@ public class DiLink5QCarCamBackend {
 
     private static volatile boolean sShutdownHookRegistered = false;
 
+    private static void gracefulStopProcess(String processPattern) {
+        try {
+            // Stage 1: Graceful SIGTERM so Qualcomm AIS / QCarCam can release DMA buffers and close camera session
+            Runtime.getRuntime().exec(new String[]{"pkill", "-15", "-f", processPattern}).waitFor(400, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+            // Check if process has exited
+            Process checkProc = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", processPattern});
+            boolean exited = false;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkProc.getInputStream()))) {
+                if (reader.readLine() == null) {
+                    exited = true;
+                }
+            } catch (Throwable ignored) {}
+
+            // Stage 2: Fallback to SIGKILL only if process is still lingering
+            if (!exited) {
+                logger.warn("Process " + processPattern + " did not terminate on SIGTERM, forcing SIGKILL");
+                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", processPattern}).waitFor(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+        } catch (Throwable t) {
+            logger.warn("Error in gracefulStopProcess(" + processPattern + "): " + t.getMessage());
+        }
+    }
+
     public static synchronized void terminateHardwareProcess() {
         if (sHardwareProcess != null) {
             try {
-                sHardwareProcess.destroy();
+                sHardwareProcess.destroy(); // sends SIGTERM
+                sHardwareProcess.waitFor(400, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (Throwable ignored) {}
+            if (sHardwareProcess != null) {
+                try {
+                    sHardwareProcess.exitValue();
+                } catch (IllegalThreadStateException lingering) {
+                    try {
+                        sHardwareProcess.destroyForcibly();
+                    } catch (Throwable ignored) {}
+                }
+            }
             sHardwareProcess = null;
         }
-        try {
-            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"}).waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (Throwable ignored) {}
+        gracefulStopProcess("fast_cam_capture");
     }
 
     private static synchronized void ensureHardwareProcess() {
@@ -393,12 +425,8 @@ public class DiLink5QCarCamBackend {
 
     public static synchronized void stopHardwareProcess() {
         try {
-            if (sHardwareProcess != null) {
-                sHardwareProcess.destroy();
-                sHardwareProcess = null;
-            }
-            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "fast_cam_capture"});
-            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "qcarcam_test"});
+            terminateHardwareProcess();
+            gracefulStopProcess("qcarcam_test");
             logger.info("Qualcomm fast_cam_capture hardware supervisor stopped.");
         } catch (Throwable t) {
             logger.warn("Error stopping hardware supervisor: " + t.getMessage());
@@ -413,16 +441,6 @@ public class DiLink5QCarCamBackend {
         }
 
         ensureHardwareProcess();
-
-        try {
-            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
-            if (ctx != null) {
-                TsAvmCoordinator.getInstance(ctx).bind();
-                TsAvmCoordinator.getInstance(ctx).startAvm();
-            }
-        } catch (Throwable t) {
-            logger.warn("TsAvmCoordinator start error: " + t.getMessage());
-        }
 
         try {
             nativeHandle = nativeInit(cameraId);

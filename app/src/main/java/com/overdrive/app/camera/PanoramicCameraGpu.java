@@ -1668,8 +1668,7 @@ public class PanoramicCameraGpu {
         }, imageReaderHandler);
         if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
             cameraSurface = new Surface(cameraSurfaceTexture);
-            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
-            logger.info("DiLink 5 QCarCamBackend started with new SurfaceTexture Surface");
+            logger.info("DiLink 5 QCarCamBackend prepared SurfaceTexture Surface");
         } else {
             cameraSurface = null;
         }

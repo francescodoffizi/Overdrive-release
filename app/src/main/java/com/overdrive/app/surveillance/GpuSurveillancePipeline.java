@@ -4510,15 +4510,16 @@ public class GpuSurveillancePipeline {
             //
             // Legacy fleet keeps the original "release and reopen as secondary
             // consumer" behaviour because that's how non-byd_apa HALs share.
-            boolean dilink4 = false;
+            boolean dilinkKeepAlive = false;
             try {
-                dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+                dilinkKeepAlive = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic()
+                        || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
             } catch (Throwable ignored) {}
-            if (camera != null && running && !dilink4) {
+            if (camera != null && running && !dilinkKeepAlive) {
                 camera.reopenCamera();
                 logger.info("ACC ON transition complete - all recordings finalized, camera reopened");
-            } else if (dilink4) {
-                logger.info("ACC ON transition complete - dilink4 keeps camera alive (oem-parity, no reopen)");
+            } else if (dilinkKeepAlive) {
+                logger.info("ACC ON transition complete - DiLink keep-alive active (oem-parity, no reopen on ACC ON)");
             } else {
                 logger.info("ACC ON transition complete - all recordings finalized");
             }

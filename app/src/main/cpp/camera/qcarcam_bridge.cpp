@@ -352,10 +352,13 @@ void* streamClientLoop(void* arg) {
                 }
 
                 ANativeWindow_Buffer winBuffer;
+                memset(&winBuffer, 0, sizeof(winBuffer));
                 if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
-                    // Color conversion UYVY to RGBA8888 onto Android Surface buffer
-                    convert_uyvy_to_rgba(render_pixels, target_w, target_h,
-                                         (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    if (winBuffer.bits != nullptr && winBuffer.stride > 0 && winBuffer.width > 0 && winBuffer.height > 0) {
+                        // Color conversion UYVY to RGBA8888 onto Android Surface buffer
+                        convert_uyvy_to_rgba(render_pixels, target_w, target_h,
+                                             (uint32_t*)winBuffer.bits, winBuffer.stride);
+                    }
                     ANativeWindow_unlockAndPost(g_nativeWindow);
                     rendered_frames++;
                     if (rendered_frames % 300 == 1) {
@@ -402,12 +405,16 @@ JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStartSurface(
     JNIEnv* env, jobject thiz, jobject surface) {
     std::lock_guard<std::mutex> lock(g_winMutex);
-    if (g_nativeWindow) {
-        ANativeWindow_release(g_nativeWindow);
-        g_nativeWindow = nullptr;
-    }
-    if (surface) {
-        g_nativeWindow = ANativeWindow_fromSurface(env, surface);
+    ANativeWindow* newWin = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    if (newWin != nullptr && newWin == g_nativeWindow) {
+        // Already active with this ANativeWindow, release extra reference acquired by ANativeWindow_fromSurface
+        ANativeWindow_release(newWin);
+    } else {
+        if (g_nativeWindow) {
+            ANativeWindow_release(g_nativeWindow);
+            g_nativeWindow = nullptr;
+        }
+        g_nativeWindow = newWin;
         if (g_nativeWindow) {
             ANativeWindow_setBuffersGeometry(g_nativeWindow, FRAME_WIDTH, FRAME_HEIGHT, WINDOW_FORMAT_RGBA_8888);
             LOGI("ANativeWindow configured: %dx%d RGBA8888", FRAME_WIDTH, FRAME_HEIGHT);
