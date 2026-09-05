@@ -1828,11 +1828,13 @@ public class GpuSurveillancePipeline {
                             logger.info("Reinit: rebuilding recorder with cached profile offsets ("
                                 + encoderWidth + "x" + encoderHeight + ")");
                             recorder = new GpuMosaicRecorder(
-                                lastQuadrantStripOffsetX, encoderWidth, encoderHeight);
+                                lastQuadrantStripOffsetX, encoderWidth, encoderHeight,
+                                com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported());
                         } else {
                             logger.warn("Reinit: no cached profile offsets — falling back to no-arg "
                                 + "GpuMosaicRecorder (Tang trims may be miss-sized)");
-                            recorder = new GpuMosaicRecorder();
+                            recorder = new GpuMosaicRecorder(
+                                com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported());
                         }
                         // FIX (audit R1, RESIDUAL): re-wire segment-rotated
                         // listener after a fresh recorder allocation so RMM
@@ -2103,7 +2105,7 @@ public class GpuSurveillancePipeline {
 
         // 2. Create GPU mosaic recorder (shared) with profile-driven viewport
         // and per-quadrant offsets. Tang gets 2560x1440 instead of 2560x1920.
-        recorder = new GpuMosaicRecorder(quadrantStripOffsetX, encoderWidth, encoderHeight);
+        recorder = new GpuMosaicRecorder(quadrantStripOffsetX, encoderWidth, encoderHeight, isDilink5);
         // Note: recorder.init() will be called after EGL context is created by camera
 
         // FIX (audit R1, RESIDUAL): stamp lastSegmentRotateMs on every
@@ -2137,7 +2139,7 @@ public class GpuSurveillancePipeline {
             }
             downscaler = null;
         }
-        downscaler = new GpuDownscaler(quadrantStripOffsetX);
+        downscaler = new GpuDownscaler(quadrantStripOffsetX, isDilink5);
         // Note: downscaler.init() will be called after EGL context is created by camera
 
         // 4. Create surveillance engine (uses shared recorder).
@@ -4756,8 +4758,9 @@ public class GpuSurveillancePipeline {
         com.overdrive.app.camera.ResolvedCameraConfig streamCfg =
             com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
         float[] streamQuadrantStripOffsetX = streamCfg.getQuadrantStripOffsetX();
+        boolean isDilink5Stream = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
         streamScaler = new com.overdrive.app.streaming.GpuStreamScaler(
-            streamWidth, streamHeight, streamQuadrantStripOffsetX);
+            streamWidth, streamHeight, streamQuadrantStripOffsetX, isDilink5Stream);
 
             try {
                 android.content.Context odCtx = savedContext;
@@ -6003,8 +6006,9 @@ public class GpuSurveillancePipeline {
         // matches the recorder's camera arrangement.
         com.overdrive.app.camera.ResolvedCameraConfig cfg =
             com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
+        boolean isDilink5Bs = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
         bsScaler = new com.overdrive.app.streaming.GpuStreamScaler(
-            BS_WIDTH, sharedLaneHeight, cfg.getQuadrantStripOffsetX());
+            BS_WIDTH, sharedLaneHeight, cfg.getQuadrantStripOffsetX(), isDilink5Bs);
 
         // BS-LIFECYCLE-1: from here on, bsScaler+bsLayer are assigned to the
         // instance fields and a GL EGLWindowSurface gets created wrapping the SC

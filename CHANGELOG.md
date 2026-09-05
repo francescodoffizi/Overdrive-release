@@ -4,6 +4,16 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Disaccoppiamento Totale Pipeline Video da Gralloc/AHardwareBuffer e Passaggio a CPU Double-Buffering + `glTexSubImage2D` (`qcarcam_bridge.cpp`, `GlUtil.java`, `PanoramicCameraGpu.java`, `GpuMosaicRecorder.java`, `GpuDownscaler.java`, `GpuStreamScaler.java`, `FoveatedCropper.java`, `HighResPreviewSampler.java`, `GpuSurveillancePipeline.java`)**:
+  - **Causa Radice del Crash/Hard Reset Veicolo alla Riaccensione**:
+    L'analisi forense dei core dump (`libadreno_utils.so` in `surfaceflinger` e `byd_cam_daemon` su `validate_resource_memory_layout_metadata`) ha evidenziato che la scrittura SIMD NEON UYVY->RGBA direttamente nella memoria mappata da Gralloc/AHardwareBuffer andava a corrompere la struttura di metadati interna (`MetaData_t`) di Gralloc del driver Qualcomm. Questo corrompeva il layout di memoria condivisa del compositore di sistema, portando al freeze totale e al riavvio a cascata dell'intero infotainment all'accensione del quadro o al risveglio delle telecamere di bordo.
+  - **Eliminazione Radicale di `AHardwareBuffer`, Gralloc ed `EGLImageKHR` (`qcarcam_bridge.cpp`)**:
+    Rimossi completamente tutti gli header, puntatori a funzione dinamici (`ahbAllocate`, `ahbLock`, `eglCreateImageKHR`, ecc.) e dipendenze da buffer hardware nativi. La conversione UYVY->RGBA avviene ora in RAM standard di processo (`malloc`), protetta da un ring-buffer ping-pong a doppio buffer (`g_cpuRgbaBuffers[2]`) atomico.
+  - **Upload Diretto via `glTexSubImage2D` su `GL_TEXTURE_2D`**:
+    Il caricamento dei frame nella GPU avviene tramite allocazione standard `glTexImage2D` e aggiornamento `glTexSubImage2D` ad alte prestazioni, garantendo isolamento totale rispetto alle risorse di sistema e azzerando qualsiasi possibilità di interferenza con SurfaceFlinger o i demoni telecamera OEM.
+  - **Adeguamento Shader Grafici Multi-Backend (`sampler2D` / `GL_TEXTURE_2D`)**:
+    Tutti i componenti di rendering e scaling video (`GpuMosaicRecorder`, `GpuDownscaler`, `GpuStreamScaler`, `FoveatedCropper`, `HighResPreviewSampler`) sono stati aggiornati per supportare in modo dinamico sia il campionamento standard `sampler2D` (`GL_TEXTURE_2D`) su DiLink 5, sia il campionamento `samplerExternalOES` (`GL_TEXTURE_EXTERNAL_OES`) per la retrocompatibilità con DiLink 4.
+
 - **Risoluzione Definitiva Crash/Riavvio Sistema alla Riaccensione del Veicolo in Sentry Mode (`qcarcam_bridge.cpp`, `AccMonitor.java`, `DiLink5QCarCamBackend.java`, `GpuSurveillancePipeline.java`, `RecordingModeManager.java`)**:
   - **Eliminazione Leak Descrittori Memoria Grafica Adreno GSL Pool 0 (`qcarcam_bridge.cpp`)**:
     Risolto il leak sistematico di descrittori GPU causato dall'invocazione di `glEGLImageTargetTexture2DOES` a 30 FPS su ogni frame. Implementata la gestione a ping-pong con due texture GL dedicate (`g_pingPongTextures[2]`) e binding `glEGLImageTargetTexture2DOES` eseguito una sola volta per ciascuna `EGLImageKHR`. Questo impedisce l'esaurimento del GSL Pool 0 dell'Adreno 643/SA8155P e previene i crash a cascata di SurfaceFlinger e il riavvio della centralina.

@@ -4,12 +4,7 @@
 
 #include <jni.h>
 #include <android/log.h>
-#include <android/hardware_buffer.h>
-#include <dlfcn.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
@@ -32,64 +27,6 @@
 
 #define FRAME_WIDTH 1920
 #define FRAME_HEIGHT 1080
-
-namespace {
-
-// Extension function signatures for EGL and AHardwareBuffer
-typedef EGLClientBuffer (EGLAPIENTRYP PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC)(const struct AHardwareBuffer* buffer);
-typedef EGLImageKHR (EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint* attrib_list);
-typedef EGLBoolean (EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay dpy, EGLImageKHR image);
-typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, GLeglImageOES image);
-
-typedef int (*PFN_AHARDWAREBUFFER_ALLOCATE)(const AHardwareBuffer_Desc* desc, AHardwareBuffer** outBuffer);
-typedef int (*PFN_AHARDWAREBUFFER_LOCK)(AHardwareBuffer* buffer, uint64_t usage, int32_t fence, const ARect* rect, void** outVirtualAddress);
-typedef int (*PFN_AHARDWAREBUFFER_UNLOCK)(AHardwareBuffer* buffer, int32_t* fence);
-typedef void (*PFN_AHARDWAREBUFFER_ACQUIRE)(AHardwareBuffer* buffer);
-typedef void (*PFN_AHARDWAREBUFFER_RELEASE)(AHardwareBuffer* buffer);
-
-struct ExtFns {
-    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC eglGetNativeClientBufferANDROID = nullptr;
-    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = nullptr;
-    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = nullptr;
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = nullptr;
-    PFN_AHARDWAREBUFFER_ALLOCATE ahbAllocate = nullptr;
-    PFN_AHARDWAREBUFFER_LOCK ahbLock = nullptr;
-    PFN_AHARDWAREBUFFER_UNLOCK ahbUnlock = nullptr;
-    PFN_AHARDWAREBUFFER_ACQUIRE ahbAcquire = nullptr;
-    PFN_AHARDWAREBUFFER_RELEASE ahbRelease = nullptr;
-    bool ok = false;
-};
-
-static ExtFns g_ext;
-static std::once_flag g_extOnce;
-
-static void resolveExtensions() {
-    std::call_once(g_extOnce, []() {
-        g_ext.eglGetNativeClientBufferANDROID = (PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC) eglGetProcAddress("eglGetNativeClientBufferANDROID");
-        g_ext.eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC) eglGetProcAddress("eglCreateImageKHR");
-        g_ext.eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC) eglGetProcAddress("eglDestroyImageKHR");
-        g_ext.glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES");
-
-        void* libnw = dlopen("libnativewindow.so", RTLD_NOW);
-        if (libnw) {
-            g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(libnw, "AHardwareBuffer_allocate");
-            g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(libnw, "AHardwareBuffer_lock");
-            g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(libnw, "AHardwareBuffer_unlock");
-            g_ext.ahbAcquire = (PFN_AHARDWAREBUFFER_ACQUIRE) dlsym(libnw, "AHardwareBuffer_acquire");
-            g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(libnw, "AHardwareBuffer_release");
-        }
-        if (!g_ext.ahbAllocate) g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_allocate");
-        if (!g_ext.ahbLock) g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_lock");
-        if (!g_ext.ahbUnlock) g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_unlock");
-        if (!g_ext.ahbAcquire) g_ext.ahbAcquire = (PFN_AHARDWAREBUFFER_ACQUIRE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_acquire");
-        if (!g_ext.ahbRelease) g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
-
-        g_ext.ok = g_ext.eglGetNativeClientBufferANDROID && g_ext.eglCreateImageKHR &&
-                   g_ext.eglDestroyImageKHR && g_ext.glEGLImageTargetTexture2DOES &&
-                   g_ext.ahbAllocate && g_ext.ahbLock && g_ext.ahbUnlock && g_ext.ahbRelease;
-        LOGI("Zero-copy EGL/AHardwareBuffer extensions resolved: ok=%d", g_ext.ok);
-    });
-}
 
 struct CameraMapping {
     std::atomic<int> hw_front{0};
@@ -115,21 +52,17 @@ std::atomic<bool> g_streaming{false};
 std::atomic<int> g_active_camera{0};
 pthread_t g_streamThread = 0;
 
-// HardwareBuffer ping-pong pool for zero-copy GL texture binding (bypasses SurfaceFlinger and HWC)
-static AHardwareBuffer* g_hwBuffers[2] = {nullptr, nullptr};
-static EGLImageKHR g_eglImages[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
-static AHardwareBuffer* g_cachedHwBufForImage[2] = {nullptr, nullptr};
-static uint32_t g_eglImageEpoch[2] = {0, 0};
-static std::atomic<uint32_t> g_hwBufferEpoch{1};
-static EGLDisplay g_cachedEglDisplay = EGL_NO_DISPLAY;
-static EGLContext g_cachedEglContext = EGL_NO_CONTEXT;
-static GLuint g_pingPongTextures[2] = {0, 0};
-static EGLImageKHR g_boundEglImage[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+// Completely decoupled CPU double-buffer pool for GL_TEXTURE_2D upload via glTexSubImage2D.
+// Zero interaction with AHardwareBuffer, Gralloc, or EGLImageKHR, making display/infotainment crashes impossible.
+static std::unique_ptr<uint8_t[]> g_cpuRgbaBuffers[2];
 static int g_bufWidth = 0;
 static int g_bufHeight = 0;
 static std::atomic<int> g_frontIdx{-1};
 static std::atomic<bool> g_hasNewFrame{false};
 static std::mutex g_bufMutex;
+static GLuint g_lastAllocatedTexId = 0;
+static int g_texAllocWidth = 0;
+static int g_texAllocHeight = 0;
 
 #include <arm_neon.h>
 
@@ -454,54 +387,33 @@ void* streamClientLoop(void* arg) {
         }
 
         if (render_pixels) {
-            resolveExtensions();
-            if (g_ext.ok) {
-                std::lock_guard<std::mutex> lock(g_bufMutex);
-                // Reallocate ping-pong AHardwareBuffers if resolution changed or not yet created
-                if (!g_hwBuffers[0] || g_bufWidth != target_w || g_bufHeight != target_h) {
-                    if (g_hwBuffers[0]) { g_ext.ahbRelease(g_hwBuffers[0]); g_hwBuffers[0] = nullptr; }
-                    if (g_hwBuffers[1]) { g_ext.ahbRelease(g_hwBuffers[1]); g_hwBuffers[1] = nullptr; }
+            std::lock_guard<std::mutex> lock(g_bufMutex);
+            if (!g_cpuRgbaBuffers[0] || !g_cpuRgbaBuffers[1] || g_bufWidth != target_w || g_bufHeight != target_h) {
+                g_cpuRgbaBuffers[0] = std::make_unique<uint8_t[]>(target_w * target_h * 4);
+                g_cpuRgbaBuffers[1] = std::make_unique<uint8_t[]>(target_w * target_h * 4);
+                g_bufWidth = target_w;
+                g_bufHeight = target_h;
+                g_frontIdx.store(-1);
+                LOGI("Allocated ping-pong CPU RGBA buffers for GL texture upload: %dx%d (%d bytes each)",
+                     target_w, target_h, target_w * target_h * 4);
+            }
 
-                    AHardwareBuffer_Desc desc = {};
-                    desc.width = target_w;
-                    desc.height = target_h;
-                    desc.layers = 1;
-                    desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
-                    desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
-
-                    g_ext.ahbAllocate(&desc, &g_hwBuffers[0]);
-                    g_ext.ahbAllocate(&desc, &g_hwBuffers[1]);
-                    g_bufWidth = target_w;
-                    g_bufHeight = target_h;
-                    g_hwBufferEpoch.fetch_add(1);
-                    g_frontIdx.store(-1);
-                    LOGI("Allocated ping-pong AHardwareBuffers for GL zero-copy: %dx%d RGBA (epoch=%u)",
-                         target_w, target_h, g_hwBufferEpoch.load());
-                }
-
-                if (g_hwBuffers[0] && g_hwBuffers[1]) {
-                    int curFront = g_frontIdx.load();
-                    int writeIdx = (curFront == 0) ? 1 : 0;
-                    void* vaddr = nullptr;
-                    if (g_ext.ahbLock(g_hwBuffers[writeIdx], AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &vaddr) == 0 && vaddr) {
-                        convert_uyvy_to_rgba(render_pixels, target_w, target_h, (uint32_t*)vaddr, target_w);
-                        g_ext.ahbUnlock(g_hwBuffers[writeIdx], nullptr);
-                        uint64_t curTsNs = (frame.timestamp_ns > 0) ? frame.timestamp_ns : getCurrentNanoTime();
-                        g_lastFrameTimestampNs.store(curTsNs);
-                        g_frontIdx.store(writeIdx);
-                        g_hasNewFrame.store(true);
-                        rendered_frames++;
-                        if (rendered_frames % 300 == 1) {
-                            LOGI("HardwareBuffer zero-copy frame ready (%u frames, mode=%d, %dx%d, ts=%" PRIu64 ")",
-                                 rendered_frames, desired_cam, target_w, target_h, curTsNs);
-                        }
-                        if (jniAttached && jniEnv && g_backendClass && g_onFrameAvailableMethod) {
-                            jniEnv->CallStaticVoidMethod(g_backendClass, g_onFrameAvailableMethod, (jlong)curTsNs);
-                            if (jniEnv->ExceptionCheck()) {
-                                jniEnv->ExceptionClear();
-                            }
-                        }
-                    }
+            int curFront = g_frontIdx.load();
+            int writeIdx = (curFront == 0) ? 1 : 0;
+            convert_uyvy_to_rgba(render_pixels, target_w, target_h, (uint32_t*)g_cpuRgbaBuffers[writeIdx].get(), target_w);
+            uint64_t curTsNs = (frame.timestamp_ns > 0) ? frame.timestamp_ns : getCurrentNanoTime();
+            g_lastFrameTimestampNs.store(curTsNs);
+            g_frontIdx.store(writeIdx);
+            g_hasNewFrame.store(true);
+            rendered_frames++;
+            if (rendered_frames % 300 == 1) {
+                LOGI("CPU RGBA frame ready (%u frames, mode=%d, %dx%d, ts=%" PRIu64 ")",
+                     rendered_frames, desired_cam, target_w, target_h, curTsNs);
+            }
+            if (jniAttached && jniEnv && g_backendClass && g_onFrameAvailableMethod) {
+                jniEnv->CallStaticVoidMethod(g_backendClass, g_onFrameAvailableMethod, (jlong)curTsNs);
+                if (jniEnv->ExceptionCheck()) {
+                    jniEnv->ExceptionClear();
                 }
             }
         }
@@ -515,8 +427,6 @@ void* streamClientLoop(void* arg) {
     LOGI("FastCamClient thread terminated.");
     return nullptr;
 }
-
-} // namespace
 
 extern "C" {
 
@@ -550,106 +460,40 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStartSurface(
     return Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStart(env, thiz, 1);
 }
 
-// Binds the latest available AHardwareBuffer directly into a dedicated EGL GL_TEXTURE_EXTERNAL_OES per ping-pong slot
+// Binds the latest available CPU RGBA frame directly into the standard GL_TEXTURE_2D texture
 // Returns the active texture ID (>0) on success, or 0 on failure.
 JNIEXPORT jint JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFrame(
     JNIEnv* env, jclass clazz, jint textureId) {
-    if (!g_hasNewFrame.load()) {
+    if (textureId <= 0) {
         return 0;
     }
-    resolveExtensions();
-    if (!g_ext.ok) {
-        return 0;
+    if (!g_hasNewFrame.load()) {
+        return textureId;
     }
 
     std::unique_lock<std::mutex> lock(g_bufMutex);
     int idx = g_frontIdx.load();
-    if (idx < 0 || idx > 1 || !g_hwBuffers[idx]) {
+    if (idx < 0 || idx > 1 || !g_cpuRgbaBuffers[idx]) {
         return 0;
     }
 
-    AHardwareBuffer* buf = g_hwBuffers[idx];
-    if (g_ext.ahbAcquire) {
-        g_ext.ahbAcquire(buf);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)textureId);
+    if (g_texAllocWidth != g_bufWidth || g_texAllocHeight != g_bufHeight || g_lastAllocatedTexId != (GLuint)textureId) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_bufWidth, g_bufHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        g_texAllocWidth = g_bufWidth;
+        g_texAllocHeight = g_bufHeight;
+        g_lastAllocatedTexId = (GLuint)textureId;
+        LOGI("Allocated GL_TEXTURE_2D storage: id=%d %dx%d RGBA", textureId, g_bufWidth, g_bufHeight);
     }
 
-    EGLDisplay dpy = eglGetCurrentDisplay();
-    EGLContext ctx = eglGetCurrentContext();
-    if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT) {
-        if (g_ext.ahbRelease) {
-            g_ext.ahbRelease(buf);
-        }
-        return 0;
-    }
-
-    if (g_cachedEglContext != ctx) {
-        // EGL context changed or was recreated: previous texture IDs are invalid in the new context
-        g_pingPongTextures[0] = 0;
-        g_pingPongTextures[1] = 0;
-        g_boundEglImage[0] = EGL_NO_IMAGE_KHR;
-        g_boundEglImage[1] = EGL_NO_IMAGE_KHR;
-        g_cachedEglContext = ctx;
-    }
-
-    uint32_t currentEpoch = g_hwBufferEpoch.load();
-    // Reuse pre-created EGLImageKHR per ping-pong buffer slot to eliminate Adreno GSL pool 0 exhaustion
-    if (g_eglImages[idx] == EGL_NO_IMAGE_KHR || g_eglImageEpoch[idx] != currentEpoch || g_cachedHwBufForImage[idx] != buf || g_cachedEglDisplay != dpy) {
-        if (g_eglImages[idx] != EGL_NO_IMAGE_KHR && g_cachedEglDisplay != EGL_NO_DISPLAY && g_ext.eglDestroyImageKHR) {
-            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[idx]);
-            g_eglImages[idx] = EGL_NO_IMAGE_KHR;
-        }
-        g_boundEglImage[idx] = EGL_NO_IMAGE_KHR;
-
-        EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(buf);
-        if (!clientBuf) {
-            if (g_ext.ahbRelease) {
-                g_ext.ahbRelease(buf);
-            }
-            return 0;
-        }
-
-        static const EGLint kAttrs[] = {
-            EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
-            EGL_NONE
-        };
-        EGLImageKHR image = g_ext.eglCreateImageKHR(
-            dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, kAttrs);
-        if (image == EGL_NO_IMAGE_KHR) {
-            if (g_ext.ahbRelease) {
-                g_ext.ahbRelease(buf);
-            }
-            return 0;
-        }
-
-        g_eglImages[idx] = image;
-        g_eglImageEpoch[idx] = currentEpoch;
-        g_cachedHwBufForImage[idx] = buf;
-        g_cachedEglDisplay = dpy;
-    }
-
-    if (g_pingPongTextures[idx] == 0) {
-        glGenTextures(1, &g_pingPongTextures[idx]);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_pingPongTextures[idx]);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_pingPongTextures[idx]);
-    // Load-bearing fix: call glEGLImageTargetTexture2DOES ONLY when image changes, NOT every frame!
-    // Repeated targeting on the same texture object leaks 20 descriptor slots in Adreno GSL Pool 0.
-    if (g_boundEglImage[idx] != g_eglImages[idx]) {
-        g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, g_eglImages[idx]);
-        g_boundEglImage[idx] = g_eglImages[idx];
-    }
-
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_bufWidth, g_bufHeight, GL_RGBA, GL_UNSIGNED_BYTE, g_cpuRgbaBuffers[idx].get());
     g_hasNewFrame.store(false);
-    if (g_ext.ahbRelease) {
-        g_ext.ahbRelease(buf);
-    }
-    return static_cast<jint>(g_pingPongTextures[idx]);
+    return textureId;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -661,34 +505,13 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
         g_streamThread = 0;
     }
     std::lock_guard<std::mutex> lock(g_bufMutex);
-    resolveExtensions();
-    if (g_cachedEglDisplay != EGL_NO_DISPLAY && g_ext.eglDestroyImageKHR) {
-        if (g_eglImages[0] != EGL_NO_IMAGE_KHR) {
-            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[0]);
-            g_eglImages[0] = EGL_NO_IMAGE_KHR;
-        }
-        if (g_eglImages[1] != EGL_NO_IMAGE_KHR) {
-            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[1]);
-            g_eglImages[1] = EGL_NO_IMAGE_KHR;
-        }
-        g_cachedEglDisplay = EGL_NO_DISPLAY;
-    }
-    if (g_pingPongTextures[0] != 0 || g_pingPongTextures[1] != 0) {
-        glDeleteTextures(2, g_pingPongTextures);
-        g_pingPongTextures[0] = 0;
-        g_pingPongTextures[1] = 0;
-    }
-    g_boundEglImage[0] = EGL_NO_IMAGE_KHR;
-    g_boundEglImage[1] = EGL_NO_IMAGE_KHR;
-    g_cachedEglContext = EGL_NO_CONTEXT;
-    g_eglImageEpoch[0] = 0;
-    g_eglImageEpoch[1] = 0;
-    g_cachedHwBufForImage[0] = nullptr;
-    g_cachedHwBufForImage[1] = nullptr;
-    if (g_ext.ahbRelease) {
-        if (g_hwBuffers[0]) { g_ext.ahbRelease(g_hwBuffers[0]); g_hwBuffers[0] = nullptr; }
-        if (g_hwBuffers[1]) { g_ext.ahbRelease(g_hwBuffers[1]); g_hwBuffers[1] = nullptr; }
-    }
+    g_cpuRgbaBuffers[0].reset();
+    g_cpuRgbaBuffers[1].reset();
+    g_bufWidth = 0;
+    g_bufHeight = 0;
+    g_texAllocWidth = 0;
+    g_texAllocHeight = 0;
+    g_lastAllocatedTexId = 0;
     g_frontIdx.store(-1);
     g_hasNewFrame.store(false);
     return JNI_TRUE;

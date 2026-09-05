@@ -1314,6 +1314,11 @@ public class PanoramicCameraGpu {
         logger.info("AI lane released (surveillance disarmed) — freed thread + EGL context + cropper buffers");
     }
 
+    public boolean isTexture2D() {
+        return (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend)
+                || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+    }
+
     /**
      * Initializes OpenGL context and textures.
      */
@@ -1329,8 +1334,12 @@ public class PanoramicCameraGpu {
         // Log GL info (now that context is current)
         GlUtil.logGlInfo();
         
-        // Create camera texture (OES type for external camera)
-        cameraTextureId = GlUtil.createExternalTexture();
+        // Create camera texture (GL_TEXTURE_2D for DiLink 5, OES for legacy/OEM)
+        if (isTexture2D()) {
+            cameraTextureId = GlUtil.create2DTexture();
+        } else {
+            cameraTextureId = GlUtil.createExternalTexture();
+        }
         windshieldTextureId = GlUtil.createExternalTexture();
 
         // Build the camera consumer. Default = oem-style SurfaceTexture
@@ -1483,7 +1492,7 @@ public class PanoramicCameraGpu {
             // GL thread. Allocating its FBOs + shader on the encoder thread
             // would serialize readback against encoder eglSwapBuffers.
             foveatedCropper = new FoveatedCropper(width, height,
-                quadrantStripOffsetX, quadrantCornerOffsetsXY);
+                quadrantStripOffsetX, quadrantCornerOffsetsXY, isTexture2D());
             foveatedCropper.setCameraLayout(getCameraLayoutMode());
 
             // DiLink 4: override the canonical corner map with the known
@@ -1645,14 +1654,16 @@ public class PanoramicCameraGpu {
      *  the current EGL context's cameraTextureId, and updateTexImage runs
      *  on the GL thread where that context is current.  */
     private void createCameraSurfaceTexture() {
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            cameraSurfaceTexture = null;
+            cameraSurface = null;
+            return;
+        }
         if (cameraTextureId == 0) {
             logger.warn("createCameraSurfaceTexture called before GL texture exists");
             return;
         }
         cameraSurfaceTexture = new SurfaceTexture(cameraTextureId);
-        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            cameraSurfaceTexture.setDefaultBufferSize(width > 0 ? width : 1920, height > 0 ? height : 1080);
-        }
         ensureCameraCallbackThread();
         cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
             // Cheap signalling — the actual updateTexImage happens on the GL
@@ -3370,7 +3381,7 @@ public class PanoramicCameraGpu {
             android.opengl.GLES20.glUseProgram(probeProgram);
 
             android.opengl.GLES20.glActiveTexture(android.opengl.GLES20.GL_TEXTURE0);
-            android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+            android.opengl.GLES20.glBindTexture(isTexture2D() ? android.opengl.GLES20.GL_TEXTURE_2D : android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
             android.opengl.GLES20.glUniform1i(probeUTexSamplerLoc, 0);
             android.opengl.GLES20.glUniformMatrix4fv(probeUTexMatrixLoc, 1, false, currentTexMatrix, 0);
 
@@ -6925,7 +6936,7 @@ public class PanoramicCameraGpu {
             return null;
         }
         try {
-            highResSampler = new HighResPreviewSampler(sharedContext);
+            highResSampler = new HighResPreviewSampler(sharedContext, isTexture2D());
             // Layout mirrors the active camera layout mode; matrix is
             // refreshed on every consume tick so even legacy mode (which
             // uses identity) stays current.
