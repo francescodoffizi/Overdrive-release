@@ -479,22 +479,20 @@ public class DiLink5QCarCamBackend {
     }
 
     public synchronized boolean startSurface(android.view.Surface surface) {
-        ensureHardwareProcess();
-        if (nativeHandle == 0 && !open()) return false;
-        if (isStreaming.get()) return true;
+        // Zero-copy GL texture binding (bindLatestFrame) replaces Surface/ANativeWindow
+        // to completely eliminate Qualcomm SA8155P hwcomposer crashes.
+        return start();
+    }
 
+    /**
+     * Binds the latest available camera frame directly to the calling thread's
+     * GL_TEXTURE_EXTERNAL_OES texture via zero-copy EGLImage/AHardwareBuffer.
+     * Bypasses Android Surface, SurfaceFlinger, and HWC completely.
+     */
+    public static boolean bindLatestFrame(int textureId) {
         try {
-            boolean ok = nativeStartSurface(surface);
-            if (ok) {
-                isStreaming.set(true);
-                sActiveInstances.add(this);
-                logger.info("DiLink 5 QCarCam Surface stream started on camera " + cameraId);
-            } else {
-                logger.warn("nativeStartSurface failed on camera " + cameraId);
-            }
-            return ok;
+            return nativeBindLatestFrame(textureId);
         } catch (Throwable t) {
-            logger.error("Error starting DiLink 5 QCarCam Surface stream", t);
             return false;
         }
     }
@@ -639,6 +637,7 @@ public class DiLink5QCarCamBackend {
     private static native boolean nativeIsSupported();
     private static native void nativeSetActiveCamera(int camIdx);
     private static native void nativeSetCameraMapping(int front, int right, int rear, int left, int dashcam);
+    private static native boolean nativeBindLatestFrame(int textureId);
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);
     private native boolean nativeStartSurface(android.view.Surface surface);

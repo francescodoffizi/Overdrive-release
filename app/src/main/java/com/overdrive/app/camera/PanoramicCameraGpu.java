@@ -1666,12 +1666,8 @@ public class PanoramicCameraGpu {
                 frameSync.notify();
             }
         }, imageReaderHandler);
-        if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
-            cameraSurface = new Surface(cameraSurfaceTexture);
-            logger.info("DiLink 5 QCarCamBackend prepared SurfaceTexture Surface");
-        } else {
-            cameraSurface = null;
-        }
+        // On DiLink 5, rendering is zero-copy in-process via AHardwareBuffer; no Surface needed.
+        cameraSurface = null;
     }
 
     /** Bind the active SurfaceTexture to the AVMCamera via reflection,
@@ -1691,9 +1687,8 @@ public class PanoramicCameraGpu {
         }
 
         if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
-            logger.info("Attaching Surface to DiLink 5 QCarCam backend");
-            if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
-            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).startSurface(cameraSurface);
+            logger.info("DiLink 5 QCarCam backend active — starting zero-copy native stream");
+            ((com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) cameraObj).start();
             return;
         }
 
@@ -2751,19 +2746,14 @@ public class PanoramicCameraGpu {
             releaseSentryBridgeViewpoint();
         }
 
-        // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS backend directly
+        // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS zero-copy backend directly
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
-            logger.info("DiLink 5 platform detected — initializing native QCarCam backend (cameraId=" + cameraId + ")");
+            logger.info("DiLink 5 platform detected — initializing native QCarCam zero-copy backend (cameraId=" + cameraId + ")");
             com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
                     new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
-            if (cameraSurfaceTexture != null) {
-                if (cameraSurface == null) cameraSurface = new Surface(cameraSurfaceTexture);
-                dilink5Backend.startSurface(cameraSurface);
-            } else {
-                dilink5Backend.start();
-            }
+            dilink5Backend.start();
             cameraObj = dilink5Backend;
-            logger.info("DiLink 5 native QCarCam stream initialized (cameraObj assigned).");
+            logger.info("DiLink 5 native QCarCam zero-copy stream started (cameraObj assigned).");
             return;
         }
 
@@ -3036,6 +3026,30 @@ public class PanoramicCameraGpu {
                 }
             }
         }
+    }
+
+    /**
+     * DiLink 5.0 QCarCam (Qualcomm SA8155P) zero-copy frame consumption.
+     * Binds the latest AHardwareBuffer into cameraTextureId via EGLImageKHR /
+     * GL_TEXTURE_EXTERNAL_OES entirely in-process, bypassing SurfaceFlinger and
+     * Qualcomm hwcomposer to eliminate SEGV_ACCERR crashes in sdm::HWCLayer::ValidateAndSetCSC.
+     *
+     * Must be called on the GL thread.
+     */
+    private boolean consumeDiLink5Frame() {
+        if (!(cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend)) {
+            return false;
+        }
+        boolean fresh;
+        synchronized (cameraTextureLock) {
+            fresh = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.bindLatestFrame(cameraTextureId);
+        }
+        if (!fresh) {
+            return false;
+        }
+        currentFrameTimestampNs = System.nanoTime();
+        cameraFrameSeq.incrementAndGet();
+        return true;
     }
 
     /**
@@ -3615,14 +3629,11 @@ public class PanoramicCameraGpu {
             synchronized (frameSync) {
                 if (!imagePending && !stFramePending) {
                     try {
-                        // FIX H4: 250 ms timeout (was 100 ms). The watchdog
-                        // owns frame-stall detection at its own 5 s cadence;
-                        // the timeout here only paces how often we re-check
-                        // running.get(). 100 ms produced ~10 idle wakeups/s
-                        // when the camera HAL was paused (e.g. during ACC-off
-                        // teardown latency); 250 ms cuts that to ~4/s with no
-                        // user-visible behaviour change.
-                        frameSync.wait(250);
+                        // On DiLink 5, frames are produced into AHardwareBuffer ring at 30 FPS.
+                        // A 16ms cadence gives responsive, silky smooth 30-60Hz frame consumption.
+                        // Legacy/OEM paths use 250ms timeout (FIX H4).
+                        long waitTimeoutMs = (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) ? 16 : 250;
+                        frameSync.wait(waitTimeoutMs);
                     } catch (InterruptedException e) {
                         // Continue
                     }
@@ -3651,17 +3662,22 @@ public class PanoramicCameraGpu {
                 return;
             }
 
-            // Bind the latest camera frame to cameraTextureId. Two paths:
+            // Bind the latest camera frame to cameraTextureId. Three paths:
+            //   - DiLink 5 (SA8155P): in-process zero-copy AHardwareBuffer -> EGLImageKHR -> EXTERNAL_OES
             //   - oem SurfaceTexture: updateTexImage() pulls the most recent
             //     BufferQueue slot into the EXTERNAL_OES texture. PTS comes
             //     from SurfaceTexture.getTimestamp().
             //   - legacy ImageReader: acquireLatestImage + getHardwareBuffer
             //     + glEGLImageTargetTexture2DOES on the gralloc buffer.
-            // Both run on the GL thread (current EGL context). If no new
+            // All run on the GL thread (current EGL context). If no new
             // frame is ready (spurious wakeup or notify race), return — the
             // finally re-posts the loop and we wait again.
             long stageT0 = System.nanoTime();
-            if (USE_OEM_SURFACE_TEXTURE_PATH) {
+            if (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) {
+                if (!consumeDiLink5Frame()) {
+                    return;
+                }
+            } else if (USE_OEM_SURFACE_TEXTURE_PATH) {
                 if (cameraSurfaceTexture == null) {
                     return;
                 }

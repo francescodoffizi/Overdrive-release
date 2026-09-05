@@ -1829,9 +1829,15 @@ public class AppUpdater {
         script.append("rm -f /data/local/tmp/start_acc_sentry.sh /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/start_zrok.sh 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/start_telegram.sh 2>/dev/null\n");
+        // Graceful stop stage 0: Disarm video consumers and release EGL context via HTTP/TCP API
+        // This ensures WebCodecs clients disconnect, and EGL context / AHardwareBuffers are cleanly destroyed
+        // BEFORE the process is signaled, preventing Adreno GPU UBWC corruptions in SurfaceFlinger.
+        script.append("curl -s -m 2 -X POST http://127.0.0.1:8080/api/surveillance/disable >/dev/null 2>&1 || true\n");
+        script.append("echo '{\"command\":\"STOP_RECORDING\"}' | nc -w 1 127.0.0.1 19876 >/dev/null 2>&1 || true\n");
+        script.append("sleep 1.2 2>/dev/null || sleep 2\n");
         // Graceful stop stage 1 (SIGTERM) to let qcarcam release DMA/HWC buffers cleanly
         script.append("killall -15 fast_cam_capture 2>/dev/null; killall -15 byd_cam_daemon 2>/dev/null\n");
-        script.append("sleep 0.5 2>/dev/null || sleep 1\n");
+        script.append("sleep 1.0 2>/dev/null || sleep 1\n");
         // Force stop stage 2 (SIGKILL)
         script.append(psAwkKillLine("cam_daemon"));
         script.append(psAwkKillLine("fast_cam_capture"));

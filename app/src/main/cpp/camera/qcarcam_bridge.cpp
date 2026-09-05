@@ -4,8 +4,12 @@
 
 #include <jni.h>
 #include <android/log.h>
-#include <android/native_window.h>
-#include <android/native_window_jni.h>
+#include <android/hardware_buffer.h>
+#include <dlfcn.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +33,58 @@
 
 namespace {
 
+// Extension function signatures for EGL and AHardwareBuffer
+typedef EGLClientBuffer (EGLAPIENTRYP PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC)(const struct AHardwareBuffer* buffer);
+typedef EGLImageKHR (EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint* attrib_list);
+typedef EGLBoolean (EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay dpy, EGLImageKHR image);
+typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, GLeglImageOES image);
+
+typedef int (*PFN_AHARDWAREBUFFER_ALLOCATE)(const AHardwareBuffer_Desc* desc, AHardwareBuffer** outBuffer);
+typedef int (*PFN_AHARDWAREBUFFER_LOCK)(AHardwareBuffer* buffer, uint64_t usage, int32_t fence, const ARect* rect, void** outVirtualAddress);
+typedef int (*PFN_AHARDWAREBUFFER_UNLOCK)(AHardwareBuffer* buffer, int32_t* fence);
+typedef void (*PFN_AHARDWAREBUFFER_RELEASE)(AHardwareBuffer* buffer);
+
+struct ExtFns {
+    PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC eglGetNativeClientBufferANDROID = nullptr;
+    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR = nullptr;
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES = nullptr;
+    PFN_AHARDWAREBUFFER_ALLOCATE ahbAllocate = nullptr;
+    PFN_AHARDWAREBUFFER_LOCK ahbLock = nullptr;
+    PFN_AHARDWAREBUFFER_UNLOCK ahbUnlock = nullptr;
+    PFN_AHARDWAREBUFFER_RELEASE ahbRelease = nullptr;
+    bool ok = false;
+};
+
+static ExtFns g_ext;
+static std::once_flag g_extOnce;
+
+static void resolveExtensions() {
+    std::call_once(g_extOnce, []() {
+        g_ext.eglGetNativeClientBufferANDROID = (PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC) eglGetProcAddress("eglGetNativeClientBufferANDROID");
+        g_ext.eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC) eglGetProcAddress("eglCreateImageKHR");
+        g_ext.eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC) eglGetProcAddress("eglDestroyImageKHR");
+        g_ext.glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
+        void* libnw = dlopen("libnativewindow.so", RTLD_NOW);
+        if (libnw) {
+            g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(libnw, "AHardwareBuffer_allocate");
+            g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(libnw, "AHardwareBuffer_lock");
+            g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(libnw, "AHardwareBuffer_unlock");
+            g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(libnw, "AHardwareBuffer_release");
+        }
+        if (!g_ext.ahbAllocate) g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_allocate");
+        if (!g_ext.ahbLock) g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_lock");
+        if (!g_ext.ahbUnlock) g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_unlock");
+        if (!g_ext.ahbRelease) g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
+
+        g_ext.ok = g_ext.eglGetNativeClientBufferANDROID && g_ext.eglCreateImageKHR &&
+                   g_ext.eglDestroyImageKHR && g_ext.glEGLImageTargetTexture2DOES &&
+                   g_ext.ahbAllocate && g_ext.ahbLock && g_ext.ahbUnlock && g_ext.ahbRelease;
+        LOGI("Zero-copy EGL/AHardwareBuffer extensions resolved: ok=%d", g_ext.ok);
+    });
+}
+
 struct CameraMapping {
     std::atomic<int> hw_front{0};
     std::atomic<int> hw_right{1};
@@ -41,8 +97,14 @@ static CameraMapping g_camMapping;
 std::atomic<bool> g_streaming{false};
 std::atomic<int> g_active_camera{0};
 pthread_t g_streamThread = 0;
-ANativeWindow* g_nativeWindow = nullptr;
-std::mutex g_winMutex;
+
+// HardwareBuffer ping-pong pool for zero-copy GL texture binding (bypasses SurfaceFlinger and HWC)
+static AHardwareBuffer* g_hwBuffers[2] = {nullptr, nullptr};
+static int g_bufWidth = 0;
+static int g_bufHeight = 0;
+static std::atomic<int> g_frontIdx{-1};
+static std::atomic<bool> g_hasNewFrame{false};
+static std::mutex g_bufMutex;
 
 #include <arm_neon.h>
 
@@ -56,7 +118,8 @@ void convert_uyvy_to_rgba(const uint8_t* __restrict__ uyvy, int width, int heigh
 
     for (int y = 0; y < height; ++y) {
         const uint8_t* src_row = uyvy + y * width * 2;
-        uint32_t* dst_row = dst_rgba + y * stride;
+        // Invert Y so OpenGL / shader coordinate conventions match upright image
+        uint32_t* dst_row = dst_rgba + (height - 1 - y) * stride;
         int x = 0;
 
         // Vectorized loop: 16 pixels per iteration
@@ -341,29 +404,43 @@ void* streamClientLoop(void* arg) {
         }
 
         if (render_pixels) {
-            std::lock_guard<std::mutex> lock(g_winMutex);
-            if (g_nativeWindow) {
-                // Dynamically reconfigure window buffer geometry if resolution changed
-                if (current_win_w != target_w || current_win_h != target_h) {
-                    ANativeWindow_setBuffersGeometry(g_nativeWindow, target_w, target_h, WINDOW_FORMAT_RGBA_8888);
-                    current_win_w = target_w;
-                    current_win_h = target_h;
-                    LOGI("ANativeWindow buffer geometry adapted: %dx%d RGBA8888 (mode=%d)", target_w, target_h, desired_cam);
+            resolveExtensions();
+            if (g_ext.ok) {
+                std::lock_guard<std::mutex> lock(g_bufMutex);
+                // Reallocate ping-pong AHardwareBuffers if resolution changed or not yet created
+                if (!g_hwBuffers[0] || g_bufWidth != target_w || g_bufHeight != target_h) {
+                    if (g_hwBuffers[0]) { g_ext.ahbRelease(g_hwBuffers[0]); g_hwBuffers[0] = nullptr; }
+                    if (g_hwBuffers[1]) { g_ext.ahbRelease(g_hwBuffers[1]); g_hwBuffers[1] = nullptr; }
+
+                    AHardwareBuffer_Desc desc = {};
+                    desc.width = target_w;
+                    desc.height = target_h;
+                    desc.layers = 1;
+                    desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+                    desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+
+                    g_ext.ahbAllocate(&desc, &g_hwBuffers[0]);
+                    g_ext.ahbAllocate(&desc, &g_hwBuffers[1]);
+                    g_bufWidth = target_w;
+                    g_bufHeight = target_h;
+                    g_frontIdx.store(-1);
+                    LOGI("Allocated ping-pong AHardwareBuffers for GL zero-copy: %dx%d RGBA", target_w, target_h);
                 }
 
-                ANativeWindow_Buffer winBuffer;
-                memset(&winBuffer, 0, sizeof(winBuffer));
-                if (ANativeWindow_lock(g_nativeWindow, &winBuffer, nullptr) == 0) {
-                    if (winBuffer.bits != nullptr && winBuffer.stride > 0 && winBuffer.width > 0 && winBuffer.height > 0) {
-                        // Color conversion UYVY to RGBA8888 onto Android Surface buffer
-                        convert_uyvy_to_rgba(render_pixels, target_w, target_h,
-                                             (uint32_t*)winBuffer.bits, winBuffer.stride);
-                    }
-                    ANativeWindow_unlockAndPost(g_nativeWindow);
-                    rendered_frames++;
-                    if (rendered_frames % 300 == 1) {
-                        LOGI("Rendered %u frames to Surface (mode=%d, res=%dx%d, lastCamId=%u)",
-                             rendered_frames, desired_cam, target_w, target_h, frame.cam_id);
+                if (g_hwBuffers[0] && g_hwBuffers[1]) {
+                    int curFront = g_frontIdx.load();
+                    int writeIdx = (curFront == 0) ? 1 : 0;
+                    void* vaddr = nullptr;
+                    if (g_ext.ahbLock(g_hwBuffers[writeIdx], AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &vaddr) == 0 && vaddr) {
+                        convert_uyvy_to_rgba(render_pixels, target_w, target_h, (uint32_t*)vaddr, target_w);
+                        g_ext.ahbUnlock(g_hwBuffers[writeIdx], nullptr);
+                        g_frontIdx.store(writeIdx);
+                        g_hasNewFrame.store(true);
+                        rendered_frames++;
+                        if (rendered_frames % 300 == 1) {
+                            LOGI("HardwareBuffer zero-copy frame ready (%u frames, mode=%d, %dx%d)",
+                                 rendered_frames, desired_cam, target_w, target_h);
+                        }
                     }
                 }
             }
@@ -401,29 +478,56 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStart(
     return JNI_TRUE;
 }
 
+// Bypasses Surface/ANativeWindow completely to avoid Qualcomm SA8155P hwcomposer crashes
 JNIEXPORT jboolean JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStartSurface(
     JNIEnv* env, jobject thiz, jobject surface) {
-    std::lock_guard<std::mutex> lock(g_winMutex);
-    ANativeWindow* newWin = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
-    if (newWin != nullptr && newWin == g_nativeWindow) {
-        // Already active with this ANativeWindow, release extra reference acquired by ANativeWindow_fromSurface
-        ANativeWindow_release(newWin);
-    } else {
-        if (g_nativeWindow) {
-            ANativeWindow_release(g_nativeWindow);
-            g_nativeWindow = nullptr;
-        }
-        g_nativeWindow = newWin;
-        if (g_nativeWindow) {
-            ANativeWindow_setBuffersGeometry(g_nativeWindow, FRAME_WIDTH, FRAME_HEIGHT, WINDOW_FORMAT_RGBA_8888);
-            LOGI("ANativeWindow configured: %dx%d RGBA8888", FRAME_WIDTH, FRAME_HEIGHT);
-        }
+    // Delegated directly to nativeStart: GL rendering now reads via nativeBindLatestFrame
+    return Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStart(env, thiz, 1);
+}
+
+// Binds the latest available AHardwareBuffer directly into the calling thread's EGL GL_TEXTURE_EXTERNAL_OES
+JNIEXPORT jboolean JNICALL
+Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFrame(
+    JNIEnv* env, jclass clazz, jint textureId) {
+    if (!g_hasNewFrame.load()) {
+        return JNI_FALSE;
     }
-    g_streaming.store(true);
-    if (g_streamThread == 0) {
-        pthread_create(&g_streamThread, nullptr, streamClientLoop, nullptr);
+    resolveExtensions();
+    if (!g_ext.ok) {
+        return JNI_FALSE;
     }
+
+    int idx = g_frontIdx.load();
+    if (idx < 0 || idx > 1 || !g_hwBuffers[idx]) {
+        return JNI_FALSE;
+    }
+
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    if (dpy == EGL_NO_DISPLAY) {
+        return JNI_FALSE;
+    }
+
+    EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(g_hwBuffers[idx]);
+    if (!clientBuf) {
+        return JNI_FALSE;
+    }
+
+    static const EGLint kAttrs[] = {
+        EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
+        EGL_NONE
+    };
+    EGLImageKHR image = g_ext.eglCreateImageKHR(
+        dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, kAttrs);
+    if (image == EGL_NO_IMAGE_KHR) {
+        return JNI_FALSE;
+    }
+
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, static_cast<GLuint>(textureId));
+    g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+    g_ext.eglDestroyImageKHR(dpy, image);
+
+    g_hasNewFrame.store(false);
     return JNI_TRUE;
 }
 
@@ -435,11 +539,14 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
         pthread_join(g_streamThread, nullptr);
         g_streamThread = 0;
     }
-    std::lock_guard<std::mutex> lock(g_winMutex);
-    if (g_nativeWindow) {
-        ANativeWindow_release(g_nativeWindow);
-        g_nativeWindow = nullptr;
+    std::lock_guard<std::mutex> lock(g_bufMutex);
+    resolveExtensions();
+    if (g_ext.ahbRelease) {
+        if (g_hwBuffers[0]) { g_ext.ahbRelease(g_hwBuffers[0]); g_hwBuffers[0] = nullptr; }
+        if (g_hwBuffers[1]) { g_ext.ahbRelease(g_hwBuffers[1]); g_hwBuffers[1] = nullptr; }
     }
+    g_frontIdx.store(-1);
+    g_hasNewFrame.store(false);
     return JNI_TRUE;
 }
 
@@ -464,16 +571,7 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeSetCameraMappi
 JNIEXPORT void JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeRelease(
     JNIEnv* env, jobject thiz, jlong handle) {
-    g_streaming.store(false);
-    if (g_streamThread != 0) {
-        pthread_join(g_streamThread, nullptr);
-        g_streamThread = 0;
-    }
-    std::lock_guard<std::mutex> lock(g_winMutex);
-    if (g_nativeWindow) {
-        ANativeWindow_release(g_nativeWindow);
-        g_nativeWindow = nullptr;
-    }
+    Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(env, thiz, handle);
 }
 
 } // extern "C"
