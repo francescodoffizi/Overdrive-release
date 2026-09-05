@@ -102,33 +102,63 @@ object CarSvcTelemetry {
     @Volatile private var notChargingSinceMs: Long = 0L
     @Volatile private var lastSampleAtMs: Long = 0L
 
-    // ==================== Core primitives ====================
+    private const val DUMPSYS_CACHE_TTL_MS = 1500L
+    @Volatile private var cachedDumpsysText: String? = null
+    @Volatile private var lastDumpsysFetchMs: Long = 0L
+    private val dumpsysLock = Any()
 
     /**
-     * Runs `dumpsys car_service`, waits for it to exit, then reads the
-     * completed output from a per-call-unique temp file. Returns null on any
-     * failure, or immediately (without shelling out) when [DiLink5Platform]
-     * is not active.
+     * Runs `dumpsys car_service` with a 1500ms memory cache and single-flight lock
+     * to protect against Binder thread pool saturation and fork storms.
      */
     fun dumpsysText(): String? {
         if (!DiLink5Platform.isActive()) return null
-        val path = "/data/local/tmp/.carsvc_dump_${Thread.currentThread().id}_${System.nanoTime()}.txt"
-        val tmpFile = File(path)
-        return try {
-            val process = Runtime.getRuntime().exec(
-                arrayOf("/system/bin/sh", "-c", "dumpsys car_service > $path 2>&1")
-            )
-            process.waitFor()
-            if (!tmpFile.isFile) return null
-            tmpFile.readText()
-        } catch (t: Throwable) {
-            logger.debug("dumpsysText() failed: " + t.message)
-            null
-        } finally {
-            try {
-                if (tmpFile.exists()) tmpFile.delete()
-            } catch (ignored: Throwable) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val currentCache = cachedDumpsysText
+        if (currentCache != null && (now - lastDumpsysFetchMs) < DUMPSYS_CACHE_TTL_MS) {
+            return currentCache
+        }
+        synchronized(dumpsysLock) {
+            val freshNow = android.os.SystemClock.elapsedRealtime()
+            if (cachedDumpsysText != null && (freshNow - lastDumpsysFetchMs) < DUMPSYS_CACHE_TTL_MS) {
+                return cachedDumpsysText
             }
+            val path = "/data/local/tmp/.carsvc_dump_${Thread.currentThread().id}.txt"
+            val tmpFile = File(path)
+            try {
+                val process = Runtime.getRuntime().exec(
+                    arrayOf("/system/bin/sh", "-c", "dumpsys car_service > $path 2>&1")
+                )
+                // Enforce maximum 2000ms execution timeout to avoid blocking caller threads
+                var finished = false
+                for (i in 0 until 20) {
+                    try {
+                        process.exitValue()
+                        finished = true
+                        break
+                    } catch (_: IllegalThreadStateException) {
+                        Thread.sleep(100)
+                    }
+                }
+                if (!finished) {
+                    process.destroy()
+                    logger.debug("dumpsys car_service timed out after 2000ms")
+                    return cachedDumpsysText
+                }
+                if (tmpFile.isFile && tmpFile.length() > 0) {
+                    val text = tmpFile.readText()
+                    cachedDumpsysText = text
+                    lastDumpsysFetchMs = freshNow
+                    return text
+                }
+            } catch (t: Throwable) {
+                logger.debug("dumpsysText() failed: " + t.message)
+            } finally {
+                try {
+                    if (tmpFile.exists()) tmpFile.delete()
+                } catch (_: Throwable) {}
+            }
+            return cachedDumpsysText
         }
     }
 

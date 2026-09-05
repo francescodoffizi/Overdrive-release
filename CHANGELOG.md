@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Integrazione Protetta e Ottimizzazione `CarSvcTelemetry` con Cache TTL (`CarSvcTelemetry.kt`)**:
+  - **Prevenzione Fork Storm su `dumpsys car_service`**: Sostituita l'esecuzione sincrona priva di rate limiting con una cache in-memory con TTL di 1.500 ms protetta da lock single-flight (`synchronized(dumpsysLock)`).
+  - **Filtro Zero-Overhead per Chiamate ad Alta Frequenza**: Le letture ravvicinate da parte di `TelemetryDataCollector` (10 Hz), `OverlayBitmapRenderer` (frequenza frame) e `HttpServer` riutilizzano istantaneamente il testo memorizzato in RAM, eliminando picchi di carico CPU, scritture ripetute su flash e saturazione dei thread Binder di `system_server`.
+  - **Timeout di Sicurezza Fail-Safe**: Introdotto un limite rigido di 2.000 ms per il processo `dumpsys car_service` con distruzione forzata in caso di mancata risposta, evitando il blocco dei thread chiamanti.
+
 - **Correzione Finestra Selezione Veicolo e Supporto Numeri Decimali per Capacità Batteria (`DashboardFragment.kt`, `dialog_vehicle_capacity.xml`, `strings.xml`)**:
   - **Supporto Virgola e Punto Decimale (`82,5` / `82.5`)**: Risolto il rifiuto del valore nominale di default o digitato con virgola (es. `82,5` kWh per BYD Sealion 7) nella finestra di selezione modello/capacità in dashboard. In precedenza `raw.toDoubleOrNull()` falliva su stringhe contenenti la virgola restituendo errore di valore non valido. Implementata la normalizzazione automatica `raw.replace(',', '.').toDoubleOrNull()`.
   - **Formattazione Indipendente dal Locale**: Forzata la formattazione con `java.util.Locale.US` (`String.format(Locale.US, "%.1f", ...)`) sia nel pre-popolamento sia nella visualizzazione, garantendo coerenza numerica ed evitando che il locale di sistema (es. italiano) inserisca automaticamente formati incompatibili con il parsing JSON del daemon.
