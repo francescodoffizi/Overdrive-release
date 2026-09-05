@@ -4,6 +4,18 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Crash Pad / Bootloop Infotainment su DiLink 5.0 (SA8155P) e Aggiornamento Sicuro (`AppUpdater.java`, `tools/safe_install_adb.sh`, `.agents/rules/safe_adb_update.md`)**:
+  - **Identificazione Causa Radice Crash Infotainment (`hwcomposer@2.4-service`)**: Analisi forense dai tombstone di sistema (`SIGSEGV` in `sdm::HWCLayer::ValidateAndSetCSC` all'indirizzo non mappato `0x7fe9717000` durante `SetLayerBuffer`). Quando l'APK viene sostituito o aggiornato a caldo mentre i processi o i watchdog della telecamera (`byd_cam_daemon`, `fast_cam_capture`) sono attivi o terminati bruscamente con `kill -9`, i buffer DMA e le sessioni di Color Space Conversion agganciate alla GPU Adreno e all'hardware composer rimangono orfani o vengono dereferenziati in modo non valido. Il crash a cascata di `composer@2.4-service` e `surfaceflinger` innesca il reboot di sicurezza del kernel (`SYSTEM_RESTART`) riavviando l'intero schermo/pad.
+  - **Hardening Procedura Auto-Update (`AppUpdater.java`)**:
+    - Spostata la rimozione delle sentinels di isolamento (`camera_daemon.disabled`, `acc_sentry_daemon.disabled`) **SOLO** al termine dell'installazione e sul ramo di effettivo successo (`INSTALL_RC == 0`). In precedenza venivano rimosse prima del `pm install -r -d`, consentendo ai watchdog di riattivarsi durante la scrittura dell'APK.
+    - Introdotto l'arresto a due stadi dei demoni video: prima `SIGTERM` (`killall -15`) con pausa di 500 ms per permettere a `qcarcam_close()` di rilasciare ordinatamente i buffer DMA e chiudere i descrittori del driver AIS, e solo successivamente `SIGKILL` forzato (`killall -9`).
+    - Eliminazione preventiva immediata di tutti gli script di watchdog shell (`start_cam_daemon.sh`, `cam_watchdog.pid`, `start_acc_sentry.sh`, ecc.) per prevenire qualsiasi race condition o respawn concorrente durante l'update.
+    - Ripristino forzato dello stato del pacchetto con `pm enable com.overdrive.app` prima del rilancio dell'interfaccia.
+  - **Script Shell Dedicato per Installazioni Sicure via ADB (`tools/safe_install_adb.sh`)**:
+    - Creato uno script automatizzato a 8 fasi che garantisce l'isolamento del sistema prima di eseguire l'installazione: verifica connettività ADB, piantaggio sentinels, pulizia script watchdog, graceful stop dei demoni video con unmap DMA, arresto controllato di Overdrive, `adb install -r -d`, sblocco sentinels e avvio pulito di `MainActivity`.
+  - **Istituzione Regola di Lavoro Permanente (`.agents/rules/safe_adb_update.md`)**:
+    - Definita una regola mandatoria per l'agente che vieta tassativamente l'uso diretto di `adb install` a caldo sul veicolo, imponendo l'uso esclusivo di `tools/safe_install_adb.sh` per ogni futuro deploy.
+
 - **Integrazione Protetta e Ottimizzazione `CarSvcTelemetry` con Cache TTL (`CarSvcTelemetry.kt`)**:
   - **Prevenzione Fork Storm su `dumpsys car_service`**: Sostituita l'esecuzione sincrona priva di rate limiting con una cache in-memory con TTL di 1.500 ms protetta da lock single-flight (`synchronized(dumpsysLock)`).
   - **Filtro Zero-Overhead per Chiamate ad Alta Frequenza**: Le letture ravvicinate da parte di `TelemetryDataCollector` (10 Hz), `OverlayBitmapRenderer` (frequenza frame) e `HttpServer` riutilizzano istantaneamente il testo memorizzato in RAM, eliminando picchi di carico CPU, scritture ripetute su flash e saturazione dei thread Binder di `system_server`.
