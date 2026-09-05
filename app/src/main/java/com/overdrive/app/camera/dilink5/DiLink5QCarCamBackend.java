@@ -105,6 +105,66 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    private static volatile boolean sYieldedForReverse = false;
+    private static final Object sGearLock = new Object();
+    private static java.util.concurrent.ScheduledExecutorService sGearResumeExecutor = null;
+    private static volatile boolean sGearListenerRegistered = false;
+
+    private static synchronized void ensureGearListenerRegistered() {
+        if (!sGearListenerRegistered) {
+            sGearListenerRegistered = true;
+            try {
+                com.overdrive.app.monitor.GearMonitor.getInstance().addListener((oldGear, newGear) -> {
+                    onGearChanged(oldGear, newGear);
+                });
+            } catch (Throwable t) {
+                logger.warn("Failed to register GearMonitor listener: " + t.getMessage());
+            }
+        }
+    }
+
+    public static void onGearChanged(int oldGear, int newGear) {
+        if (newGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+            logger.info("Gear shifted to REVERSE: gracefully yielding Qualcomm AIS capture to native BYD 360 app...");
+            sYieldedForReverse = true;
+            synchronized (sGearLock) {
+                if (sGearResumeExecutor != null) {
+                    sGearResumeExecutor.shutdownNow();
+                    sGearResumeExecutor = null;
+                }
+            }
+            terminateHardwareProcess();
+        } else if (oldGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 400ms...");
+            sYieldedForReverse = false;
+            scheduleResumeAfterReverse();
+        }
+    }
+
+    private static void scheduleResumeAfterReverse() {
+        synchronized (sGearLock) {
+            if (sGearResumeExecutor != null) {
+                sGearResumeExecutor.shutdownNow();
+            }
+            sGearResumeExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "fast-cam-reverse-resume");
+                t.setDaemon(true);
+                return t;
+            });
+            sGearResumeExecutor.schedule(() -> {
+                int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+                    logger.info("Capture resumption cancelled: vehicle is still in REVERSE");
+                    return;
+                }
+                if (hasActiveStreamingBackend()) {
+                    logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after reverse yield...");
+                    ensureHardwareProcess();
+                }
+            }, 400, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+    }
+
     public static synchronized void terminateHardwareProcess() {
         if (sHardwareProcess != null) {
             try {
@@ -127,6 +187,14 @@ public class DiLink5QCarCamBackend {
 
     private static synchronized void ensureHardwareProcess() {
         try {
+            ensureGearListenerRegistered();
+
+            int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+            if (sYieldedForReverse || curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+                logger.info("Skipping ensureHardwareProcess: vehicle currently in REVERSE (yielding to native AVM)");
+                return;
+            }
+
             // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
             String binPath = "/data/local/tmp/fast_cam_capture";
             java.io.File binFile = new java.io.File(binPath);
@@ -191,7 +259,17 @@ public class DiLink5QCarCamBackend {
                     sHardwareProcess = null;
                 }
 
+                if (exitCode == 42) {
+                    logger.info("Qualcomm fast_cam_capture exited cleanly due to hardware preemption (exit code 42)");
+                }
+
                 if (hasActiveStreamingBackend()) {
+                    int gear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                    if (gear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
+                        logger.info("Suppressing auto-recovery: vehicle is in REVERSE, waiting for gear change to resume");
+                        return;
+                    }
+
                     logger.warn("Qualcomm fast_cam_capture process exited unexpectedly (code " + exitCode + "). Triggering auto-recovery supervisor in 500ms...");
                     try {
                         Thread.sleep(500);

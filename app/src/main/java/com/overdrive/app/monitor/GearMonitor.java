@@ -51,6 +51,34 @@ public class GearMonitor {
      *  to within ~POLL_INTERVAL_MS rather than a cold initial value. */
     public boolean isActive() { return isRunning; }
     
+    public interface OnGearChangeListener {
+        void onGearChanged(int oldGear, int newGear);
+    }
+
+    private final java.util.List<OnGearChangeListener> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public void addListener(OnGearChangeListener listener) {
+        if (listener != null && !listeners.contains(listener)) {
+            listeners.add(listener);
+        }
+    }
+
+    public void removeListener(OnGearChangeListener listener) {
+        if (listener != null) {
+            listeners.remove(listener);
+        }
+    }
+
+    private void notifyListeners(int oldGear, int newGear) {
+        for (OnGearChangeListener listener : listeners) {
+            try {
+                listener.onGearChanged(oldGear, newGear);
+            } catch (Throwable t) {
+                logger.error("Error in OnGearChangeListener: " + t.getMessage(), t);
+            }
+        }
+    }
+
     // TelemetryDataCollector reference — when set, read gear from its cached snapshot
     // instead of polling the BYD device directly (avoids duplicate CAN bus reads)
     private volatile com.overdrive.app.telemetry.TelemetryDataCollector telemetrySource = null;
@@ -242,6 +270,7 @@ public class GearMonitor {
                         if (gear != previousGear) {
                             logger.info("Gear changed: " + gearToString(previousGear) + " -> " + gearToString(gear));
                             CameraDaemon.onGearChanged(gear);
+                            notifyListeners(previousGear, gear);
                         }
                     } catch (InterruptedException e) {
                         break;
@@ -254,6 +283,7 @@ public class GearMonitor {
             }, "GearPoll");
             pollThread.setDaemon(true);
             CameraDaemon.onGearChanged(initialGear);
+            notifyListeners(-1, initialGear);
             pollThread.start();
             
             logger.info("Gear monitor started successfully");

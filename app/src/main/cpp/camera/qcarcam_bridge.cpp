@@ -322,6 +322,11 @@ void* streamClientLoop(void* arg) {
 
     while (g_streaming.load()) {
         if (!client.isConnected()) {
+            {
+                std::lock_guard<std::mutex> lock(g_bufMutex);
+                g_frontIdx.store(-1);
+                g_hasNewFrame.store(false);
+            }
             LOGW("FastCamClient disconnected from @fast_cam.sock. Reconnecting...");
             while (g_streaming.load() && !client.connect("@fast_cam.sock")) {
                 if (client.connect("/data/local/tmp/fast_cam.sock")) {
@@ -498,6 +503,7 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
         return JNI_FALSE;
     }
 
+    std::unique_lock<std::mutex> lock(g_bufMutex);
     int idx = g_frontIdx.load();
     if (idx < 0 || idx > 1 || !g_hwBuffers[idx]) {
         return JNI_FALSE;

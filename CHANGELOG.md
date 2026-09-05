@@ -4,6 +4,23 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Cooperative Hardware Yielding su Marcia R (Reverse) e Prevenzione Lockup AIS / Esaurimento Slot GPU Adreno (`fast_cam_capture/src/main.c`, `GearMonitor.java`, `DiLink5QCarCamBackend.java`, `qcarcam_bridge.cpp`)**:
+  - **Identificazione Conflitto Hardware su Qualcomm AIS (SA8155P)**:
+    All'inserimento della retromarcia (`GEAR_R`), l'applicazione di sistema nativa BYD 360 AVM assume il controllo prioritario ed esclusivo del server AIS (`libais_client.so`). Qualsiasi client in background riceve l'errore di preemption hardware `ERR 12` (`QCARCAM_RET_ERR`).
+  - **Fix Loop a Vuoto e Backoff in `fast_cam_capture` (C nativo)**:
+    - Rilevato un loop infinito stretto in `fast_cam_capture/src/main.c`: su errore di acquisizione frame da AIS (`ret != QCARCAM_RET_OK`), eseguiva `continue;` privo di sleep, martellando il server AIS a 100% di CPU milioni di volte al secondo.
+    - Introdotto un backoff preventivo `usleep(15000)` quando nessun canale restituisce frame in un ciclo.
+    - Implementato il rilevamento intelligente della preemption: se i frame falliscono consecutivamente per oltre 1.5 secondi dopo l'avvio a regime, `fast_cam_capture` termina in modo pulito invocando `qcarcam_stop()` e `qcarcam_close()` e uscendo con codice di stato dedicato `42` (`EXIT_PREEMPTED`).
+    - Compilato con Android NDK r26d e integrato il nuovo binario in `app/src/main/assets/dilink5/fast_cam_capture`.
+  - **Architettura di Yielding Cooperativo a Due Livelli (Java / C++)**:
+    - **In `GearMonitor.java`**: Introdotta l'interfaccia `OnGearChangeListener` e il meccanismo di notifica thread-safe sincrono con il ciclo di polling a 200 ms.
+    - **In `DiLink5QCarCamBackend.java`**:
+      - All'ingresso in retromarcia (`GEAR_R`): invia immediatamente `SIGTERM` a `fast_cam_capture` (`terminateHardwareProcess()`), rilasciando l'hardware AIS istantaneamente e cedendo il controllo incondizionato alla vista nativa 360 BYD.
+      - Nel thread `drainer`: intercetta il codice di uscita `42` e sopprime l'auto-recovery supervisor finché il veicolo rimane in `GEAR_R`.
+      - All'uscita da `GEAR_R` (ritorno in `P`, `D` o `N`): azzera il flag di resa e programma il riavvio controllato di `fast_cam_capture` con un debounce di 400 ms, consentendo alla vista nativa 360 di chiudere le proprie sessioni prima di riacquisire l'hardware.
+  - **Prevenzione Esaurimento Command Buffer Pool GPU Adreno (`qcarcam_bridge.cpp`)**:
+    - Risolto il rischio di esaurimento degli slot del pool di comandi della GPU Adreno 643 (`mem used 4533.89% slots used 978`): protetto l'accesso all'array `AHardwareBuffer` in `nativeBindLatestFrame` con `std::unique_lock<std::mutex> lock(g_bufMutex)`, e inserito l'azzeramento atomico dello stato frame (`g_hasNewFrame = false`, `g_frontIdx = -1`) in caso di disconnessione del socket IPC per evitare che il thread di composizione GL continui ad agganciare buffer o texture pendenti durante il freeze temporaneo.
+
 - **Correzione Scalatura TPMS e Falsa Allerta "Low Pressure" su BYD DiLink 5.0 (`CarSvcTelemetry.kt`)**:
   - **Identificazione Errore di Conversione Unità**: Su DiLink 5.0, le proprietà TPMS di `dumpsys car_service` (`0x2160801d` e `0x2160801e`) riportano i valori in decine di kPa / bar*10 (es. `29.0` e `30.0` corrispondenti esattamente a 290 e 300 kPa, come confermato dalla proprietà nativa `0x21404a03` `TYRE_PRESSURE_VALUE: 290`). In precedenza, il codice divideva il valore per 10 assumendo erroneamente che fosse espresso in decimi di PSI (`30 / 10 = 3.0 PSI` -> `21 kPa` -> `0.21 bar`), causando la falsa segnalazione di gomme sgonfie/a terra con badge rosso e allerta `Low pressure`.
   - **Ripristino Scalatura Corretta**: Implementata la gestione dinamica del range: se `r in 15..60` il valore viene scalato correttamente in `r * 10` kPa (290/300 kPa = 2.9/3.0 bar), e se `r > 60` viene preso direttamente come kPa. I pneumatici vengono ora renderizzati con precisione a 2.90 e 3.00 bar in stato "All OK".

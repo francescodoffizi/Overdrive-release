@@ -2949,8 +2949,12 @@ object UnifiedConfigManager {
         val oem = getOemDashcam()
         val recMode = getOemRecordingMode()
         val survMode = getOemSurveillanceMode()
-        val oemActive = (recMode != "off" || survMode != "off") || oem.optBoolean("enabled", false)
-        if (!oemActive) {
+        val oemActive = if (oem.has("recordingMode") || oem.has("surveillanceMode")) {
+            recMode != "off" || survMode != "off"
+        } else {
+            oem.optBoolean("enabled", false)
+        }
+        if (!oemActive || !oem.optBoolean("enabled", true)) {
             return -1
         }
         val mode = camera.optString("cameraMode", "")
