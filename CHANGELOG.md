@@ -4,6 +4,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Definitiva Falsa Segnalazione Cavo / Caricatore Connesso ("Plugged in") a Veicolo a Riposo (`ChargingApiHandler.java`)**:
+  - **Identificazione Regressione da Merge DiLink 5.0**: Rilevata la reintroduzione accidentale di `|| status == ChargingStateData.ChargingStatus.READY` all'interno di `resolvePlugged()`. Su veicoli BYD, `READY` (stato `0`) rappresenta lo stato di standby a riposo del controller BMS quando il veicolo è parcheggiato e spento. In assenza di sensore pistola (`gunState` non disponibile o a riposo), la condizione qualificava erroneamente il veicolo come collegato alla presa.
+  - **Rimozione Condizione Errata**: Eliminato definitivamente il controllo su `status == READY` da `ChargingApiHandler.resolvePlugged()`. Il veicolo viene ora qualificato come `plugged` unicamente se il sensore fisico pistola (`gunState in 2..4`), la ricarica attiva (`charging == true`), o una sessione completata/programmata certificano l'effettivo collegamento del cavo di ricarica.
+
 - **Cooperative Hardware Yielding su Marcia R (Reverse) e Prevenzione Lockup AIS / Esaurimento Slot GPU Adreno (`fast_cam_capture/src/main.c`, `GearMonitor.java`, `DiLink5QCarCamBackend.java`, `qcarcam_bridge.cpp`)**:
   - **Identificazione Conflitto Hardware su Qualcomm AIS (SA8155P)**:
     All'inserimento della retromarcia (`GEAR_R`), l'applicazione di sistema nativa BYD 360 AVM assume il controllo prioritario ed esclusivo del server AIS (`libais_client.so`). Qualsiasi client in background riceve l'errore di preemption hardware `ERR 12` (`QCARCAM_RET_ERR`).

@@ -1059,7 +1059,6 @@ public class ChargingApiHandler {
         if (gunState == 2 || gunState == 3 || gunState == 4) return true;
         return charging
                 || status == ChargingStateData.ChargingStatus.FINISHED
-                || status == ChargingStateData.ChargingStatus.READY
                 || status == ChargingStateData.ChargingStatus.SCHEDULED;
     }
 
