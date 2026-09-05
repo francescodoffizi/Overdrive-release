@@ -682,6 +682,31 @@ public class TelemetryDataCollector {
             }
         }
 
+        // DiLink 5 / Fallback speed resolution when CAN speed device fails or is 0
+        if (!lastSpeedValid || speedKmh == 0) {
+            try {
+                if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+                    int carSvcSpeed = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.speedValue();
+                    if (carSvcSpeed >= 0 && carSvcSpeed <= 300) {
+                        acceptSpeedCandidate(carSvcSpeed, pollElapsedRealtimeMs);
+                        speedKmh = lastSpeedKmh;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            if (!lastSpeedValid || speedKmh == 0) {
+                try {
+                    com.overdrive.app.byd.BydDataCollector col = com.overdrive.app.byd.BydDataCollector.getInstance();
+                    if (col != null) {
+                        double ds = col.readCurrentSpeedKmh();
+                        if (!Double.isNaN(ds) && ds >= 0 && ds <= 300) {
+                            acceptSpeedCandidate((int) Math.round(ds), pollElapsedRealtimeMs);
+                            speedKmh = lastSpeedKmh;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+
         GpsSpeedEvidence gpsSpeedEvidence =
                 captureTrustworthyGpsSpeed(
                         pollElapsedRealtimeMs,
@@ -718,6 +743,14 @@ public class TelemetryDataCollector {
                     invalidateFrozenSpeed(speedKmh);
                 }
             }
+        }
+
+        // Live GPS speed fallback when CAN speed is invalidated or reporting 0 while in motion
+        if ((speedSourceInvalidated || !lastSpeedValid || speedKmh == 0)
+                && gpsSpeedEvidence != null
+                && gpsSpeedEvidence.speedKmh >= 2.0) {
+            acceptSpeedCandidate((int) Math.round(gpsSpeedEvidence.speedKmh), pollElapsedRealtimeMs);
+            speedKmh = lastSpeedKmh;
         }
 
         // Gearbox: gear mode (every poll — changes on shift)
@@ -763,10 +796,62 @@ public class TelemetryDataCollector {
                     lastGearValid = true;
                     lastGearReadElapsedRealtimeMs =
                             pollElapsedRealtimeMs;
+                    gearAcquired = true;
                 }
             } catch (Exception e) {
                 logger.warn("Failed to read gear mode: " + e.getMessage());
             }
+        }
+
+        // Fallback 1: GearMonitor (multi-source DiLink 5.0 resolver)
+        if (!gearAcquired) {
+            try {
+                com.overdrive.app.monitor.GearMonitor gm = com.overdrive.app.monitor.GearMonitor.getInstance();
+                if (gm != null) {
+                    int candidate = gm.getCurrentGear();
+                    if (isValidGearMode(candidate)) {
+                        gearMode = candidate;
+                        lastGearMode = candidate;
+                        lastGearValid = true;
+                        lastGearReadElapsedRealtimeMs = pollElapsedRealtimeMs;
+                        gearAcquired = true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Fallback 2: DiLink 5.0 CarSvcTelemetry (car_service dumpsys)
+        if (!gearAcquired && com.overdrive.app.byd.DiLink5Platform.isActive()) {
+            try {
+                int candidate = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.gearValue();
+                if (isValidGearMode(candidate)) {
+                    gearMode = candidate;
+                    lastGearMode = candidate;
+                    lastGearValid = true;
+                    lastGearReadElapsedRealtimeMs = pollElapsedRealtimeMs;
+                    gearAcquired = true;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Consistency check: vehicle moving (>5 km/h) cannot be in PARK (1)
+        if (speedKmh > 5 && gearMode == 1) {
+            int fallbackGear = 4; // GEAR_D
+            try {
+                com.overdrive.app.monitor.GearMonitor gm = com.overdrive.app.monitor.GearMonitor.getInstance();
+                if (gm != null && isValidGearMode(gm.getCurrentGear()) && gm.getCurrentGear() != 1) {
+                    fallbackGear = gm.getCurrentGear();
+                } else if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+                    int csg = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.gearValue();
+                    if (isValidGearMode(csg) && csg != 1) {
+                        fallbackGear = csg;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            gearMode = fallbackGear;
+            lastGearMode = fallbackGear;
+            lastGearValid = true;
+            lastGearReadElapsedRealtimeMs = pollElapsedRealtimeMs;
         }
 
         // Turn signals (every poll = 5Hz). Read on the fast path so a cancelled
@@ -1249,7 +1334,6 @@ public class TelemetryDataCollector {
             GpsSpeedEvidence gps,
             long nowElapsedRealtimeMs) {
         if (gps == null
-                || canSpeedKmh <= 0
                 || !isSpeedContradictory(canSpeedKmh, gps)) {
             resetSpeedContradiction();
             return false;
@@ -1276,8 +1360,9 @@ public class TelemetryDataCollector {
     private static boolean isSpeedContradictory(
             int canSpeedKmh,
             GpsSpeedEvidence gps) {
-        return gps != null
-                && Math.abs(canSpeedKmh - gps.speedKmh)
+        if (gps == null) return false;
+        if (canSpeedKmh <= 0 && gps.speedKmh >= 5.0) return true;
+        return Math.abs(canSpeedKmh - gps.speedKmh)
                 >= SPEED_CONTRADICTION_DELTA_KMH;
     }
 

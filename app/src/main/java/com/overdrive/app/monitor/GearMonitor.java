@@ -380,7 +380,18 @@ public class GearMonitor {
                 }
             } catch (Throwable ignored) {}
 
-            // 2. Fallback: dumpsys car_service (throttled to 3 seconds to avoid CPU/IPC saturation)
+            // 2. Try CarSvcTelemetry on DiLink 5.0 (extracts PROP_GEAR_R 0x21403a0a)
+            try {
+                if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+                    int csg = com.overdrive.app.byd.CarSvcTelemetry.INSTANCE.gearValue();
+                    if (isValidGearMode(csg)) {
+                        lastDumpsysGear = csg;
+                        return csg;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            // 3. Fallback: dumpsys car_service (throttled to 3 seconds to avoid CPU/IPC saturation)
             String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
                 "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
             if (propDump != null && !propDump.isEmpty()) {

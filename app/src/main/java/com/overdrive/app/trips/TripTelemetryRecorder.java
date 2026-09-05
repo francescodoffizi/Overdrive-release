@@ -372,8 +372,18 @@ public class TripTelemetryRecorder {
             double altitude = fix.altitude;
             float gpsAccuracy = fix.accuracy;
 
+            // GPS speed fallback: if dynamics reported 0 or was stale while GPS indicates motion
+            if (speedKmh == 0 && !Float.isNaN(fix.speed) && fix.speed * 3.6f >= 1.5f && !fix.loadedFromCache) {
+                speedKmh = (int) Math.round(fix.speed * 3.6f);
+                dynamicsStale = false;
+            }
+
             // Read gear from GearMonitor
             int gearMode = GearMonitor.getInstance().getCurrentGear();
+            if (gearMode == 1 && speedKmh > 3) {
+                // Vehicle in motion cannot be in PARK
+                gearMode = 4; // GEAR_D
+            }
 
             TelemetrySample sample = new TelemetrySample(
                     now, speedKmh, accelPedal, brakePedal,
