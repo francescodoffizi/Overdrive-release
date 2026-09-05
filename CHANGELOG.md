@@ -4,6 +4,16 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Correzione Scalatura TPMS e Falsa Allerta "Low Pressure" su BYD DiLink 5.0 (`CarSvcTelemetry.kt`)**:
+  - **Identificazione Errore di Conversione Unità**: Su DiLink 5.0, le proprietà TPMS di `dumpsys car_service` (`0x2160801d` e `0x2160801e`) riportano i valori in decine di kPa / bar*10 (es. `29.0` e `30.0` corrispondenti esattamente a 290 e 300 kPa, come confermato dalla proprietà nativa `0x21404a03` `TYRE_PRESSURE_VALUE: 290`). In precedenza, il codice divideva il valore per 10 assumendo erroneamente che fosse espresso in decimi di PSI (`30 / 10 = 3.0 PSI` -> `21 kPa` -> `0.21 bar`), causando la falsa segnalazione di gomme sgonfie/a terra con badge rosso e allerta `Low pressure`.
+  - **Ripristino Scalatura Corretta**: Implementata la gestione dinamica del range: se `r in 15..60` il valore viene scalato correttamente in `r * 10` kPa (290/300 kPa = 2.9/3.0 bar), e se `r > 60` viene preso direttamente come kPa. I pneumatici vengono ora renderizzati con precisione a 2.90 e 3.00 bar in stato "All OK".
+
+- **Isolamento e Soppressione Selettore OEM Dashcam / DVR su Veicoli Non Provvisti (`StreamingApiHandler.java`, `UnifiedConfigManager.kt`)**:
+  - **Prevenzione Crash Composer `ValidateAndSetCSC` via Camera2**: Quando sul veicolo viene sollecitata la camera DVR/Dashcam e l'hardware nativo non è presente, `OemDashcamPipeline` tentava di aprire il device via Camera2 / BufferQueue, inviando buffer privi di metadati CSC che provocavano il crash fatale di `composer@2.4-service`.
+  - **Gating Rigoroso in Backend e API**:
+    - In `UnifiedConfigManager.resolveOemDashcamId()`, introdotto il controllo sullo stato attivo effettivo (`oemActive = recMode != "off" || survMode != "off"`): se l'OEM dashcam non è esplicitamente abilitata e configurata, restituisce sempre `-1`, nascondendo automaticamente il pulsante/pillola DVR da `live-view.html` e dalla dashboard.
+    - In `StreamingApiHandler.handleOemDashcamView()`, inserito il rifiuto immediato per viewMode 6 se `resolveOemDashcamId() < 0`, bloccando sul nascere qualsiasi invocazione non necessaria della pipeline.
+
 - **Soluzione Definitiva Crash Display / Infotainment su BYD DiLink 5.0 (Qualcomm Snapdragon SA8155P) via Pipeline Zero-Copy `AHardwareBuffer` (`qcarcam_bridge.cpp`, `DiLink5QCarCamBackend.java`, `PanoramicCameraGpu.java`)**:
   - **Identificazione Causa Radice Incontrovertibile (Tombstone SIGSEGV `sdm::HWCLayer::ValidateAndSetCSC`)**:
     Dall'analisi dei dump di crash nativi del composer Android (`pid: 515, name: HwBinder:515_2 >>> /vendor/bin/hw/android.hardware.graphics.composer@2.4-service <<<`, `signal 11 (SIGSEGV), code 2 (SEGV_ACCERR), fault addr 0x76f2fda000` in `sdm::HWCLayer::ValidateAndSetCSC(private_handle_t const*)`), è emerso che i buffer bloccati da CPU via `ANativeWindow_lock()` sulla `Surface` passata al bridge nativo non possedevano i metadati hardware di Color Space Conversion (CSC) della GPU Adreno. Quando il composer hardware Qualcomm tentava di comporli a display tramite `SurfaceFlinger`, cercava di leggere da puntatori metadati inesistenti generando SIGSEGV immediato e innescando il riavvio del sottosistema grafico/infotainment.

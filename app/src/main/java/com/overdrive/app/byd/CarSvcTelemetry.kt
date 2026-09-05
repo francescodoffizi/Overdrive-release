@@ -330,9 +330,13 @@ object CarSvcTelemetry {
             val corner = JSONObject()
             val r = raw[i]
             if (r > 0) {
-                val psi = r / 10.0
+                // DiLink 5 TPMS properties:
+                // If r in 15..60: values are reported in tens of kPa (or bar * 10, e.g. 29 -> 290 kPa = 2.9 bar, 30 -> 300 kPa = 3.0 bar)
+                // If r > 60: values are reported directly in kPa (e.g. 290)
+                val kPa = if (r in 15..60) r * 10 else r
+                val psi = Math.round(kPa * 0.1450377 * 10.0) / 10.0
                 corner.put("psi", psi)
-                corner.put("kPa", Math.round(psi * 6.89476).toInt())
+                corner.put("kPa", kPa)
                 corner.put("available", true)
                 any = true
             } else {
