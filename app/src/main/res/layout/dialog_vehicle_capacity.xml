@@ -115,6 +115,7 @@
                 android:layout_height="wrap_content"
                 android:imeOptions="actionDone"
                 android:inputType="numberDecimal"
+                android:digits="0123456789.,"
                 android:maxLines="1"
                 android:textAppearance="@style/TextAppearance.Material3.BodyLarge" />
         </com.google.android.material.textfield.TextInputLayout>
