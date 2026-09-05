@@ -1363,13 +1363,23 @@ public class HardwareEventRecorderGpu {
         /** Pure policy check kept Android-runtime independent for local tests. */
         boolean shouldAutoUpload(String fileName) {
             if (this != AUTOMATIC) return false;
-            if (fileName == null) return true;
+            if (fileName == null) return false;
             String name = fileName;
             int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
             if (slash >= 0 && slash + 1 < name.length()) {
                 name = name.substring(slash + 1);
             }
-            return !name.startsWith("event_");
+            // NEVER auto-upload continuous dashcam recordings (cam_* or replay_*).
+            // Continuous driving loops must stay local and not flood Telegram.
+            if (name.startsWith("cam_") || name.startsWith("replay_") || name.matches("^cam\\d+_.*")) {
+                return false;
+            }
+            // Sentry events (event_*.mp4) are handled exclusively by SurveillanceEngineGpu
+            // which evaluates severity and alert thresholds.
+            if (name.startsWith("event_")) {
+                return false;
+            }
+            return true;
         }
     }
     private VideoUploadPolicy videoUploadPolicy = VideoUploadPolicy.AUTOMATIC;

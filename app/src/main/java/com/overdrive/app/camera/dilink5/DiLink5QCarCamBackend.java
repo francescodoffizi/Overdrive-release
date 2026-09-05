@@ -78,6 +78,20 @@ public class DiLink5QCarCamBackend {
                 return true;
             }
         }
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
+                    com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (pipeline != null && pipeline.isRunning()) {
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oem =
+                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            if (oem != null && oem.isRunning()) {
+                return true;
+            }
+        } catch (Throwable ignored) {}
         return false;
     }
 
@@ -111,6 +125,78 @@ public class DiLink5QCarCamBackend {
     private static final Object sGearLock = new Object();
     private static java.util.concurrent.ScheduledExecutorService sGearResumeExecutor = null;
     private static volatile boolean sGearListenerRegistered = false;
+
+    private static volatile boolean sYieldedForAccOn = false;
+    private static final Object sAccLock = new Object();
+    private static java.util.concurrent.ScheduledExecutorService sAccResumeExecutor = null;
+    private static volatile boolean sAccListenerRegistered = false;
+    private static final Object sSpawnLock = new Object();
+
+    private static synchronized void ensureAccListenerRegistered() {
+        if (!sAccListenerRegistered) {
+            sAccListenerRegistered = true;
+            try {
+                com.overdrive.app.monitor.AccMonitor.addListener(isAccOn -> {
+                    onAccStateChanged(isAccOn);
+                });
+            } catch (Throwable t) {
+                logger.warn("Failed to register AccMonitor listener: " + t.getMessage());
+            }
+        }
+    }
+
+    public static void onAccStateChanged(boolean isAccOn) {
+        if (isAccOn) {
+            logger.info("ACC switched to ON: gracefully yielding Qualcomm AIS capture to system services (AVM, radar, SystemUI)...");
+            sYieldedForAccOn = true;
+            synchronized (sAccLock) {
+                if (sAccResumeExecutor != null) {
+                    sAccResumeExecutor.shutdownNow();
+                    sAccResumeExecutor = null;
+                }
+            }
+            terminateHardwareProcess();
+            scheduleResumeAfterAccOn();
+        } else {
+            logger.info("ACC switched to OFF: entering Sentry mode capture");
+            sYieldedForAccOn = false;
+            synchronized (sAccLock) {
+                if (sAccResumeExecutor != null) {
+                    sAccResumeExecutor.shutdownNow();
+                    sAccResumeExecutor = null;
+                }
+            }
+            if (hasActiveStreamingBackend()) {
+                ensureHardwareProcess();
+            }
+        }
+    }
+
+    private static void scheduleResumeAfterAccOn() {
+        synchronized (sAccLock) {
+            if (sAccResumeExecutor != null) {
+                sAccResumeExecutor.shutdownNow();
+            }
+            sAccResumeExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "fast-cam-acc-resume");
+                t.setDaemon(true);
+                return t;
+            });
+            // 2000 ms cooperative yield allows native BYD AVM / camera HAL and SystemUI to initialize cleanly
+            sAccResumeExecutor.schedule(() -> {
+                sYieldedForAccOn = false;
+                if (hasActiveStreamingBackend()) {
+                    int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                    if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
+                        logger.info("Capture resumption after ACC-ON deferred: vehicle is in REVERSE");
+                        return;
+                    }
+                    logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after ACC-ON yield...");
+                    ensureHardwareProcess();
+                }
+            }, 2000, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+    }
 
     private static synchronized void ensureGearListenerRegistered() {
         if (!sGearListenerRegistered) {
@@ -187,108 +273,124 @@ public class DiLink5QCarCamBackend {
         gracefulStopProcess("fast_cam_capture");
     }
 
-    private static synchronized void ensureHardwareProcess() {
-        try {
-            ensureGearListenerRegistered();
+    private static void ensureHardwareProcess() {
+        synchronized (sSpawnLock) {
+            try {
+                ensureGearListenerRegistered();
+                ensureAccListenerRegistered();
 
-            int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-            if (sYieldedForReverse || curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
-                logger.info("Skipping ensureHardwareProcess: vehicle currently in REVERSE (yielding to native AVM)");
-                return;
-            }
-
-            // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
-            String binPath = "/data/local/tmp/fast_cam_capture";
-            java.io.File binFile = new java.io.File(binPath);
-            boolean wasUpdated = ensureDaemonBinaryExtracted(binFile);
-
-            // If we already hold an alive supervised process and the binary wasn't updated, keep it
-            if (sHardwareProcess != null) {
-                boolean isAlive = false;
-                try {
-                    sHardwareProcess.exitValue();
-                } catch (IllegalThreadStateException e) {
-                    isAlive = true; // Process is still running
-                }
-                if (isAlive && !wasUpdated) {
+                if (sYieldedForAccOn) {
+                    logger.info("Skipping ensureHardwareProcess: vehicle currently yielding for ACC-ON transition");
                     return;
                 }
-            }
 
-            logger.info("Preparing fresh Qualcomm fast_cam_capture hardware capture supervisor...");
+                int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                if (sYieldedForReverse || curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+                    logger.info("Skipping ensureHardwareProcess: vehicle currently in REVERSE (yielding to native AVM)");
+                    return;
+                }
 
-            // Terminate any existing or orphan instances to prevent duplicate services
-            terminateHardwareProcess();
-            Thread.sleep(300);
+                // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
+                String binPath = "/data/local/tmp/fast_cam_capture";
+                java.io.File binFile = new java.io.File(binPath);
+                boolean wasUpdated = ensureDaemonBinaryExtracted(binFile);
 
-            if (binFile.exists()) {
-                binFile.setReadable(true, false);
-                binFile.setExecutable(true, false);
-            }
-
-            String camArgs = getCameraMappingArgs();
-            ProcessBuilder pb = new ProcessBuilder(
-                    "/system/bin/sh", "-c",
-                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --socket @fast_cam.sock --time 0"
-            );
-            pb.redirectErrorStream(true);
-            sHardwareProcess = pb.start();
-
-            // Register shutdown hook once so termination on daemon shutdown or reinstall is guaranteed
-            if (!sShutdownHookRegistered) {
-                sShutdownHookRegistered = true;
-                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                    terminateHardwareProcess();
-                }, "fast-cam-shutdown-hook"));
-            }
-
-            // Asynchronously drain stdout/stderr to prevent pipe buffer saturation (64KB deadlock)
-            final Process proc = sHardwareProcess;
-            Thread drainer = new Thread(() -> {
-                try (java.io.BufferedReader streamReader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream()))) {
-                    String drainLine;
-                    while ((drainLine = streamReader.readLine()) != null) {
-                        logger.info("[FastCamProc] " + drainLine);
+                // If we already hold an alive supervised process and the binary wasn't updated, keep it
+                if (sHardwareProcess != null) {
+                    boolean isAlive = false;
+                    try {
+                        sHardwareProcess.exitValue();
+                    } catch (IllegalThreadStateException e) {
+                        isAlive = true; // Process is still running
                     }
-                } catch (Throwable ignored) {}
-
-                int exitCode = -1;
-                try {
-                    exitCode = proc.exitValue();
-                } catch (Throwable ignored) {}
-
-                if (sHardwareProcess == proc) {
-                    sHardwareProcess = null;
+                    if (isAlive && !wasUpdated) {
+                        return;
+                    }
                 }
 
-                if (exitCode == 42) {
-                    logger.info("Qualcomm fast_cam_capture exited cleanly due to hardware preemption (exit code 42)");
+                logger.info("Preparing fresh Qualcomm fast_cam_capture hardware capture supervisor...");
+
+                // Terminate any existing or orphan instances to prevent duplicate services
+                terminateHardwareProcess();
+                Thread.sleep(300);
+
+                if (binFile.exists()) {
+                    binFile.setReadable(true, false);
+                    binFile.setExecutable(true, false);
                 }
 
-                if (hasActiveStreamingBackend()) {
-                    int gear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-                    if (gear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
-                        logger.info("Suppressing auto-recovery: vehicle is in REVERSE, waiting for gear change to resume");
+                String camArgs = getCameraMappingArgs();
+                ProcessBuilder pb = new ProcessBuilder(
+                        "/system/bin/sh", "-c",
+                        "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --socket @fast_cam.sock --time 0"
+                );
+                pb.redirectErrorStream(true);
+                sHardwareProcess = pb.start();
+
+                // Register shutdown hook once so termination on daemon shutdown or reinstall is guaranteed
+                if (!sShutdownHookRegistered) {
+                    sShutdownHookRegistered = true;
+                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                        terminateHardwareProcess();
+                    }, "fast-cam-shutdown-hook"));
+                }
+
+                // Asynchronously drain stdout/stderr to prevent pipe buffer saturation (64KB deadlock)
+                final Process proc = sHardwareProcess;
+                Thread drainer = new Thread(() -> {
+                    try (java.io.BufferedReader streamReader = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream()))) {
+                        String drainLine;
+                        while ((drainLine = streamReader.readLine()) != null) {
+                            logger.info("[FastCamProc] " + drainLine);
+                        }
+                    } catch (Throwable ignored) {}
+
+                    int exitCode = -1;
+                    try {
+                        exitCode = proc.exitValue();
+                    } catch (Throwable ignored) {}
+
+                    if (sHardwareProcess == proc) {
+                        sHardwareProcess = null;
+                    } else if (sHardwareProcess != null) {
+                        // Another instance is already running, suppress duplicate recovery
                         return;
                     }
 
-                    logger.warn("Qualcomm fast_cam_capture process exited unexpectedly (code " + exitCode + "). Triggering auto-recovery supervisor in 500ms...");
-                    try {
-                        Thread.sleep(500);
-                        if (hasActiveStreamingBackend()) {
-                            ensureHardwareProcess();
-                        }
-                    } catch (Throwable t) {
-                        logger.error("Auto-recovery supervisor failed: " + t.getMessage(), t);
+                    if (exitCode == 42) {
+                        logger.info("Qualcomm fast_cam_capture exited cleanly due to hardware preemption (exit code 42)");
                     }
-                }
-            }, "fast-cam-capture-drainer");
-            drainer.setDaemon(true);
-            drainer.start();
 
-            logger.info("Qualcomm fast_cam_capture hardware pipeline started successfully via supervisor.");
-        } catch (Throwable t) {
-            logger.error("Failed to start Qualcomm fast_cam_capture hardware supervisor: " + t.getMessage(), t);
+                    if (hasActiveStreamingBackend()) {
+                        if (sYieldedForAccOn) {
+                            logger.info("Suppressing auto-recovery: vehicle is yielding for ACC-ON transition");
+                            return;
+                        }
+
+                        int gear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                        if (gear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
+                            logger.info("Suppressing auto-recovery: vehicle is in REVERSE, waiting for gear change to resume");
+                            return;
+                        }
+
+                        logger.warn("Qualcomm fast_cam_capture process exited unexpectedly (code " + exitCode + "). Triggering auto-recovery supervisor in 500ms...");
+                        try {
+                            Thread.sleep(500);
+                            if (hasActiveStreamingBackend()) {
+                                ensureHardwareProcess();
+                            }
+                        } catch (Throwable t) {
+                            logger.error("Auto-recovery supervisor failed: " + t.getMessage(), t);
+                        }
+                    }
+                }, "fast-cam-capture-drainer");
+                drainer.setDaemon(true);
+                drainer.start();
+
+                logger.info("Qualcomm fast_cam_capture hardware pipeline started successfully via supervisor.");
+            } catch (Throwable t) {
+                logger.error("Failed to start Qualcomm fast_cam_capture hardware supervisor: " + t.getMessage(), t);
+            }
         }
     }
 
@@ -592,16 +694,21 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    public static boolean isYielded() {
+        return sYieldedForReverse || sYieldedForAccOn;
+    }
+
     /**
      * Binds the latest available camera frame directly to the calling thread's
      * GL_TEXTURE_EXTERNAL_OES texture via zero-copy EGLImage/AHardwareBuffer.
      * Bypasses Android Surface, SurfaceFlinger, and HWC completely.
+     * Returns the bound texture ID (>0), or 0 on failure.
      */
-    public static boolean bindLatestFrame(int textureId) {
+    public static int bindLatestFrame(int textureId) {
         try {
             return nativeBindLatestFrame(textureId);
         } catch (Throwable t) {
-            return false;
+            return 0;
         }
     }
 
@@ -745,7 +852,7 @@ public class DiLink5QCarCamBackend {
     private static native boolean nativeIsSupported();
     private static native void nativeSetActiveCamera(int camIdx);
     private static native void nativeSetCameraMapping(int front, int right, int rear, int left, int dashcam);
-    private static native boolean nativeBindLatestFrame(int textureId);
+    private static native int nativeBindLatestFrame(int textureId);
     private static native long nativeGetLatestFrameTimestamp();
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);

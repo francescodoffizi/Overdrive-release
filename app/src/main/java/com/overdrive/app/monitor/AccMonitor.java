@@ -51,6 +51,24 @@ public class AccMonitor {
     // -1 = no edge dispatched yet (first authoritative read is treated as an edge).
     private static volatile int lastEdgeState = -1;
 
+    public interface AccStateListener {
+        void onAccStateChanged(boolean isAccOn);
+    }
+    private static final java.util.List<AccStateListener> sListeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public static void addListener(AccStateListener listener) {
+        if (listener != null && !sListeners.contains(listener)) {
+            sListeners.add(listener);
+        }
+    }
+
+    public static void removeListener(AccStateListener listener) {
+        if (listener != null) {
+            sListeners.remove(listener);
+        }
+    }
+
     // Track the last sentinel state we logged (FAKE_OK=4, INVALID=255, or
     // out-of-range value), so we log only on transitions. Without this,
     // a persistently broken HAL would emit ~2880 "powerLevel=INVALID" lines
@@ -165,6 +183,15 @@ public class AccMonitor {
     private static void notifyAccEdge(boolean isAccOn) {
         if (lastEdgeState == (isAccOn ? 1 : 0)) return;  // no real transition
         lastEdgeState = isAccOn ? 1 : 0;
+
+        for (AccStateListener l : sListeners) {
+            try {
+                l.onAccStateChanged(isAccOn);
+            } catch (Throwable t) {
+                CameraDaemon.log("notifyAccEdge listener failed: " + t.getMessage());
+            }
+        }
+
         if (!isAccOn) {
             // ACC-OFF: stop the cluster map projector so its holder releases + the
             // launched cluster Activity is torn down. Safe + idempotent if not active.

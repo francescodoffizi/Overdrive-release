@@ -4,6 +4,26 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Risoluzione Definitiva Crash/Riavvio Sistema alla Riaccensione del Veicolo in Sentry Mode (`qcarcam_bridge.cpp`, `AccMonitor.java`, `DiLink5QCarCamBackend.java`, `GpuSurveillancePipeline.java`, `RecordingModeManager.java`)**:
+  - **Eliminazione Leak Descrittori Memoria Grafica Adreno GSL Pool 0 (`qcarcam_bridge.cpp`)**:
+    Risolto il leak sistematico di descrittori GPU causato dall'invocazione di `glEGLImageTargetTexture2DOES` a 30 FPS su ogni frame. Implementata la gestione a ping-pong con due texture GL dedicate (`g_pingPongTextures[2]`) e binding `glEGLImageTargetTexture2DOES` eseguito una sola volta per ciascuna `EGLImageKHR`. Questo impedisce l'esaurimento del GSL Pool 0 dell'Adreno 643/SA8155P e previene i crash a cascata di SurfaceFlinger e il riavvio della centralina.
+  - **Yielding Cooperativo Hardware su Transizione ACC ON (`AccMonitor.java`, `DiLink5QCarCamBackend.java`)**:
+    Aggiunta l'interfaccia `AccStateListener` su `AccMonitor` e implementato il rilascio cooperativo temporaneo dell'hardware telecamere (`fast_cam_capture`) quando il veicolo passa da ACC OFF ad ACC ON, consentendo ai servizi nativi di bordo (AVM/360) di inizializzarsi senza conflitti DMA su Qualcomm AIS.
+  - **Disattivazione `dilinkKeepAlive` su DiLink 5 (`GpuSurveillancePipeline.java`, `RecordingModeManager.java`)**:
+    Rimosso il loop di riapertura forzata DiLink 4 su DiLink 5, evitando collisioni hardware durante i cambi di stato veicolo.
+
+- **Risoluzione Invio Continuo Spezzoni di 6 Secondi su Telegram (`HardwareEventRecorderGpu.java`)**:
+  - **Policy di Upload Restrittiva (`VideoUploadPolicy.shouldAutoUpload`)**:
+    Esclusi esplicitamente dall'auto-upload Telegram tutti i frammenti video di test, snapshot o replay (`cam_*`, `replay_*`, `cam\d+_*`). L'inoltro automatico su Telegram è ora rigorosamente limitato agli eventi sentinella certificati (`sentry_`, `event_`, `alarm_`).
+  - **Copertura Test Unitari (`HardwareEventRecorderGpuVideoUploadPolicyTest.java`)**:
+    Aggiunti test specifici di regressione per validare il blocco di file `cam_...`, `cam2_...`, `replay_...` e la gestione sicura di valori null.
+
+- **Risoluzione Blocco Ripristino Stream dopo Retromarcia P -> R -> P (`PanoramicCameraGpu.java`, `DiLink5QCarCamBackend.java`)**:
+  - **Soppressione Falso Allarme Frame-Stall Watchdog (`PanoramicCameraGpu.java`)**:
+    Durante la fase di retromarcia (`GEAR_R`) o transizione ACC ON, il watchdog di stallo frame GL viene soppresso e `lastFrameTime` rinfrescato, impedendo la chiusura non voluta del backend e l'escalation con riavvio forzato del demone (`System.exit(0)`).
+  - **Verifica Resiliente Pipeline Attiva (`DiLink5QCarCamBackend.java`)**:
+    In `hasActiveStreamingBackend()`, integrato il controllo diretto sullo stato running di `CameraDaemon.getGpuPipeline()` e `CameraDaemon.getOemDashcamPipeline()`. All'uscita dalla retromarcia e ritorno in P, `fast_cam_capture` viene correttamente riavviato e lo stream video riprende regolarmente senza dover riavviare l'app.
+
 - **Eliminazione Frame Skip e Sincronizzazione Event-Driven Pipeline Video a 30 FPS (`qcarcam_bridge.cpp`, `PanoramicCameraGpu.java`, `DiLink5QCarCamBackend.java`, `HardwareEventRecorderGpu.java`)**:
   - **Identificazione Causa Radice tramite ffprobe packet delta**:
     L'analisi forense su video MP4 registrato su DiLink 5 mostrava un framerate effettivo degradato a 25.05 FPS (anziché i 30.00 nominali), con il 23.7% di pacchetti con delta di ~50ms e il 4.1% oltre i 65ms (effettivi frame drop visibili come scatti). Il benchmark hardware eseguito direttamente sul SoC del veicolo ha escluso problemi di cattura: `fast_cam_capture` acquisisce a 119.89 FPS aggregati (30.22 FPS Cam 0, 30.22 FPS Cam 1, 29.89 FPS Cam 2, 29.56 FPS Cam 3) con zero perdite da parte del server Qualcomm AIS.

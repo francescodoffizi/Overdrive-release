@@ -122,6 +122,9 @@ static AHardwareBuffer* g_cachedHwBufForImage[2] = {nullptr, nullptr};
 static uint32_t g_eglImageEpoch[2] = {0, 0};
 static std::atomic<uint32_t> g_hwBufferEpoch{1};
 static EGLDisplay g_cachedEglDisplay = EGL_NO_DISPLAY;
+static EGLContext g_cachedEglContext = EGL_NO_CONTEXT;
+static GLuint g_pingPongTextures[2] = {0, 0};
+static EGLImageKHR g_boundEglImage[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
 static int g_bufWidth = 0;
 static int g_bufHeight = 0;
 static std::atomic<int> g_frontIdx{-1};
@@ -547,22 +550,23 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStartSurface(
     return Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStart(env, thiz, 1);
 }
 
-// Binds the latest available AHardwareBuffer directly into the calling thread's EGL GL_TEXTURE_EXTERNAL_OES
-JNIEXPORT jboolean JNICALL
+// Binds the latest available AHardwareBuffer directly into a dedicated EGL GL_TEXTURE_EXTERNAL_OES per ping-pong slot
+// Returns the active texture ID (>0) on success, or 0 on failure.
+JNIEXPORT jint JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFrame(
     JNIEnv* env, jclass clazz, jint textureId) {
     if (!g_hasNewFrame.load()) {
-        return JNI_FALSE;
+        return 0;
     }
     resolveExtensions();
     if (!g_ext.ok) {
-        return JNI_FALSE;
+        return 0;
     }
 
     std::unique_lock<std::mutex> lock(g_bufMutex);
     int idx = g_frontIdx.load();
     if (idx < 0 || idx > 1 || !g_hwBuffers[idx]) {
-        return JNI_FALSE;
+        return 0;
     }
 
     AHardwareBuffer* buf = g_hwBuffers[idx];
@@ -571,11 +575,21 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
     }
 
     EGLDisplay dpy = eglGetCurrentDisplay();
-    if (dpy == EGL_NO_DISPLAY) {
+    EGLContext ctx = eglGetCurrentContext();
+    if (dpy == EGL_NO_DISPLAY || ctx == EGL_NO_CONTEXT) {
         if (g_ext.ahbRelease) {
             g_ext.ahbRelease(buf);
         }
-        return JNI_FALSE;
+        return 0;
+    }
+
+    if (g_cachedEglContext != ctx) {
+        // EGL context changed or was recreated: previous texture IDs are invalid in the new context
+        g_pingPongTextures[0] = 0;
+        g_pingPongTextures[1] = 0;
+        g_boundEglImage[0] = EGL_NO_IMAGE_KHR;
+        g_boundEglImage[1] = EGL_NO_IMAGE_KHR;
+        g_cachedEglContext = ctx;
     }
 
     uint32_t currentEpoch = g_hwBufferEpoch.load();
@@ -585,13 +599,14 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
             g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[idx]);
             g_eglImages[idx] = EGL_NO_IMAGE_KHR;
         }
+        g_boundEglImage[idx] = EGL_NO_IMAGE_KHR;
 
         EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(buf);
         if (!clientBuf) {
             if (g_ext.ahbRelease) {
                 g_ext.ahbRelease(buf);
             }
-            return JNI_FALSE;
+            return 0;
         }
 
         static const EGLint kAttrs[] = {
@@ -604,7 +619,7 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
             if (g_ext.ahbRelease) {
                 g_ext.ahbRelease(buf);
             }
-            return JNI_FALSE;
+            return 0;
         }
 
         g_eglImages[idx] = image;
@@ -613,14 +628,28 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
         g_cachedEglDisplay = dpy;
     }
 
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, static_cast<GLuint>(textureId));
-    g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, g_eglImages[idx]);
+    if (g_pingPongTextures[idx] == 0) {
+        glGenTextures(1, &g_pingPongTextures[idx]);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_pingPongTextures[idx]);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_pingPongTextures[idx]);
+    // Load-bearing fix: call glEGLImageTargetTexture2DOES ONLY when image changes, NOT every frame!
+    // Repeated targeting on the same texture object leaks 20 descriptor slots in Adreno GSL Pool 0.
+    if (g_boundEglImage[idx] != g_eglImages[idx]) {
+        g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, g_eglImages[idx]);
+        g_boundEglImage[idx] = g_eglImages[idx];
+    }
 
     g_hasNewFrame.store(false);
     if (g_ext.ahbRelease) {
         g_ext.ahbRelease(buf);
     }
-    return JNI_TRUE;
+    return static_cast<jint>(g_pingPongTextures[idx]);
 }
 
 JNIEXPORT jboolean JNICALL
@@ -644,6 +673,14 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
         }
         g_cachedEglDisplay = EGL_NO_DISPLAY;
     }
+    if (g_pingPongTextures[0] != 0 || g_pingPongTextures[1] != 0) {
+        glDeleteTextures(2, g_pingPongTextures);
+        g_pingPongTextures[0] = 0;
+        g_pingPongTextures[1] = 0;
+    }
+    g_boundEglImage[0] = EGL_NO_IMAGE_KHR;
+    g_boundEglImage[1] = EGL_NO_IMAGE_KHR;
+    g_cachedEglContext = EGL_NO_CONTEXT;
     g_eglImageEpoch[0] = 0;
     g_eglImageEpoch[1] = 0;
     g_cachedHwBufForImage[0] = nullptr;

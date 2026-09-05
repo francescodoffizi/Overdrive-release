@@ -4512,8 +4512,7 @@ public class GpuSurveillancePipeline {
             // consumer" behaviour because that's how non-byd_apa HALs share.
             boolean dilinkKeepAlive = false;
             try {
-                dilinkKeepAlive = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic()
-                        || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
+                dilinkKeepAlive = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
             } catch (Throwable ignored) {}
             if (camera != null && running && !dilinkKeepAlive) {
                 camera.reopenCamera();

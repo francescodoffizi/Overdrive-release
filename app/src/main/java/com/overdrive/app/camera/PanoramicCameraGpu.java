@@ -3054,11 +3054,14 @@ public class PanoramicCameraGpu {
         if (!(cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend)) {
             return false;
         }
-        boolean fresh;
+        int activeTex;
         synchronized (cameraTextureLock) {
-            fresh = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.bindLatestFrame(cameraTextureId);
+            activeTex = com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.bindLatestFrame(cameraTextureId);
+            if (activeTex > 0) {
+                cameraTextureId = activeTex;
+            }
         }
-        if (!fresh) {
+        if (activeTex <= 0) {
             return false;
         }
         long candidate = System.nanoTime();
@@ -4678,7 +4681,12 @@ public class PanoramicCameraGpu {
                     if (USE_OEM_SURFACE_TEXTURE_PATH && stallClock <= 0) {
                         stallClock = lastCameraStartTime;
                     }
-                    if (!cameraYielded && stallClock > 0 &&
+                    boolean dilink5Yielded = cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend
+                            && com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isYielded();
+                    if (dilink5Yielded) {
+                        lastFrameTime = now;
+                    }
+                    if (!cameraYielded && !dilink5Yielded && stallClock > 0 &&
                         timeSinceHeartbeat < GL_THREAD_TIMEOUT_MS) {
                         long timeSinceFrame = now - stallClock;
 
