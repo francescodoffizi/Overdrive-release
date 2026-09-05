@@ -44,6 +44,7 @@ typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, G
 typedef int (*PFN_AHARDWAREBUFFER_ALLOCATE)(const AHardwareBuffer_Desc* desc, AHardwareBuffer** outBuffer);
 typedef int (*PFN_AHARDWAREBUFFER_LOCK)(AHardwareBuffer* buffer, uint64_t usage, int32_t fence, const ARect* rect, void** outVirtualAddress);
 typedef int (*PFN_AHARDWAREBUFFER_UNLOCK)(AHardwareBuffer* buffer, int32_t* fence);
+typedef void (*PFN_AHARDWAREBUFFER_ACQUIRE)(AHardwareBuffer* buffer);
 typedef void (*PFN_AHARDWAREBUFFER_RELEASE)(AHardwareBuffer* buffer);
 
 struct ExtFns {
@@ -54,6 +55,7 @@ struct ExtFns {
     PFN_AHARDWAREBUFFER_ALLOCATE ahbAllocate = nullptr;
     PFN_AHARDWAREBUFFER_LOCK ahbLock = nullptr;
     PFN_AHARDWAREBUFFER_UNLOCK ahbUnlock = nullptr;
+    PFN_AHARDWAREBUFFER_ACQUIRE ahbAcquire = nullptr;
     PFN_AHARDWAREBUFFER_RELEASE ahbRelease = nullptr;
     bool ok = false;
 };
@@ -73,11 +75,13 @@ static void resolveExtensions() {
             g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(libnw, "AHardwareBuffer_allocate");
             g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(libnw, "AHardwareBuffer_lock");
             g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(libnw, "AHardwareBuffer_unlock");
+            g_ext.ahbAcquire = (PFN_AHARDWAREBUFFER_ACQUIRE) dlsym(libnw, "AHardwareBuffer_acquire");
             g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(libnw, "AHardwareBuffer_release");
         }
         if (!g_ext.ahbAllocate) g_ext.ahbAllocate = (PFN_AHARDWAREBUFFER_ALLOCATE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_allocate");
         if (!g_ext.ahbLock) g_ext.ahbLock = (PFN_AHARDWAREBUFFER_LOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_lock");
         if (!g_ext.ahbUnlock) g_ext.ahbUnlock = (PFN_AHARDWAREBUFFER_UNLOCK) dlsym(RTLD_DEFAULT, "AHardwareBuffer_unlock");
+        if (!g_ext.ahbAcquire) g_ext.ahbAcquire = (PFN_AHARDWAREBUFFER_ACQUIRE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_acquire");
         if (!g_ext.ahbRelease) g_ext.ahbRelease = (PFN_AHARDWAREBUFFER_RELEASE) dlsym(RTLD_DEFAULT, "AHardwareBuffer_release");
 
         g_ext.ok = g_ext.eglGetNativeClientBufferANDROID && g_ext.eglCreateImageKHR &&
@@ -115,6 +119,8 @@ pthread_t g_streamThread = 0;
 static AHardwareBuffer* g_hwBuffers[2] = {nullptr, nullptr};
 static EGLImageKHR g_eglImages[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
 static AHardwareBuffer* g_cachedHwBufForImage[2] = {nullptr, nullptr};
+static uint32_t g_eglImageEpoch[2] = {0, 0};
+static std::atomic<uint32_t> g_hwBufferEpoch{1};
 static EGLDisplay g_cachedEglDisplay = EGL_NO_DISPLAY;
 static int g_bufWidth = 0;
 static int g_bufHeight = 0;
@@ -464,8 +470,10 @@ void* streamClientLoop(void* arg) {
                     g_ext.ahbAllocate(&desc, &g_hwBuffers[1]);
                     g_bufWidth = target_w;
                     g_bufHeight = target_h;
+                    g_hwBufferEpoch.fetch_add(1);
                     g_frontIdx.store(-1);
-                    LOGI("Allocated ping-pong AHardwareBuffers for GL zero-copy: %dx%d RGBA", target_w, target_h);
+                    LOGI("Allocated ping-pong AHardwareBuffers for GL zero-copy: %dx%d RGBA (epoch=%u)",
+                         target_w, target_h, g_hwBufferEpoch.load());
                 }
 
                 if (g_hwBuffers[0] && g_hwBuffers[1]) {
@@ -557,20 +565,32 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
         return JNI_FALSE;
     }
 
+    AHardwareBuffer* buf = g_hwBuffers[idx];
+    if (g_ext.ahbAcquire) {
+        g_ext.ahbAcquire(buf);
+    }
+
     EGLDisplay dpy = eglGetCurrentDisplay();
     if (dpy == EGL_NO_DISPLAY) {
+        if (g_ext.ahbRelease) {
+            g_ext.ahbRelease(buf);
+        }
         return JNI_FALSE;
     }
 
+    uint32_t currentEpoch = g_hwBufferEpoch.load();
     // Reuse pre-created EGLImageKHR per ping-pong buffer slot to eliminate Adreno GSL pool 0 exhaustion
-    if (g_eglImages[idx] == EGL_NO_IMAGE_KHR || g_cachedHwBufForImage[idx] != g_hwBuffers[idx] || g_cachedEglDisplay != dpy) {
-        if (g_eglImages[idx] != EGL_NO_IMAGE_KHR && g_cachedEglDisplay != EGL_NO_DISPLAY) {
+    if (g_eglImages[idx] == EGL_NO_IMAGE_KHR || g_eglImageEpoch[idx] != currentEpoch || g_cachedHwBufForImage[idx] != buf || g_cachedEglDisplay != dpy) {
+        if (g_eglImages[idx] != EGL_NO_IMAGE_KHR && g_cachedEglDisplay != EGL_NO_DISPLAY && g_ext.eglDestroyImageKHR) {
             g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[idx]);
             g_eglImages[idx] = EGL_NO_IMAGE_KHR;
         }
 
-        EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(g_hwBuffers[idx]);
+        EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(buf);
         if (!clientBuf) {
+            if (g_ext.ahbRelease) {
+                g_ext.ahbRelease(buf);
+            }
             return JNI_FALSE;
         }
 
@@ -581,11 +601,15 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
         EGLImageKHR image = g_ext.eglCreateImageKHR(
             dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, kAttrs);
         if (image == EGL_NO_IMAGE_KHR) {
+            if (g_ext.ahbRelease) {
+                g_ext.ahbRelease(buf);
+            }
             return JNI_FALSE;
         }
 
         g_eglImages[idx] = image;
-        g_cachedHwBufForImage[idx] = g_hwBuffers[idx];
+        g_eglImageEpoch[idx] = currentEpoch;
+        g_cachedHwBufForImage[idx] = buf;
         g_cachedEglDisplay = dpy;
     }
 
@@ -593,6 +617,9 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
     g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, g_eglImages[idx]);
 
     g_hasNewFrame.store(false);
+    if (g_ext.ahbRelease) {
+        g_ext.ahbRelease(buf);
+    }
     return JNI_TRUE;
 }
 
@@ -617,6 +644,8 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
         }
         g_cachedEglDisplay = EGL_NO_DISPLAY;
     }
+    g_eglImageEpoch[0] = 0;
+    g_eglImageEpoch[1] = 0;
     g_cachedHwBufForImage[0] = nullptr;
     g_cachedHwBufForImage[1] = nullptr;
     if (g_ext.ahbRelease) {
