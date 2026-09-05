@@ -219,7 +219,7 @@ class DaemonStartupManager(
 
     fun initializeOnAppLaunch() {
         log.info(TAG, "=== Initializing daemon startup on app launch ===")
-        log.info(TAG, "Waiting 45 seconds before starting daemons (system stabilization)...")
+        log.info(TAG, "Waiting 2.5 seconds before starting daemons (system stabilization)...")
 
         // Hand off from any pre-existing bootManager (which was launched
         // before MainActivity attached). If we don't shut its scheduler
@@ -276,12 +276,12 @@ class DaemonStartupManager(
         // only machine-written markers immediately before starting a daemon.
         clearStaleSentinels()
 
-        // Wait 45 seconds for system to fully stabilize before starting any daemons
-        handler.postDelayed({ startCoreDaemons() }, 45000)
-        handler.postDelayed({ startOptionalDaemonsFromPreferences() }, 60000)
+        // Wait 2.5 seconds for system/ADB stabilization on app launch (instead of 45s cold-boot wait)
+        handler.postDelayed({ startCoreDaemons() }, 2500)
+        handler.postDelayed({ startOptionalDaemonsFromPreferences() }, 5000)
 
         // Start periodic health check after initial daemons have had time to start
-        handler.postDelayed({ startDaemonHealthCheck() }, 90000)
+        handler.postDelayed({ startDaemonHealthCheck() }, 20000)
     }
 
     /**
@@ -445,7 +445,7 @@ class DaemonStartupManager(
      * /data/local/tmp). Probe errors fail closed: preserving an explicit user
      * stop is more important than one automatic start attempt.
      */
-    private fun ifNotUserStopped(type: DaemonType, onAllowed: () -> Unit) {
+    private fun ifNotUserStopped(type: DaemonType, retryCount: Int = 0, onAllowed: () -> Unit) {
         val probe =
             "S='${type.sentinelPath}'; " +
             "if [ ! -f \"\$S\" ]; then echo OK; " +
@@ -475,8 +475,15 @@ class DaemonStartupManager(
                 }
                 override fun onLaunched() {}
                 override fun onError(error: String) {
-                    log.warn(TAG, "Auto-start sentinel probe failed for " +
-                        "${type.displayName} ($error) — leaving it stopped")
+                    if (retryCount < 3) {
+                        log.warn(TAG, "Auto-start sentinel probe failed for ${type.displayName} ($error) — retrying in 2s (attempt ${retryCount + 1}/3)")
+                        handler.postDelayed({
+                            ifNotUserStopped(type, retryCount + 1, onAllowed)
+                        }, 2000)
+                    } else {
+                        log.warn(TAG, "Auto-start sentinel probe failed for " +
+                            "${type.displayName} ($error) after 3 retries — leaving it stopped")
+                    }
                 }
             }
         )

@@ -227,7 +227,7 @@ public class DiLink5QCarCamBackend {
             String camArgs = getCameraMappingArgs();
             ProcessBuilder pb = new ProcessBuilder(
                     "/system/bin/sh", "-c",
-                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --time 0"
+                    "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --socket @fast_cam.sock --time 0"
             );
             pb.redirectErrorStream(true);
             sHardwareProcess = pb.start();

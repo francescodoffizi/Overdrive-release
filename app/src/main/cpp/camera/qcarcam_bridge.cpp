@@ -100,6 +100,9 @@ pthread_t g_streamThread = 0;
 
 // HardwareBuffer ping-pong pool for zero-copy GL texture binding (bypasses SurfaceFlinger and HWC)
 static AHardwareBuffer* g_hwBuffers[2] = {nullptr, nullptr};
+static EGLImageKHR g_eglImages[2] = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR};
+static AHardwareBuffer* g_cachedHwBufForImage[2] = {nullptr, nullptr};
+static EGLDisplay g_cachedEglDisplay = EGL_NO_DISPLAY;
 static int g_bufWidth = 0;
 static int g_bufHeight = 0;
 static std::atomic<int> g_frontIdx{-1};
@@ -514,24 +517,35 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeBindLatestFram
         return JNI_FALSE;
     }
 
-    EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(g_hwBuffers[idx]);
-    if (!clientBuf) {
-        return JNI_FALSE;
-    }
+    // Reuse pre-created EGLImageKHR per ping-pong buffer slot to eliminate Adreno GSL pool 0 exhaustion
+    if (g_eglImages[idx] == EGL_NO_IMAGE_KHR || g_cachedHwBufForImage[idx] != g_hwBuffers[idx] || g_cachedEglDisplay != dpy) {
+        if (g_eglImages[idx] != EGL_NO_IMAGE_KHR && g_cachedEglDisplay != EGL_NO_DISPLAY) {
+            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[idx]);
+            g_eglImages[idx] = EGL_NO_IMAGE_KHR;
+        }
 
-    static const EGLint kAttrs[] = {
-        EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
-        EGL_NONE
-    };
-    EGLImageKHR image = g_ext.eglCreateImageKHR(
-        dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, kAttrs);
-    if (image == EGL_NO_IMAGE_KHR) {
-        return JNI_FALSE;
+        EGLClientBuffer clientBuf = g_ext.eglGetNativeClientBufferANDROID(g_hwBuffers[idx]);
+        if (!clientBuf) {
+            return JNI_FALSE;
+        }
+
+        static const EGLint kAttrs[] = {
+            EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
+            EGL_NONE
+        };
+        EGLImageKHR image = g_ext.eglCreateImageKHR(
+            dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, kAttrs);
+        if (image == EGL_NO_IMAGE_KHR) {
+            return JNI_FALSE;
+        }
+
+        g_eglImages[idx] = image;
+        g_cachedHwBufForImage[idx] = g_hwBuffers[idx];
+        g_cachedEglDisplay = dpy;
     }
 
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, static_cast<GLuint>(textureId));
-    g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
-    g_ext.eglDestroyImageKHR(dpy, image);
+    g_ext.glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, g_eglImages[idx]);
 
     g_hasNewFrame.store(false);
     return JNI_TRUE;
@@ -547,6 +561,19 @@ Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(
     }
     std::lock_guard<std::mutex> lock(g_bufMutex);
     resolveExtensions();
+    if (g_cachedEglDisplay != EGL_NO_DISPLAY && g_ext.eglDestroyImageKHR) {
+        if (g_eglImages[0] != EGL_NO_IMAGE_KHR) {
+            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[0]);
+            g_eglImages[0] = EGL_NO_IMAGE_KHR;
+        }
+        if (g_eglImages[1] != EGL_NO_IMAGE_KHR) {
+            g_ext.eglDestroyImageKHR(g_cachedEglDisplay, g_eglImages[1]);
+            g_eglImages[1] = EGL_NO_IMAGE_KHR;
+        }
+        g_cachedEglDisplay = EGL_NO_DISPLAY;
+    }
+    g_cachedHwBufForImage[0] = nullptr;
+    g_cachedHwBufForImage[1] = nullptr;
     if (g_ext.ahbRelease) {
         if (g_hwBuffers[0]) { g_ext.ahbRelease(g_hwBuffers[0]); g_hwBuffers[0] = nullptr; }
         if (g_hwBuffers[1]) { g_ext.ahbRelease(g_hwBuffers[1]); g_hwBuffers[1] = nullptr; }
