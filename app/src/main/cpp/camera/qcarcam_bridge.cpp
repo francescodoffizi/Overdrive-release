@@ -11,6 +11,8 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -93,6 +95,17 @@ struct CameraMapping {
     std::atomic<int> hw_dashcam{-1};
 };
 static CameraMapping g_camMapping;
+
+static JavaVM* g_jvm = nullptr;
+static jclass g_backendClass = nullptr;
+static jmethodID g_onFrameAvailableMethod = nullptr;
+static std::atomic<uint64_t> g_lastFrameTimestampNs{0};
+
+static inline uint64_t getCurrentNanoTime() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
 
 std::atomic<bool> g_streaming{false};
 std::atomic<int> g_active_camera{0};
@@ -296,6 +309,17 @@ static void compose_4k_2160p_uyvy(
 void* streamClientLoop(void* arg) {
     LOGI("FastCamClient thread started.");
 
+    JNIEnv* jniEnv = nullptr;
+    bool jniAttached = false;
+    if (g_jvm) {
+        jint res = g_jvm->AttachCurrentThread(&jniEnv, nullptr);
+        if (res == JNI_OK && jniEnv) {
+            jniAttached = true;
+        } else {
+            LOGW("streamClientLoop: failed to attach to JVM (err=%d)", res);
+        }
+    }
+
     FastCamClient client;
 
     // Connect to the abstract domain socket @fast_cam.sock (SELinux-safe)
@@ -309,6 +333,9 @@ void* streamClientLoop(void* arg) {
 
     if (!g_streaming.load()) {
         client.disconnect();
+        if (jniAttached && g_jvm) {
+            g_jvm->DetachCurrentThread();
+        }
         LOGI("FastCamClient thread terminated before stream start.");
         return nullptr;
     }
@@ -373,29 +400,35 @@ void* streamClientLoop(void* arg) {
 
         if (desired_cam == 5) {
             // Mode 5 = 4K Ultra-HD Native Grid (3840x2160, 100% native sensor pixels 16:9)
-            if (!mosaic_buf_4k) {
-                mosaic_buf_4k = std::make_unique<uint8_t[]>(FRAME_WIDTH_4K * FRAME_HEIGHT_4K * 2);
-            }
-            const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
-            const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
-            const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
-            const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
+            // Anchor on Cam 0 (slot == 0, Front) arriving at 30 FPS to avoid 120 FPS CPU overload
+            if (slot == 0 || rendered_frames == 0) {
+                if (!mosaic_buf_4k) {
+                    mosaic_buf_4k = std::make_unique<uint8_t[]>(FRAME_WIDTH_4K * FRAME_HEIGHT_4K * 2);
+                }
+                const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
+                const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
+                const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
+                const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
 
-            compose_4k_2160p_uyvy(p0, p1, p3, p2, mosaic_buf_4k.get());
-            render_pixels = mosaic_buf_4k.get();
-            target_w = FRAME_WIDTH_4K;
-            target_h = FRAME_HEIGHT_4K;
+                compose_4k_2160p_uyvy(p0, p1, p3, p2, mosaic_buf_4k.get());
+                render_pixels = mosaic_buf_4k.get();
+                target_w = FRAME_WIDTH_4K;
+                target_h = FRAME_HEIGHT_4K;
+            }
         } else if (desired_cam == 4) {
             // Mode 4 = 2x2 Decimated Mosaic (1920x1080)
-            const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
-            const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
-            const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
-            const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
+            // Anchor on Cam 0 (slot == 0, Front) arriving at 30 FPS to avoid 120 FPS CPU overload
+            if (slot == 0 || rendered_frames == 0) {
+                const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
+                const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
+                const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
+                const uint8_t* p3 = cam_ptrs[3] ? cam_ptrs[3] : p0;
 
-            compose_2x2_1080p_uyvy(p0, p1, p3, p2, mosaic_buf_2x2);
-            render_pixels = mosaic_buf_2x2;
-            target_w = FRAME_WIDTH_1080P;
-            target_h = FRAME_HEIGHT_1080P;
+                compose_2x2_1080p_uyvy(p0, p1, p3, p2, mosaic_buf_2x2);
+                render_pixels = mosaic_buf_2x2;
+                target_w = FRAME_WIDTH_1080P;
+                target_h = FRAME_HEIGHT_1080P;
+            }
         } else if (desired_cam >= 0 && desired_cam < FAST_CAM_MAX_CAMS) {
             // Specific single camera channel requested (0..3 surround or 6 internal dashcam)
             if (slot == desired_cam) {
@@ -442,17 +475,29 @@ void* streamClientLoop(void* arg) {
                     if (g_ext.ahbLock(g_hwBuffers[writeIdx], AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr, &vaddr) == 0 && vaddr) {
                         convert_uyvy_to_rgba(render_pixels, target_w, target_h, (uint32_t*)vaddr, target_w);
                         g_ext.ahbUnlock(g_hwBuffers[writeIdx], nullptr);
+                        uint64_t curTsNs = (frame.timestamp_ns > 0) ? frame.timestamp_ns : getCurrentNanoTime();
+                        g_lastFrameTimestampNs.store(curTsNs);
                         g_frontIdx.store(writeIdx);
                         g_hasNewFrame.store(true);
                         rendered_frames++;
                         if (rendered_frames % 300 == 1) {
-                            LOGI("HardwareBuffer zero-copy frame ready (%u frames, mode=%d, %dx%d)",
-                                 rendered_frames, desired_cam, target_w, target_h);
+                            LOGI("HardwareBuffer zero-copy frame ready (%u frames, mode=%d, %dx%d, ts=%" PRIu64 ")",
+                                 rendered_frames, desired_cam, target_w, target_h, curTsNs);
+                        }
+                        if (jniAttached && jniEnv && g_backendClass && g_onFrameAvailableMethod) {
+                            jniEnv->CallStaticVoidMethod(g_backendClass, g_onFrameAvailableMethod, (jlong)curTsNs);
+                            if (jniEnv->ExceptionCheck()) {
+                                jniEnv->ExceptionClear();
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    if (jniAttached && g_jvm) {
+        g_jvm->DetachCurrentThread();
     }
 
     client.disconnect();
@@ -605,6 +650,41 @@ JNIEXPORT void JNICALL
 Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeRelease(
     JNIEnv* env, jobject thiz, jlong handle) {
     Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeStop(env, thiz, handle);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_overdrive_app_camera_dilink5_DiLink5QCarCamBackend_nativeGetLatestFrameTimestamp(
+    JNIEnv* env, jclass clazz) {
+    return (jlong)g_lastFrameTimestampNs.load();
+}
+
+jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    g_jvm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        return JNI_ERR;
+    }
+    jclass localClass = env->FindClass("com/overdrive/app/camera/dilink5/DiLink5QCarCamBackend");
+    if (localClass) {
+        g_backendClass = (jclass)env->NewGlobalRef(localClass);
+        g_onFrameAvailableMethod = env->GetStaticMethodID(g_backendClass, "onNativeFrameAvailable", "(J)V");
+        env->DeleteLocalRef(localClass);
+        LOGI("JNI_OnLoad: DiLink5QCarCamBackend cached, onNativeFrameAvailableMethod=%p", g_onFrameAvailableMethod);
+    } else {
+        LOGE("JNI_OnLoad: Failed to find DiLink5QCarCamBackend class");
+    }
+    return JNI_VERSION_1_6;
+}
+
+void JNI_OnUnload(JavaVM* vm, void* reserved) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK) {
+        if (g_backendClass) {
+            env->DeleteGlobalRef(g_backendClass);
+            g_backendClass = nullptr;
+        }
+    }
+    g_jvm = nullptr;
 }
 
 } // extern "C"

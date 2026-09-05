@@ -1,5 +1,6 @@
 package com.overdrive.app.camera.dilink5;
 
+import androidx.annotation.Keep;
 import com.overdrive.app.logging.DaemonLogger;
 
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -9,6 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Communicates directly with /vendor/lib64/libais_client.so to stream raw camera frames
  * (1920x1300 @ 30 FPS) for OverDrive's Dashcam, Sentry, and EGL video encoding pipelines.
  */
+@Keep
 public class DiLink5QCarCamBackend {
 
     private static final String TAG = "DiLink5QCarCam";
@@ -562,6 +564,34 @@ public class DiLink5QCarCamBackend {
         return start();
     }
 
+    public interface FrameListener {
+        void onFrameAvailable(long timestampNs);
+    }
+
+    private static volatile FrameListener sFrameListener = null;
+
+    public static void setFrameListener(FrameListener listener) {
+        sFrameListener = listener;
+    }
+
+    /**
+     * Called from native C++ streamClientLoop when a new zero-copy hardware frame is fully ready.
+     */
+    public static void onNativeFrameAvailable(long timestampNs) {
+        FrameListener listener = sFrameListener;
+        if (listener != null) {
+            listener.onFrameAvailable(timestampNs);
+        }
+    }
+
+    public static long getLatestFrameTimestamp() {
+        try {
+            return nativeGetLatestFrameTimestamp();
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
     /**
      * Binds the latest available camera frame directly to the calling thread's
      * GL_TEXTURE_EXTERNAL_OES texture via zero-copy EGLImage/AHardwareBuffer.
@@ -716,6 +746,7 @@ public class DiLink5QCarCamBackend {
     private static native void nativeSetActiveCamera(int camIdx);
     private static native void nativeSetCameraMapping(int front, int right, int rear, int left, int dashcam);
     private static native boolean nativeBindLatestFrame(int textureId);
+    private static native long nativeGetLatestFrameTimestamp();
     private native long nativeInit(int inputId);
     private native boolean nativeStart(long handle);
     private native boolean nativeStartSurface(android.view.Surface surface);

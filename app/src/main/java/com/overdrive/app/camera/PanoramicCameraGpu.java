@@ -705,6 +705,11 @@ public class PanoramicCameraGpu {
     // instead of imagePending (which is for the ImageReader path).
     private volatile boolean stFramePending = false;
 
+    // Sticky flag and hardware timestamp for DiLink 5.0 (Snapdragon SA8155P) zero-copy path.
+    // Signalled from native C++ streamClientLoop when an AHardwareBuffer is converted and ready.
+    private volatile boolean diLink5FramePending = false;
+    private volatile long diLink5HardwareTimestampNs = 0L;
+
     // GENUINE new-buffer counter for the SurfaceTexture (dilink4) path.
     // Incremented ONLY from onFrameAvailable — i.e. only when the HAL actually
     // queued a buffer. This exists because updateTexImage() is a documented
@@ -2483,6 +2488,8 @@ public class PanoramicCameraGpu {
         }
         }
         stFramePending = false;
+        diLink5FramePending = false;
+        diLink5HardwareTimestampNs = 0L;
         // Reset the arrival bookkeeping together with the SurfaceTexture it
         // describes. The old SurfaceTexture's listener is detached above, so no
         // further increments can arrive from it; a NEW SurfaceTexture starts its
@@ -2749,6 +2756,13 @@ public class PanoramicCameraGpu {
         // DiLink 5.0 (Snapdragon SA8155P): uses native QCarCam / AIS zero-copy backend directly
         if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
             logger.info("DiLink 5 platform detected — initializing native QCarCam zero-copy backend (cameraId=" + cameraId + ")");
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setFrameListener(timestampNs -> {
+                synchronized (frameSync) {
+                    diLink5FramePending = true;
+                    diLink5HardwareTimestampNs = timestampNs;
+                    frameSync.notify();
+                }
+            });
             com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend dilink5Backend =
                     new com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend(cameraId);
             dilink5Backend.start();
@@ -3047,7 +3061,12 @@ public class PanoramicCameraGpu {
         if (!fresh) {
             return false;
         }
-        currentFrameTimestampNs = System.nanoTime();
+        long candidate = System.nanoTime();
+        if (candidate <= lastAcceptedPtsNs) {
+            candidate = lastAcceptedPtsNs + 1_000L;
+        }
+        lastAcceptedPtsNs = candidate;
+        currentFrameTimestampNs = candidate;
         cameraFrameSeq.incrementAndGet();
         return true;
     }
@@ -3626,20 +3645,21 @@ public class PanoramicCameraGpu {
             // imagePending is set by the ImageReader OnImageAvailable cb;
             // stFramePending is set by SurfaceTexture.onFrameAvailable. The
             // path that's inactive simply never sets its flag.
+            // diLink5FramePending is set by DiLink5QCarCamBackend FrameListener.
             synchronized (frameSync) {
-                if (!imagePending && !stFramePending) {
+                if (!imagePending && !stFramePending && !diLink5FramePending) {
                     try {
-                        // On DiLink 5, frames are produced into AHardwareBuffer ring at 30 FPS.
-                        // A 16ms cadence gives responsive, silky smooth 30-60Hz frame consumption.
-                        // Legacy/OEM paths use 250ms timeout (FIX H4).
-                        long waitTimeoutMs = (cameraObj instanceof com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend) ? 16 : 250;
-                        frameSync.wait(waitTimeoutMs);
+                        // Event-driven frame synchronization: waits for notification from
+                        // HAL callback (ImageReader/SurfaceTexture) or native FastCamClient (DiLink 5).
+                        // 250ms fallback timeout in case of dropped signal or hardware stall.
+                        frameSync.wait(250);
                     } catch (InterruptedException e) {
                         // Continue
                     }
                 }
                 imagePending = false;
                 stFramePending = false;
+                diLink5FramePending = false;
             }
 
             if (!running) {

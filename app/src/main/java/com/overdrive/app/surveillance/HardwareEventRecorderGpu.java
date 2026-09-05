@@ -120,7 +120,7 @@ public class HardwareEventRecorderGpu {
     // meant to prevent. Secondary encoders (e.g. OEM dashcam alongside pano)
     // call setPinOperatingRate(false) before init() so only the primary
     // encoder claims the frequency lock.
-    private boolean pinOperatingRate = PIN_OPERATING_RATE;
+    private boolean pinOperatingRate = PIN_OPERATING_RATE || com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported();
     
     // Encoder
     // Volatile because release() (lifecycle thread) nulls this while the

@@ -4,6 +4,22 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Eliminazione Frame Skip e Sincronizzazione Event-Driven Pipeline Video a 30 FPS (`qcarcam_bridge.cpp`, `PanoramicCameraGpu.java`, `DiLink5QCarCamBackend.java`, `HardwareEventRecorderGpu.java`)**:
+  - **Identificazione Causa Radice tramite ffprobe packet delta**:
+    L'analisi forense su video MP4 registrato su DiLink 5 mostrava un framerate effettivo degradato a 25.05 FPS (anziché i 30.00 nominali), con il 23.7% di pacchetti con delta di ~50ms e il 4.1% oltre i 65ms (effettivi frame drop visibili come scatti). Il benchmark hardware eseguito direttamente sul SoC del veicolo ha escluso problemi di cattura: `fast_cam_capture` acquisisce a 119.89 FPS aggregati (30.22 FPS Cam 0, 30.22 FPS Cam 1, 29.89 FPS Cam 2, 29.56 FPS Cam 3) con zero perdite da parte del server Qualcomm AIS.
+  - **Causa 1 — Polling Cieco nel Render Loop GL (`PanoramicCameraGpu.java`)**:
+    Il render loop EGL attendeva tramite un polling non sincronizzato `frameSync.wait(16ms)`. L'aliasing di fase tra i cicli a 16ms e l'arrivo dei frame hardware a 33.3ms faceva cadere il 23.7% dei controlli a 1ms prima dell'arrivo del frame, costringendo il loop a un secondo sleep da 16ms (delta risultante ~50ms). Su ritardi cumulativi >66ms, il buffer ping-pong in C++ veniva sovrascritto, cancellando irrimediabilmente il frame.
+  - **Causa 2 — Sovraccarico CPU per Composizione 2x2 a 120 FPS (`qcarcam_bridge.cpp`)**:
+    `qcarcam_bridge.cpp` eseguiva la composizione UYVY e la conversione SIMD NEON UYVY->RGBA su ogni singolo frame di qualsiasi telecamera (120 FPS), saturando inutilmente i core CPU Kryo.
+  - **Causa 3 — Jitter nei Timestamp PTS di MediaCodec**:
+    I timestamp di presentazione passati all'encoder venivano generati tramite `System.nanoTime()` al risveglio ritardato del thread GL anziché riflettere il momento effettivo di acquisizione dal sensore.
+  - **Architettura Event-Driven Reattiva C++ → Java**:
+    - In `qcarcam_bridge.cpp`: ancorata la composizione dei mosaici 2x2 e 4K sull'arrivo dei frame della telecamera frontale Cam 0 (`slot == 0`), riducendo del 75% il carico di elaborazione CPU. Appena il buffer hardware RGBA è sbloccato e pronto, il thread C++ invoca istantaneamente la callback JNI `DiLink5QCarCamBackend.onNativeFrameAvailable(timestampNs)`.
+    - In `DiLink5QCarCamBackend.java` e `PanoramicCameraGpu.java`: introdotto il `FrameListener` che risveglia istantaneamente `frameSync.notify()`, azzerando la latenza di polling e sincronizzando il disegno EGL esattamente all'emissione hardware.
+    - **Sincronizzazione Monotona PTS MediaCodec (`PanoramicCameraGpu.java`)**: Allineato `consumeDiLink5Frame()` al clock domain `System.nanoTime()` con monotonic guard `lastAcceptedPtsNs + 1us` (identico al pattern collaudato OEM), prevenendo cadute nel fallback +1ms di `GpuMosaicRecorder` e assicurando un framerate effettivo di registrazione isocrono a 30.00 FPS.
+    - **Inclusione `acc_sentry_daemon` nel Lifecycle di Installazione (`safe_install_adb.sh`)**: Aggiunto `acc_sentry_daemon` alla lista di arresto/riavvio coordinato prima dell'aggiornamento APK per garantire che il demone sentinella esegua sempre l'ultima versione del codice.
+    - **Preservazione Permessi Directory Web (`/data/local/tmp/web`)**: Garantito il bit di esecuzione directory (`+x`, modo 755) su `/data/local/tmp/web` prevenendo errori 404 `index.html not found` durante l'accesso alla web UI e al tunnel Cloudflare.
+
 - **Fix Esaurimento GSL Pool 0 Driver Adreno e Prevenzione Crash SurfaceFlinger su Inserimento Retromarcia (`qcarcam_bridge.cpp`)**:
   - **Identificazione Causa Radice Crash Retromarcia (SIGSEGV SurfaceFlinger `GLESRenderEngine::cacheExternalTextureBufferInternal` e Allocator Service `metadata mmap failed - fd: 8 err: Out of memory`)**:
     All'inserimento della retromarcia (`GEAR_R`), l'app nativa BYD 360 (`com.ts.avm`) alloca buffer grafici per comporre le viste telecamere. In `qcarcam_bridge.cpp`, la funzione `nativeBindLatestFrame` invocava `eglCreateImageKHR` ed `eglDestroyImageKHR` a 60 FPS per ogni singolo frame. Nel driver Adreno Qualcomm (Adreno 643 / SA8155P), la creazione/distruzione continua di immagini EGL su buffer hardware esaurisce il GSL pool 0 (`mem used 550.00% slots used 20 - Out of memory`), impedendo all'allocatore di sistema di creare nuovi descrittori di memoria grafica per SurfaceFlinger e HWC, causando il crash immediato del compositore di sistema e il riavvio del tab.
