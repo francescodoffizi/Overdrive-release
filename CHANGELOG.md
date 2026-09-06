@@ -4,6 +4,13 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+## [v51.4] - 2026-09-06
+
+- **Richiesta Immediata Sync-Frame IDR al Cambio Visuale Telecamere in Live View (`GpuSurveillancePipeline.java`)**:
+  - In `setStreamViewMode(mode)`: introdotta la chiamata esplicita a `streamEncoder.requestSyncFrame()` non appena viene commutata la telecamera (da mosaico a singola Front, Right, Rear, Left o viceversa).
+  - Questo forza il codec hardware `MediaCodec` ad emettere immediatamente un nuovo frame chiave IDR completo con parametri di decodifica aggiornati, azzerando la dipendenza dai P-frame calcolati sulla geometria precedente.
+  - Risolti i freeze, gli stalli e i blocchi del decoder nel player web (WebCodecs / jmuxer) e nell'interfaccia veicolare, garantendo una transizione istantanea e fluida tra le visuali.
+
 ## [v51.3] - 2026-09-06
 
 - **Risoluzione Alterazione Cromatica Verde su Fotogramma Chiave Telegram (`FoveatedCropper.java`, `GpuDownscaler.java`, `HighResPreviewSampler.java`, `PanoramicCameraGpu.java`)**:

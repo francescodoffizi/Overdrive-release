@@ -8901,6 +8901,14 @@ public class GpuSurveillancePipeline {
         } else {
             logger.warn("Cannot set stream view mode - streaming not enabled");
         }
+        if (streamEncoder != null) {
+            try {
+                streamEncoder.requestSyncFrame();
+                logger.info("Requested immediate IDR sync frame for stream view switch (mode=" + mode + ")");
+            } catch (Throwable t) {
+                logger.warn("Failed to request sync frame on view change: " + t.getMessage());
+            }
+        }
     }
 
     /** Back-compat 8-arg pass-through (rear roll/pitch = 0 = rear identity). */
