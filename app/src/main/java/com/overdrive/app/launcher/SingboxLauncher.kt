@@ -171,7 +171,6 @@ class SingboxLauncher(
       "tag": "proxy",
       "server": "80.225.224.92",
       "server_port": 443,
-      "bind_interface": "vlan4",
       "uuid": "ce8591be-9fa8-4361-90f3-427e9b5e8b85",
       "flow": "xtls-rprx-vision",
       "tls": {

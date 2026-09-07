@@ -203,7 +203,6 @@ public class GlobalProxyDaemon {
                 "      \"tag\": \"" + OUTBOUND_PROXY() + "\",\n" +
                 "      \"server\": \"" + SERVER_IP() + "\",\n" +
                 "      \"server_port\": 443,\n" +
-                "      \"bind_interface\": \"vlan4\",\n" +
                 "      \"uuid\": \"" + UUID() + "\",\n" +
                 "      \"flow\": \"" + FLOW_XTLS() + "\",\n" +
                 "      \"tls\": {\n" +
