@@ -11,6 +11,10 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 - **Eliminazione Falso Stato "Charging" e "Plugged" in Park (`CarSvcChargeSessionAdmit.java`, `CarSvcChargingDebounce.java`, `CarSvcTelemetry.kt`)**:
   - Risolto l'aggancio indebito su consumi stazionari di cabina (clima/infotainment ~1.2 kW): `CarSvcChargeSessionAdmit` ora rifiuta ammissioni per potenze inferiori a 3.0 kW (`STRONG_KW`) se il cavo non è fisicamente inserito (`gunConnected == false`).
   - In `CarSvcTelemetry.kt`, aggiunto fallback su `VehicleDataMonitor` per conoscere lo stato del connettore anche se `dumpsys car_service` non ha ancora emesso l'evento; se il connettore risulta scollegato (`gun == 0`), `sessionAdmit.reset()` e `chargingDebounce.reset()` azzerano istantaneamente lo stato di ricarica senza ritardi di debounce.
+- **Reindirizzamento In-App Updater su Fork Personale & Supporto Tag `vX.Y` (`AppUpdater.java`, `build.gradle.kts`)**:
+  - In `build.gradle.kts`, introdotto il parametro `UPDATE_REPO` configurabile via proprietà Gradle, impostato di default su `francescodoffizi/Overdrive-release`.
+  - In `AppUpdater.java`, `GITHUB_REPO` ora punta al fork personale (`BuildConfig.UPDATE_REPO`), evitando che la ricerca aggiornamenti sovrascriva l'app con l'upstream di Yash privo dei fix per DiLink 5.0.
+  - In `listVersions()` e `isValidAlphaTag()`, estesa la validazione dei tag per includere i formati di versione `vX.Y` (es. `v51.9`, `v51.8`) oltre ai tag legacy `alpha-v*`, consentendo a te e agli altri tester di installare direttamente dall'infotainment qualsiasi release rilasciata.
 
 ## [v51.8] - 2026-09-07
 

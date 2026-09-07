@@ -38,7 +38,8 @@ import okhttp3.Response;
 public class AppUpdater {
 
     private static final String TAG = "AppUpdater";
-    private static final String GITHUB_REPO = "yash-srivastava/Overdrive-release";
+    private static final String GITHUB_REPO = (BuildConfig.UPDATE_REPO != null && !BuildConfig.UPDATE_REPO.isEmpty())
+            ? BuildConfig.UPDATE_REPO : "francescodoffizi/Overdrive-release";
     private static final String PREFS_NAME = "app_updater";
     // LEGACY (pre-channel) baseline key/file. Still read once by
     // migrateBaseline() to seed the per-channel "alpha" slot, then unused.
@@ -2313,9 +2314,9 @@ public class AppUpdater {
         return cameraStopConfirmed[0];
     }
 
-    /** Strict alpha tag allowlist: bare "alpha" or "alpha-v<semver>". */
+    /** Strict tag allowlist: bare "alpha", "alpha-v<semver>", bare "latest", or "v<semver>". */
     private static final java.util.regex.Pattern VALID_ALPHA_TAG =
-            java.util.regex.Pattern.compile("^alpha(-v\\d+\\.\\d+(\\.\\d+)?)?$");
+            java.util.regex.Pattern.compile("^(alpha(-v\\d+\\.\\d+(\\.\\d+)?)?|latest|v\\d+\\.\\d+(\\.\\d+)?)$");
 
     public static boolean isValidAlphaTag(String tag) {
         return tag != null && VALID_ALPHA_TAG.matcher(tag).matches();
@@ -3012,8 +3013,8 @@ public class AppUpdater {
                         JSONObject rel = releases.optJSONObject(i);
                         if (rel == null) continue;
                         String tag = rel.optString("tag_name", "");
-                        boolean isAlphaArchive = tag.startsWith("alpha-v");
-                        boolean isLegacyAlpha = tag.equals("alpha");
+                        boolean isAlphaArchive = tag.startsWith("alpha-v") || tag.matches("^v\\d+(\\.\\d+)*.*");
+                        boolean isLegacyAlpha = tag.equals("alpha") || tag.equals("latest");
                         if (!isAlphaArchive && !isLegacyAlpha) continue;
 
                         String[] apk = firstApkAsset(rel.optJSONArray("assets"));

@@ -329,6 +329,8 @@ android {
         // the working build's generated BuildConfig (default-config fields).
         buildConfigField("boolean", "LOG_CAPTURE", "false")
         buildConfigField("String", "LOG_UPLOAD_URL", "\"\"")
+        val updateRepo = (project.findProperty("overdriveUpdateRepo") as? String) ?: "francescodoffizi/Overdrive-release"
+        buildConfigField("String", "UPDATE_REPO", "\"$updateRepo\"")
     }
 
     buildFeatures {
