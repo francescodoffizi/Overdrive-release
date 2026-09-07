@@ -4,6 +4,8 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [v51.9] - 2026-09-07
 
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
 - **Ripristino Live View post-AVM con Registrazione su NONE (`TsAvmCoordinator.java`, `DiLink5QCarCamBackend.java`, `GpuSurveillancePipeline.java`)**:
   - Sostituita la verifica statica su `/proc` in `TsAvmCoordinator.isAvmActive()` con il controllo dinamico dell'attività foreground su schermo (`mResumedActivity`): in questo modo, il fatto che il processo Android `com.byd.avm` rimanga memorizzato in cache non blocca più indefinitamente la riattivazione hardware di `fast_cam_capture`.
   - In `DiLink5QCarCamBackend.java`, aggiornato `isYielded()` includendo `isAvmActive()` per evitare falsi allarmi del frame-stall detector GL durante l'uso dell'AVM.
