@@ -15,6 +15,7 @@
 *.raw
 *.zip
 *.png
+*.apk
 dilink5_camera_dump*
 .DS_Store
 
