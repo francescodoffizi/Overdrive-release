@@ -115,4 +115,15 @@ class WakeLockManager(private val context: Context) {
      * Check if WiFi lock is held.
      */
     fun isWifiLockHeld(): Boolean = wifiLock?.isHeld == true
+
+    /**
+     * Safe finalizer to prevent Android's FinalizerDaemon from logging
+     * Log.wtf: 'WakeLock finalized while still held' if an instance is orphaned.
+     */
+    @Suppress("DEPRECATION")
+    protected fun finalize() {
+        try {
+            releaseAll()
+        } catch (_: Throwable) {}
+    }
 }

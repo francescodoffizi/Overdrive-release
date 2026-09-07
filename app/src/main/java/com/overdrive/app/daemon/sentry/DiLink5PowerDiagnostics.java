@@ -15,8 +15,12 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.InputStreamReader;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Enumeration;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -30,6 +34,7 @@ public class DiLink5PowerDiagnostics {
     private static final String TAG = "DiLink5PowerDiag";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final String LOG_PATH = "/sdcard/Overdrive/sentry_power_test.log";
+    private static final long MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB cap
 
     private static final AtomicBoolean sRunning = new AtomicBoolean(false);
     private static Thread sDiagThread = null;
@@ -37,6 +42,14 @@ public class DiLink5PowerDiagnostics {
 
     public static synchronized void start(Context context) {
         if (sRunning.get()) return;
+
+        // Ensure any previously allocated wake lock is safely released first
+        if (sWakeLockManager != null) {
+            try {
+                sWakeLockManager.releaseAll();
+            } catch (Throwable ignored) {}
+            sWakeLockManager = null;
+        }
 
         if (context != null) {
             try {
@@ -101,27 +114,45 @@ public class DiLink5PowerDiagnostics {
         appendLog(logFile, "=== DiLink 5 Sentry & Power Diagnostic Session Started: " + sdf.format(new Date()) + " ===\n");
         appendLog(logFile, "=================================================================\n");
 
+        long lastPowerSampleTime = 0;
+        String cachedScreenPower = "UNKNOWN";
+        String cachedIsInteractive = "UNKNOWN";
+
+        long lastQcarcamSampleTime = 0;
+        String cachedQcarcamPid = "NONE";
+        boolean cachedQcarcamRunning = false;
+
+        long lastWifiReconnectAttempt = 0;
+        long currentWifiBackoffMs = 15_000L; // Start at 15s, backoff up to 120s
+
         while (sRunning.get()) {
             try {
-                String timestamp = sdf.format(new Date());
+                long now = System.currentTimeMillis();
+                String timestamp = sdf.format(new Date(now));
 
                 // 1. ACC State
                 String accAnimStatus = execShell("getprop sys.accanim.status").trim();
-                String screenPower = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power' | head -1").trim();
-                String isInteractive = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim();
 
-                // 2. Wi-Fi Status & Proactive Reconnect
+                // Throttle heavy dumpsys power query to once every 30 seconds
+                if (now - lastPowerSampleTime >= 30_000L || "UNKNOWN".equals(cachedScreenPower)) {
+                    lastPowerSampleTime = now;
+                    String sp = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power' | head -1").trim();
+                    if (!sp.isEmpty()) cachedScreenPower = sp;
+                    String ii = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim();
+                    if (!ii.isEmpty()) cachedIsInteractive = ii;
+                }
+
+                // 2. Wi-Fi Status via native APIs (zero shell overhead)
                 String wifiIp = "N/A";
                 String wifiSsid = "N/A";
                 int wifiRssi = 0;
                 boolean wifiConnected = false;
+                WifiManager wm = null;
+
                 if (context != null) {
                     try {
-                        WifiManager wm = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                        wm = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
                         if (wm != null) {
-                            if (!wm.isWifiEnabled()) {
-                                wm.setWifiEnabled(true);
-                            }
                             WifiInfo info = wm.getConnectionInfo();
                             if (info != null && info.getNetworkId() != -1) {
                                 wifiSsid = info.getSSID();
@@ -133,27 +164,46 @@ public class DiLink5PowerDiagnostics {
                                             (ip & 0xff), (ip >> 8 & 0xff), (ip >> 16 & 0xff), (ip >> 24 & 0xff));
                                 }
                             }
-                            // Proactively reconnect if disconnected
-                            if (!wifiConnected) {
-                                wm.reconnect();
-                            }
                         }
                     } catch (Throwable ignored) {}
                 }
-                if ("N/A".equals(wifiIp) || "0.0.0.0".equals(wifiIp)) {
-                    String ipCmd = execShell("ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}'").trim();
-                    if (!ipCmd.isEmpty()) {
-                        wifiIp = ipCmd;
+
+                // Fallback IP lookup using Java NetworkInterface (native, no /system/bin/sh fork)
+                if (!wifiConnected || "N/A".equals(wifiIp) || "0.0.0.0".equals(wifiIp)) {
+                    String nativeWlanIp = getWlan0IpNative();
+                    if (nativeWlanIp != null) {
+                        wifiIp = nativeWlanIp;
                         wifiConnected = true;
-                    } else {
-                        // Shell fallback to ensure Wi-Fi stays awake and reconnects
-                        execShell("svc wifi enable 2>/dev/null; cmd wifi reconnect 2>/dev/null");
                     }
                 }
 
-                // 3. Hardware Camera Status
-                String qcarcamPid = execShell("pgrep -f fast_cam_capture").trim();
-                boolean qcarcamRunning = !qcarcamPid.isEmpty();
+                // Wi-Fi Reconnection with Exponential Backoff (prevents IPC/binder saturation)
+                if (!wifiConnected) {
+                    if (now - lastWifiReconnectAttempt >= currentWifiBackoffMs) {
+                        lastWifiReconnectAttempt = now;
+                        logger.info("Wi-Fi disconnected. Proactive reconnect attempt (backoff interval: " + (currentWifiBackoffMs / 1000) + "s)");
+                        currentWifiBackoffMs = Math.min(currentWifiBackoffMs * 2, 120_000L); // Cap at 2 minutes
+
+                        if (wm != null) {
+                            try {
+                                if (!wm.isWifiEnabled()) {
+                                    wm.setWifiEnabled(true);
+                                }
+                                wm.reconnect();
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                } else {
+                    // Reset backoff once connection is healthy
+                    currentWifiBackoffMs = 15_000L;
+                }
+
+                // 3. Hardware Camera Status (Sampled every 6 seconds to avoid constant pgrep forks)
+                if (now - lastQcarcamSampleTime >= 6_000L) {
+                    lastQcarcamSampleTime = now;
+                    cachedQcarcamPid = execShell("pgrep -f fast_cam_capture").trim();
+                    cachedQcarcamRunning = !cachedQcarcamPid.isEmpty();
+                }
                 boolean backendSupported = DiLink5QCarCamBackend.isSupported();
 
                 // 4. TS AVM Status
@@ -164,14 +214,14 @@ public class DiLink5PowerDiagnostics {
                         "[%s] ACC: '%s' | Screen: [%s, %s] | Wi-Fi: [Connected=%b, IP=%s, SSID=%s, RSSI=%d] | FastCam: [Running=%b, PID=%s, Supported=%b] | AVM Alive: %b\n",
                         timestamp,
                         accAnimStatus.isEmpty() ? "0 (ON)" : accAnimStatus,
-                        screenPower.isEmpty() ? "UNKNOWN" : screenPower,
-                        isInteractive.isEmpty() ? "UNKNOWN" : isInteractive,
+                        cachedScreenPower,
+                        cachedIsInteractive,
                         wifiConnected,
                         wifiIp,
                         wifiSsid,
                         wifiRssi,
-                        qcarcamRunning,
-                        qcarcamPid.isEmpty() ? "NONE" : qcarcamPid,
+                        cachedQcarcamRunning,
+                        cachedQcarcamPid.isEmpty() ? "NONE" : cachedQcarcamPid,
                         backendSupported,
                         tsAvmAlive
                 );
@@ -188,10 +238,38 @@ public class DiLink5PowerDiagnostics {
         }
     }
 
+    private static String getWlan0IpNative() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            if (interfaces == null) return null;
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                if ("wlan0".equalsIgnoreCase(iface.getName())) {
+                    Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) {
+                            return addr.getHostAddress();
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     private static synchronized void appendLog(File file, String text) {
-        try (FileWriter fw = new FileWriter(file, true)) {
-            fw.write(text);
-            fw.flush();
+        try {
+            // Rotate log if exceeds MAX_LOG_SIZE_BYTES (5 MB)
+            if (file.exists() && file.length() > MAX_LOG_SIZE_BYTES) {
+                File bak = new File(file.getAbsolutePath() + ".1");
+                if (bak.exists()) bak.delete();
+                file.renameTo(bak);
+            }
+            try (FileWriter fw = new FileWriter(file, true)) {
+                fw.write(text);
+                fw.flush();
+            }
         } catch (Throwable ignored) {}
     }
 

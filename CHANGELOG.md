@@ -1,6 +1,24 @@
 # Changelog
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
+
+## [v51.11] - 2026-09-07
+
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
+- **Prevenzione Freeze & Reboot Hardware su Perdita Wi-Fi (`DiLink5PowerDiagnostics.java`)**:
+  - Introdotto backoff esponenziale (15s → 30s → 60s → max 120s) per i tentativi di riconnessione Wi-Fi proattiva in assenza di rete.
+  - Eliminata la raffica continua di comandi shell bloccanti (`svc wifi enable`, `cmd wifi reconnect`, `ip addr show wlan0` ogni 2 secondi) che saturavano l'IPC Binder di `system_server` portando al watchdog reset hardware del SoC Qualcomm.
+  - Sostituita l'estrazione dell'IP locale con l'ispezione nativa Java di `NetworkInterface` (zero fork di processo).
+  - Throttled il campionamento pesante di `dumpsys power` a 30s e ridotto il polling `pgrep` di FastCam.
+  - Aggiunto cap massimo di 5 MB a `sentry_power_test.log` con rotazione automatica (`.1`), preservando la memoria flash.
+- **Eliminazione Allarmi e Leak WakeLock `system_server_wtf` (`WakeLockManager.kt`, `DiLink5PowerDiagnostics.java`)**:
+  - In `DiLink5PowerDiagnostics.start()`, aggiunto rilascio incondizionato del WakeLock preesistente prima di allocarne uno nuovo per evitare istanze orfane durante i riavvii.
+  - In `WakeLockManager.kt`, implementato `finalize()` difensivo per rilasciare sia il `wakeLock` che il `wifiLock` qualora l'oggetto venga raccolto dal GC mentre ancora trattenuto, impedendo che Android inneschi `Log.wtf: 'WakeLock finalized while still held: BYDCam::WakeLock'`.
+- **Stabilizzazione Ciclo di Vita FastCam e Prevenzione Crash GPU Adreno / SurfaceFlinger (`DiLink5QCarCamBackend.java`)**:
+  - Esteso il tempo concesso a `SIGTERM` (a 600ms) durante la chiusura di `fast_cam_capture` per permettere a Qualcomm QCarCam/AIS di deregistrare in modo pulito i buffer DMA da Gralloc prima di un eventuale fallback a `SIGKILL`.
+  - Aumentato a 800ms il tempo di sincronizzazione e deallocazione prima del riavvio della pipeline hardware, scongiurando il crash `SIGSEGV` in `libadreno_utils.so` (`validate_resource_memory_layout_metadata`) e `hwcomposer.msmnile.so` al riavvio servizi.
+
 ## [v51.10] - 2026-09-07
 
 > **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.

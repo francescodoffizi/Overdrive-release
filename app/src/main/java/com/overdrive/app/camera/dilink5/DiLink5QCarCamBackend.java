@@ -100,7 +100,7 @@ public class DiLink5QCarCamBackend {
     private static void gracefulStopProcess(String processPattern) {
         try {
             // Stage 1: Graceful SIGTERM so Qualcomm AIS / QCarCam can release DMA buffers and close camera session
-            Runtime.getRuntime().exec(new String[]{"pkill", "-15", "-f", processPattern}).waitFor(400, java.util.concurrent.TimeUnit.MILLISECONDS);
+            Runtime.getRuntime().exec(new String[]{"pkill", "-15", "-f", processPattern}).waitFor(600, java.util.concurrent.TimeUnit.MILLISECONDS);
 
             // Check if process has exited
             Process checkProc = Runtime.getRuntime().exec(new String[]{"pgrep", "-f", processPattern});
@@ -114,7 +114,7 @@ public class DiLink5QCarCamBackend {
             // Stage 2: Fallback to SIGKILL only if process is still lingering
             if (!exited) {
                 logger.warn("Process " + processPattern + " did not terminate on SIGTERM, forcing SIGKILL");
-                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", processPattern}).waitFor(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", processPattern}).waitFor(300, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
         } catch (Throwable t) {
             logger.warn("Error in gracefulStopProcess(" + processPattern + "): " + t.getMessage());
@@ -304,7 +304,7 @@ public class DiLink5QCarCamBackend {
         if (sHardwareProcess != null) {
             try {
                 sHardwareProcess.destroy(); // sends SIGTERM
-                sHardwareProcess.waitFor(400, java.util.concurrent.TimeUnit.MILLISECONDS);
+                sHardwareProcess.waitFor(600, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (Throwable ignored) {}
             if (sHardwareProcess != null) {
                 try {
@@ -318,9 +318,6 @@ public class DiLink5QCarCamBackend {
             sHardwareProcess = null;
         }
         gracefulStopProcess("fast_cam_capture");
-        try {
-            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "/data/local/tmp/fast_cam_capture"}).waitFor(200, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (Throwable ignored) {}
     }
 
     private static void ensureHardwareProcess() {
@@ -376,7 +373,7 @@ public class DiLink5QCarCamBackend {
 
                 // Terminate any existing or orphan instances to prevent duplicate services
                 terminateHardwareProcess();
-                Thread.sleep(300);
+                Thread.sleep(800);
 
                 if (binFile.exists()) {
                     binFile.setReadable(true, false);
