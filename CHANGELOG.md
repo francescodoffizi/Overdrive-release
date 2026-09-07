@@ -4,8 +4,16 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In sviluppo] - 2026-09-07
 
-- **Risoluzione Contesa Vold/CarPlay ed Eliminazione Dumpsys**:
-  - In corso di implementazione.
+- **Gestione Smontaggio USB Vold & Prevenzione Crash CarPlay (`StorageManager.java`)**:
+  - Intercettazione sincrona degli eventi `ACTION_MEDIA_EJECT`, `ACTION_MEDIA_UNMOUNTED`, `ACTION_MEDIA_BAD_REMOVAL` e `ACTION_MEDIA_REMOVED`.
+  - Arresto immediato e rilascio sincrono degli inotify watches di `RecordingsIndexFileWatcher` e chiusura di eventuali file aperti su disco del muxer (`HardwareEventRecorderGpu`) prima della scansione di `/proc/<pid>/fd/` da parte di `vold`, impedendo il kill forzato (`vold: Sending Interrupt to <pid>`) causato dalla rinegoziazione USB host/peripheral all'avvio di CarPlay.
+  - Reindirizzamento automatico delle cartelle di registrazione sentry sullo storage interno finché il volume esterno non viene rimontato.
+- **Eliminazione Dumpsys Periodici & Azzeramento Lock Contention (`DiLink5PowerDiagnostics.java`, `AccMonitor.java`, `AccMonitorController.kt`, `AccSentryDaemon.java`, `GearMonitor.java`, `AbrpAppPresence.java`, `CarSvcTelemetry.kt`)**:
+  - Sostituito il polling continuo di `dumpsys power` in `DiLink5PowerDiagnostics` e `AccMonitorController` con chiamate native a `PowerManager.isInteractive()`.
+  - Eliminato il polling ripetuto di `dumpsys car_service` in `AccMonitor` (ogni 3s), `AccMonitorController` (ogni 9s), `AccSentryDaemon` e `GearMonitor`, sostituendolo con la lettura leggera della proprietà BYD `sys.accanim.status` (0 = ACC ON, 1/2 = ACC OFF) e lo stato del PowerManager nativo.
+  - Rimosso `dumpsys wifi` per il monitoraggio dell'hotspot in `AccSentryDaemon`, demandando il controllo ai probe IP e agli indirizzi di rete attivi.
+  - In `AbrpAppPresence`, subordinata l'interrogazione foreground alla presenza del processo (`isProcessAlive`) ed introdotto timeout limitato (`dumpsys -t 2`).
+  - In `CarSvcTelemetry`, applicato timeout stringente (`dumpsys -t 3` e `process.waitFor(4s)`) con distruzione forzata del processo in caso di ritardo, per impedire qualunque stallo dei thread di telemetria sotto carico.
 
 ## [v51.13] - 2026-09-07
 

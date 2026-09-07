@@ -6422,32 +6422,31 @@ public class AccSentryDaemon {
 
     private static int readPowerLevelDiLink5() {
         try {
-            String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 3 | grep 'current' | head -1");
-            if (carServicePower != null && !carServicePower.isEmpty()) {
-                if (carServicePower.contains("4=PowerMode Standby") || carServicePower.contains("8=PowerMode Sleep") ||
-                    carServicePower.contains("5=PowerMode Str") || carServicePower.contains("0=PowerMode Off") ||
-                    carServicePower.contains("1=PowerMode Pre StartUp") || carServicePower.contains("12=PowerMode Tod") ||
-                    carServicePower.contains("9=PowerMode Str Suspending")) {
-                    return POWER_LEVEL_OFF;
-                } else if (carServicePower.contains("2=PowerMode StartUp") ||
-                           carServicePower.contains("10=PowerMode DisPlay on") || carServicePower.contains("3=PowerMode Degraded")) {
-                    return POWER_LEVEL_ON;
-                }
-            }
-        } catch (Throwable t) {
-            log("readPowerLevelDiLink5 dumpsys error: " + t.getMessage());
-        }
-
-        try {
             if (appContext != null) {
                 PowerManager pm = (PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
                 if (pm != null && !pm.isInteractive()) {
                     return POWER_LEVEL_OFF;
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            log("readPowerLevelDiLink5 PowerManager error: " + t.getMessage());
+        }
 
-        return POWER_LEVEL_OFF;
+        try {
+            String accAnim = execShell("getprop sys.accanim.status");
+            if (accAnim != null) {
+                accAnim = accAnim.trim();
+                if ("1".equals(accAnim) || "2".equals(accAnim)) {
+                    return POWER_LEVEL_OFF;
+                } else if ("0".equals(accAnim)) {
+                    return POWER_LEVEL_ON;
+                }
+            }
+        } catch (Throwable t) {
+            log("readPowerLevelDiLink5 getprop error: " + t.getMessage());
+        }
+
+        return POWER_LEVEL_ON;
     }
 
     private static void applyHeartbeatPowerLevel(
@@ -9042,31 +9041,12 @@ public class AccSentryDaemon {
                         + " ticks — no longer holding off the keep-alive");
             }
             enablingHoldOffTicks = 0;
-            // Multi-tier SoftAP probe:
-            // 1. Check if an active SoftAP IP exists (default 192.168.43.1 / 192.168.44.1)
+            // SoftAP probe:
+            // Check if an active SoftAP IP exists (default 192.168.43.1 / 192.168.44.1)
             String ipDump = execShell("ip addr show 2>/dev/null | grep -E 'inet 192\\.168\\.(43|44)\\.1'").trim();
             boolean apIpActive = !ipDump.isEmpty();
-
-            // 2. Query dumpsys wifi for curState=SoftApState, mSoftApState=13, or curState=Started
-            String apDump = execShell(
-                    "dumpsys wifi 2>/dev/null | grep -E -c '(curState=SoftApState|mSoftApState=13|curState=Started)'"
-                            + "; echo PROBE_OK");
             boolean apUp = apIpActive;
-            boolean probeWorked = apIpActive;
-            if (apDump != null && apDump.contains("PROBE_OK")) {
-                for (String line : apDump.split("\\r?\\n")) {
-                    String t = line.trim();
-                    if (t.isEmpty() || t.equals("PROBE_OK")) continue;
-                    try {
-                        if (Integer.parseInt(t) > 0) {
-                            apUp = true;
-                        }
-                        probeWorked = true;
-                    } catch (NumberFormatException ignored) {
-                        // Not the count line; keep looking.
-                    }
-                }
-            }
+            boolean probeWorked = true;
             if (!probeWorked) {
                 staleHotspotProbeTicks++;
                 if (staleHotspotProbeTicks < MAX_STALE_HOTSPOT_PROBE_TICKS) {

@@ -420,24 +420,6 @@ public class GearMonitor {
                     }
                 }
             } catch (Throwable ignored) {}
-
-            // 3. Fallback: dumpsys car_service (throttled to 3 seconds to avoid CPU/IPC saturation)
-            String propDump = com.overdrive.app.monitor.AccMonitor.execShell(
-                "dumpsys car_service 2>/dev/null | grep -E '0x21406407|0x21403a06|0x21403a0a' | grep 'lastEvent'");
-            if (propDump != null && !propDump.isEmpty()) {
-                if (propDump.contains("0x21406407") || propDump.contains("0x21403a06") || propDump.contains("0x21403a0a")) {
-                    int decoded = -1;
-                    if (propDump.contains("int32Values: [4]")) decoded = GEAR_D;
-                    else if (propDump.contains("int32Values: [2]")) decoded = GEAR_R;
-                    else if (propDump.contains("int32Values: [3]")) decoded = GEAR_N;
-                    else if (propDump.contains("int32Values: [1]") || propDump.contains("int32Values: [0]")) decoded = GEAR_P;
-                    
-                    if (isValidGearMode(decoded)) {
-                        lastDumpsysGear = decoded;
-                        return decoded;
-                    }
-                }
-            }
         } catch (Throwable ignored) {}
         return isValidGearMode(lastDumpsysGear) ? lastDumpsysGear : -1;
     }

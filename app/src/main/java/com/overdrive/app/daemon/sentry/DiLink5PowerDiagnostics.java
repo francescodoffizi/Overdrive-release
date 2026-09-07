@@ -133,13 +133,16 @@ public class DiLink5PowerDiagnostics {
                 // 1. ACC State
                 String accAnimStatus = execShell("getprop sys.accanim.status").trim();
 
-                // Throttle heavy dumpsys power query to once every 30 seconds
-                if (now - lastPowerSampleTime >= 30_000L || "UNKNOWN".equals(cachedScreenPower)) {
-                    lastPowerSampleTime = now;
-                    String sp = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power' | head -1").trim();
-                    if (!sp.isEmpty()) cachedScreenPower = sp;
-                    String ii = execShell("dumpsys power 2>/dev/null | grep -i 'mIsInteractive' | head -1").trim();
-                    if (!ii.isEmpty()) cachedIsInteractive = ii;
+                // Screen / interactive state via native PowerManager (zero dumpsys / zero lock contention)
+                if (context != null) {
+                    try {
+                        PowerManager pm = (PowerManager) context.getApplicationContext().getSystemService(Context.POWER_SERVICE);
+                        if (pm != null) {
+                            boolean isInteractive = pm.isInteractive();
+                            cachedIsInteractive = "mIsInteractive=" + isInteractive;
+                            cachedScreenPower = "Display Power: state=" + (isInteractive ? "ON" : "OFF");
+                        }
+                    } catch (Throwable ignored) {}
                 }
 
                 // 2. Wi-Fi Status via native APIs (zero shell overhead)

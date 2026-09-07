@@ -349,34 +349,24 @@ public class AccMonitor {
                     }
                 }
 
-                // 2. Throttled check for Automotive BYD PowerMode enum (Standby=4, Sleep=8, Str=5, Off=0, Pre StartUp=1 vs StartUp=2, DisPlay on=10)
-                long now = android.os.SystemClock.elapsedRealtime();
-                if (now - lastDiLink5PowerDumpMs < DILINK5_POWER_DUMP_THROTTLE_MS && lastProbeTrustworthy) {
-                    return !accOn;
-                }
-                lastDiLink5PowerDumpMs = now;
-
-                String carServicePower = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 3 | grep 'current' | head -1");
-                if (!carServicePower.isEmpty()) {
-                    if (carServicePower.contains("4=PowerMode Standby") || carServicePower.contains("8=PowerMode Sleep") ||
-                        carServicePower.contains("5=PowerMode Str") || carServicePower.contains("0=PowerMode Off") ||
-                        carServicePower.contains("1=PowerMode Pre StartUp") || carServicePower.contains("12=PowerMode Tod") ||
-                        carServicePower.contains("9=PowerMode Str Suspending")) {
+                // 2. Check sys.accanim.status (0 = Driving/ON, 1 or 2 = ACC OFF / Standby)
+                String accAnimStatus = execShell("getprop sys.accanim.status").trim();
+                if (!accAnimStatus.isEmpty()) {
+                    if ("1".equals(accAnimStatus) || "2".equals(accAnimStatus)) {
                         accOn = false;
                         inSentryMode = true;
                         lastProbeTrustworthy = true;
                         accOnAuthoritative = true;
                         notifyAccEdge(false);
-                        CameraDaemon.log("AccMonitor [DiLink5]: Vehicle PowerMode is STANDBY/OFF (" + carServicePower.trim() + ") -> accOn=false, sentryMode=true");
+                        CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=" + accAnimStatus + " -> accOn=false, sentryMode=true");
                         return true;
-                    } else if (carServicePower.contains("2=PowerMode StartUp") ||
-                               carServicePower.contains("10=PowerMode DisPlay on") || carServicePower.contains("3=PowerMode Degraded")) {
+                    } else if ("0".equals(accAnimStatus)) {
                         accOn = true;
                         inSentryMode = false;
                         lastProbeTrustworthy = true;
                         accOnAuthoritative = true;
                         notifyAccEdge(true);
-                        CameraDaemon.log("AccMonitor [DiLink5]: Vehicle PowerMode is ACTIVE/READY (" + carServicePower.trim() + ") -> accOn=true, sentryMode=false");
+                        CameraDaemon.log("AccMonitor [DiLink5]: sys.accanim.status=0 -> accOn=true, sentryMode=false");
                         return false;
                     }
                 }

@@ -78,20 +78,26 @@ public class AbrpAppPresence {
         String pkg = config.getAppPackage();
         if (pkg == null || pkg.isEmpty()) pkg = "com.iternio.abrpapp";
 
+        boolean alive = isProcessAlive(pkg);
+        lastProcessAlive = alive;
+        if (!alive) {
+            lastForegroundNow = false;
+            return;
+        }
+
         String top = readForegroundPackage();
         boolean foregroundNow = top != null && top.contains(pkg);
         lastForegroundNow = foregroundNow;
         if (foregroundNow) {
             lastForegroundSeenMs = now;
         }
-        lastProcessAlive = foregroundNow || isProcessAlive(pkg);
     }
 
-    /** Parse the resumed/top activity package from dumpsys. */
+    /** Parse the resumed/top activity package from dumpsys (bounded by -t 2). */
     private String readForegroundPackage() {
-        String out = runShell("dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity|mCurrentFocus' | head -n 5");
+        String out = runShell("dumpsys -t 2 activity activities 2>/dev/null | grep -E 'mResumedActivity|topResumedActivity|mCurrentFocus' | head -n 5");
         if (out == null || out.isEmpty()) {
-            out = runShell("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' | head -n 5");
+            out = runShell("dumpsys -t 2 window windows 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 5");
         }
         if (out == null) return null;
         for (String line : out.split("\n")) {

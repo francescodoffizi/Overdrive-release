@@ -6912,28 +6912,30 @@ public class StorageManager {
             filter.addAction(android.content.Intent.ACTION_MEDIA_EJECT);
             filter.addAction(android.content.Intent.ACTION_MEDIA_UNMOUNTED);
             filter.addAction(android.content.Intent.ACTION_MEDIA_REMOVED);
-            filter.addAction(android.content.Intent.ACTION_MEDIA_BAD_REMOVAL);
+             filter.addAction(android.content.Intent.ACTION_MEDIA_BAD_REMOVAL);
             filter.addDataScheme("file");
             ctx.registerReceiver(new android.content.BroadcastReceiver() {
                 @Override
                 public void onReceive(android.content.Context c, android.content.Intent intent) {
-                    logInfo("Media event: " + intent.getAction() + " " + intent.getData()
-                        + " — scheduling volume refresh");
+                    if (intent == null) return;
+                    String action = intent.getAction();
+                    android.net.Uri data = intent.getData();
+                    String path = (data != null) ? data.getPath() : null;
+                    logInfo("Media event: " + action + " " + path + " — scheduling volume refresh");
+
+                    boolean isEjectOrUnmount = android.content.Intent.ACTION_MEDIA_EJECT.equals(action)
+                        || android.content.Intent.ACTION_MEDIA_UNMOUNTED.equals(action)
+                        || android.content.Intent.ACTION_MEDIA_BAD_REMOVAL.equals(action)
+                        || android.content.Intent.ACTION_MEDIA_REMOVED.equals(action);
+
+                    if (isEjectOrUnmount) {
+                        // CRITICAL: Synchronously close inotify file observers and any active muxers
+                        // on the unmounting drive BEFORE vold scans /proc/<pid>/fd/ and sends SIGINT kill!
+                        handleMediaEjectSynchronously(path);
+                    }
+
                     // Never do mount/discovery work on the broadcast thread —
                     // the refresh takes mountLock and probes the FS.
-                    //
-                    // Full refreshSdCard(), NOT bare discoverVolumes() (audit:
-                    // media events updated detection but not usable
-                    // directories). Discovery alone commits only
-                    // paths/availability — the per-volume dir fields and the
-                    // active-directory resolution are separate steps, so a
-                    // hot-mount landed as available=true with null dir fields
-                    // (active storage stuck on internal, and the watchdog sees
-                    // a healthy mount so it never re-initializes), and an
-                    // eject left active dirs pointing at the removed volume.
-                    // refreshSdCard = discovery (with the centralized
-                    // transition notify) + initSd/UsbDirectories +
-                    // updateActiveDirectories + limit reclamp.
                     Thread t = new Thread(() -> {
                         try {
                             refreshSdCard();
@@ -6948,11 +6950,60 @@ public class StorageManager {
             logInfo("Media event receiver registered — event-driven volume refresh active"
                 + " (15s watchdog remains the backstop)");
         } catch (Throwable t) {
-            // Expected on ROMs where AMS rejects our manual ActivityThread.
-            // Leave the latch SET — re-registering would fail identically
-            // every watchdog re-arm and spam the log.
             logWarn("Media event receiver registration failed (" + t.getMessage()
                 + ") — event-driven refresh unavailable, relying on 15s watchdog");
+        }
+    }
+
+    /**
+     * Synchronously tear down any file descriptors or inotify watches held on the volume
+     * being ejected or unmounted. Android's vold daemon scans /proc/pid/fd/ and sends
+     * SIGINT/SIGKILL to any process holding an open handle to the volume.
+     */
+    private void handleMediaEjectSynchronously(String path) {
+        try {
+            logInfo("handleMediaEjectSynchronously: path=" + path + " — closing open handles");
+            // 1. Immediately stop RecordingsIndexFileWatcher inotify watches so /proc/pid/fd/
+            // no longer references /storage/.../surveillance or /storage/.../recordings
+            try {
+                com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().stop();
+                logInfo("handleMediaEjectSynchronously: stopped RecordingsIndexFileWatcher");
+            } catch (Throwable t) {
+                logWarn("handleMediaEjectSynchronously: stopping RecordingsIndexFileWatcher threw: " + t.getMessage());
+            }
+
+            // 2. Stop any active recording or muxing if output is on the ejecting volume
+            try {
+                com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+                if (pipeline != null) {
+                    com.overdrive.app.surveillance.GpuMosaicRecorder recorder = pipeline.getRecorder();
+                    com.overdrive.app.surveillance.HardwareEventRecorderGpu encoder = (recorder != null) ? recorder.getEncoder() : null;
+                    String currentOutput = (encoder != null) ? encoder.getCurrentOutputPath() : null;
+                    if (currentOutput != null && (path == null || currentOutput.startsWith(path))) {
+                        logInfo("handleMediaEjectSynchronously: stopping pipeline to close fd on " + currentOutput);
+                        pipeline.stopRecording();
+                    }
+                    // Reset sentry output dir to internal storage
+                    com.overdrive.app.surveillance.SurveillanceEngineGpu sentry = pipeline.getSentry();
+                    if (sentry != null && internalSurveillanceDir != null) {
+                        sentry.setEventOutputDir(internalSurveillanceDir);
+                    }
+                }
+            } catch (Throwable t) {
+                logWarn("handleMediaEjectSynchronously: stopping pipeline threw: " + t.getMessage());
+            }
+
+            // 3. Mark volume unavailable immediately to prevent new writes
+            if (path != null) {
+                if (sdCardPath != null && path.startsWith(sdCardPath)) {
+                    sdCardAvailable = false;
+                }
+                if (usbPath != null && path.startsWith(usbPath)) {
+                    usbAvailable = false;
+                }
+            }
+        } catch (Throwable t) {
+            logWarn("handleMediaEjectSynchronously top error: " + t.getMessage());
         }
     }
 

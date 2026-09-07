@@ -261,9 +261,13 @@ object CarSvcTelemetry {
             val tmpFile = File(path)
             return try {
                 val process = Runtime.getRuntime().exec(
-                    arrayOf("/system/bin/sh", "-c", "dumpsys car_service > $path 2>&1")
+                    arrayOf("/system/bin/sh", "-c", "dumpsys -t 3 car_service > $path 2>&1")
                 )
-                process.waitFor()
+                val finished = process.waitFor(4, java.util.concurrent.TimeUnit.SECONDS)
+                if (!finished) {
+                    process.destroyForcibly()
+                    return null
+                }
                 if (!tmpFile.isFile) return null
                 val text = tmpFile.readText()
                 cachedDump = text

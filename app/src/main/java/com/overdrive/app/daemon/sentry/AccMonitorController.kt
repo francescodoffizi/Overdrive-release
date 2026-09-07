@@ -84,21 +84,7 @@ class AccMonitorController(
 
                     // 2. Fast property check
                     var accAnimStatus = execShell("getprop sys.accanim.status").trim()
-
-                    // 3. Cadenced CarService check: run when screen is ON, or every 9s in sentry, or when active
-                    val nowMs = System.currentTimeMillis()
-                    val shouldCheckCarService = !isScreenOff || !isCurrentlyAccOff || (nowMs - lastCarServiceCheckMs >= 9_000L)
-                    
-                    var isStandby = false
-                    var carPowerMode = ""
-                    if (shouldCheckCarService) {
-                        carPowerMode = execShell("dumpsys car_service 2>/dev/null | grep -i 'Power Mute State' -A 2 | grep 'current' | head -1").trim()
-                        isStandby = carPowerMode.contains("Standby") || carPowerMode.contains("Sleep") || carPowerMode.contains("Str") || carPowerMode.contains("4=") || carPowerMode.contains("8=") || carPowerMode.contains("5=")
-                        lastCarServiceCheckMs = nowMs
-                    } else if (isCurrentlyAccOff && isScreenOff) {
-                        // While screen is off and car was off, maintain standby without waking car_service
-                        isStandby = true
-                    }
+                    var isStandby = (accAnimStatus == "1" || accAnimStatus == "2")
 
                     if (accAnimStatus.isEmpty()) {
                         accAnimStatus = if (isScreenOff || isStandby) "1" else "0"
@@ -109,7 +95,7 @@ class AccMonitorController(
                     val wasAccOff = (lastAccAnimStatus != "0")
 
                     if (isAccOffNow != wasAccOff) {
-                        logger.info(">>> ACC STATE CHANGED: isAccOffNow=$isAccOffNow (wasAccOff=$wasAccOff, isStandby=$isStandby, screenOff=$isScreenOff, accAnim=$accAnimStatus, powerMode=$carPowerMode)")
+                        logger.info(">>> ACC STATE CHANGED: isAccOffNow=$isAccOffNow (wasAccOff=$wasAccOff, isStandby=$isStandby, screenOff=$isScreenOff, accAnim=$accAnimStatus)")
                         if (isAccOffNow) {
                             logger.info("!!! ACC OFF DETECTED (Standby/ScreenOff) -> ENTER SENTRY !!!")
                             onAccOff()
@@ -136,8 +122,7 @@ class AccMonitorController(
     
     /**
      * Check if display is OFF or non-interactive.
-     * Uses direct PowerManager Binder call when context is available (0 forks),
-     * falling back to a single dumpsys power query.
+     * Uses direct PowerManager Binder call (0 forks, 0 dumpsys).
      */
     private fun checkScreenOff(): Boolean {
         try {
@@ -149,13 +134,8 @@ class AccMonitorController(
                 }
             }
         } catch (t: Throwable) {
-            // Fall back to dumpsys
         }
-
-        val screenState = execShell("dumpsys power 2>/dev/null | grep -E -i 'Display Power: state=|mIsInteractive' | head -2").trim()
-        val isInteractive = !screenState.contains("mIsInteractive=false") && !screenState.contains("mIsInteractive: false")
-        val isDisplayOn = screenState.contains("state=ON")
-        return !isDisplayOn || !isInteractive
+        return false
     }
     
     /**
@@ -167,48 +147,17 @@ class AccMonitorController(
         pollingThread = null
     }
 
-    
     /**
-     * Log power state from all available sources for debugging.
+     * Log power state from lightweight system properties for debugging.
      */
     private fun logAllPowerSources() {
-        logger.info("=== Power State Snapshot ===")
-        
-        // 1. Driving state from byd_car_service
-        val drivingState = getDrivingState()
-        logger.info("Driving State: $drivingState")
-        
-        // 2. ACC animation status
-        val accAnimStatus = execShell("getprop sys.accanim.status")
-        logger.info("sys.accanim.status: $accAnimStatus")
-        
-        // 3. ACC animation service
-        val accAnimSvc = execShell("getprop init.svc.accanim")
-        logger.info("init.svc.accanim: $accAnimSvc")
-        
-        // 4. accmodemanager dirty flag
-        val accDump = execShell("dumpsys accmodemanager 2>/dev/null | head -5")
-        logger.info("accmodemanager: ${accDump.replace("\n", " | ")}")
-        
-        // 5. Screen state
-        val screenState = execShell("dumpsys power 2>/dev/null | grep -i 'Display Power' | head -1")
-        logger.info("Display Power: $screenState")
-        
-        logger.info("=== End Snapshot ===")
-    }
-    
-    /**
-     * Get driving state from byd_car_service.
-     */
-    private fun getDrivingState(): Int {
-        return try {
-            val output = execShell("dumpsys byd_car_service 2>/dev/null | grep 'Current Driving State'")
-            if (output.contains(":")) {
-                val value = output.split(":")[1].trim()
-                value.toInt()
-            } else -1
+        try {
+            val accAnimStatus = execShell("getprop sys.accanim.status").trim()
+            val accAnimSvc = execShell("getprop init.svc.accanim").trim()
+            val bootCompleted = execShell("getprop sys.boot_completed").trim()
+            logger.info("=== Power State Snapshot === sys.accanim.status=$accAnimStatus, init.svc.accanim=$accAnimSvc, boot=$bootCompleted, screenOff=${checkScreenOff()}")
         } catch (e: Exception) {
-            -1
+            logger.warn("Error capturing power snapshot: ${e.message}")
         }
     }
     
