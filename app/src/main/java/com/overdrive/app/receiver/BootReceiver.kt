@@ -209,9 +209,21 @@ class BootReceiver : BroadcastReceiver() {
                 armBlindSpotIfEnabled(context)
             }
             
-            // BYD ACC OFF - AccSentryDaemon handles sentry mode via bodywork listener
+            // BYD ACC OFF - schedule Wi-Fi re-arm after TsCarPower turnOffWifi finishes (~2.5s)
             "com.byd.action.ACC_OFF" -> {
-                Log.d(TAG, "ACC OFF received - AccSentryDaemon handles sentry mode")
+                Log.d(TAG, "ACC OFF received - scheduling Wi-Fi re-arm via ADB shell")
+                try {
+                    com.overdrive.app.launcher.AdbDaemonLauncher(context.applicationContext).executeShellCommand(
+                        "sleep 2.5 && (cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null) &",
+                        object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
+                            override fun onLog(message: String) {}
+                            override fun onLaunched() {}
+                            override fun onError(error: String) {}
+                        }
+                    )
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to schedule ACC-OFF Wi-Fi re-arm: ${t.message}")
+                }
             }
             
             // WiFi/Network events - restart daemons if WiFi is enabled

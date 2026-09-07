@@ -3568,6 +3568,13 @@ public class AccSentryDaemon {
         }
 
         log("Sentry mode ACTIVE");
+        new Thread(() -> {
+            try {
+                Thread.sleep(2500);
+                log("ACC OFF: Re-arming Wi-Fi radio via cmd wifi (UID 2000)...");
+                execShell("cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null");
+            } catch (Exception ignored) {}
+        }, "AccOffWifiRearm").start();
     }
 
     /**
@@ -5356,7 +5363,7 @@ public class AccSentryDaemon {
         // We use a lightweight check to avoid spamming the shell log
         // running it blindly is safer for persistence.
         ShellResult result = execShellResult(
-                CMD_WIFI_ENABLE(),
+                "cmd wifi set-wifi-enabled enabled 2>/dev/null || " + CMD_WIFI_ENABLE(),
                 DEFAULT_SHELL_TIMEOUT_MS,
                 () -> isKeepAliveCommitCurrent(transitionGeneration));
         if (!result.success && !result.canceled) {
