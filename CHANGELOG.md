@@ -4,6 +4,17 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+## [v51.5] - 2026-09-07
+
+- **Estensione Timer Ripresa Fotocamera e Prevenzione Contesa Qualcomm AIS (`DiLink5QCarCamBackend.java`, `BydCameraCoordinator.java`)**:
+  - **Debounce e Ripresa Post-Retromarcia (da 400ms a 3000ms)**: Su piattaforma DiLink 5.0 (`DiLink5QCarCamBackend.java`), esteso il delay di riacquisizione della fotocamera da 400 ms a 3000 ms dopo l'uscita dalla retromarcia (`GEAR_R` -> P/D). Ciò impedisce la collisione hardware tra `fast_cam_capture` e l'app panoramica 360 proprietaria di BYD (AVM), che rimane visualizzata a schermo durante le manovre a bassa velocità finché non si superano i 15 km/h o non si preme Home.
+  - **Verifica Stato Marcia al Risveglio**: Al termine del delay di 3000 ms, viene ricontrollata la marcia corrente: se l'auto è tornata in retromarcia (es. manovra di parcheggio multi-punto) o è in fase di transizione ACC-ON, la ripresa viene deferita o annullata, evitando spin-up e abbattimenti continui del processo hardware.
+  - **Ripresa Post-Risveglio ACC (da 2000ms a 4000ms)**: In `scheduleResumeAfterAccOn()`, aumentato il delay a 4000 ms per dare tempo completo a SystemUI, Wi-Fi, Bluetooth e HAL fotocamera di stabilizzarsi dopo il risveglio dallo standby.
+  - **Backoff e Prevenzione Crashloop Auto-Recovery**:
+    - Se `fast_cam_capture` esce con codice 42 (prelazione hardware da parte dell'app 360 nativa BYD), il supervisore attende 5000 ms prima di riprovare anziché 500 ms.
+    - Per qualsiasi altra uscita anomala, il backoff passa da 500 ms a 3000 ms con rivalutazione dello stato veicolo al risveglio prima di tentare il riavvio.
+  - **Cooperative Yield DiLink 4 (`BydCameraCoordinator.java`)**: Aumentato `REACQUIRE_DELAY_MS` da 200 ms a 1500 ms per consentire il completo rilascio dei buffer nativi e dei context EGL da parte dell'app AVM nativa prima della riapertura.
+
 ## [v51.4] - 2026-09-07
 
 - **Hardening Wi-Fi Background Keep-Awake, Force-Reconnect L2/L3 & Anti-DTIM Sleep (`AccSentryDaemon.java`)**:

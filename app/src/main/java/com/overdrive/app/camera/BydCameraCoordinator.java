@@ -45,7 +45,7 @@ public class BydCameraCoordinator {
     // Yield state
     private volatile boolean yielded = false;
     private volatile long yieldTimestamp = 0;
-    private static final long REACQUIRE_DELAY_MS = 200;  // Native app fully closed by onCloseCamera
+    private static final long REACQUIRE_DELAY_MS = 1500;  // Native app fully closed by onCloseCamera
 
     // Callback to PanoramicCameraGpu
     public interface CameraYieldCallback {

@@ -182,7 +182,7 @@ public class DiLink5QCarCamBackend {
                 t.setDaemon(true);
                 return t;
             });
-            // 2000 ms cooperative yield allows native BYD AVM / camera HAL and SystemUI to initialize cleanly
+            // 4000 ms cooperative yield allows native BYD AVM / camera HAL, SystemUI, and vehicle services to initialize cleanly
             sAccResumeExecutor.schedule(() -> {
                 sYieldedForAccOn = false;
                 if (hasActiveStreamingBackend()) {
@@ -194,7 +194,7 @@ public class DiLink5QCarCamBackend {
                     logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after ACC-ON yield...");
                     ensureHardwareProcess();
                 }
-            }, 2000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }, 4000, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 
@@ -223,7 +223,7 @@ public class DiLink5QCarCamBackend {
             }
             terminateHardwareProcess();
         } else if (oldGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
-            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 400ms...");
+            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 3000ms...");
             sYieldedForReverse = false;
             scheduleResumeAfterReverse();
         }
@@ -239,17 +239,22 @@ public class DiLink5QCarCamBackend {
                 t.setDaemon(true);
                 return t;
             });
+            // 3000ms cooperative yield allows native BYD 360/AVM view to close cleanly without AIS contention
             sGearResumeExecutor.schedule(() -> {
                 int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-                if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
+                if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
                     logger.info("Capture resumption cancelled: vehicle is still in REVERSE");
+                    return;
+                }
+                if (sYieldedForAccOn) {
+                    logger.info("Capture resumption deferred: vehicle is yielding for ACC-ON");
                     return;
                 }
                 if (hasActiveStreamingBackend()) {
                     logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after reverse yield...");
                     ensureHardwareProcess();
                 }
-            }, 400, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }, 3000, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 
@@ -373,9 +378,18 @@ public class DiLink5QCarCamBackend {
                             return;
                         }
 
-                        logger.warn("Qualcomm fast_cam_capture process exited unexpectedly (code " + exitCode + "). Triggering auto-recovery supervisor in 500ms...");
+                        // Exit 42 means native BYD app (e.g. 360 panoramic view) preempted AIS. Give it 5s to finish.
+                        // For other unexpected exits, wait 3s instead of 500ms to prevent rapid crashloops.
+                        long backoffMs = (exitCode == 42) ? 5000L : 3000L;
+                        logger.warn("Qualcomm fast_cam_capture process exited (code " + exitCode + "). Scheduling auto-recovery supervisor in " + backoffMs + "ms...");
                         try {
-                            Thread.sleep(500);
+                            Thread.sleep(backoffMs);
+                            // Re-verify vehicle state after backoff before respawning
+                            int postSleepGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                            if (postSleepGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse || sYieldedForAccOn) {
+                                logger.info("Suppressing auto-recovery: vehicle state changed during backoff");
+                                return;
+                            }
                             if (hasActiveStreamingBackend()) {
                                 ensureHardwareProcess();
                             }
