@@ -40,21 +40,13 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
     private var isWifiAssociated = false
     private var consecutiveWifiFailures = 0
     private var consecutiveWifiSuccesses = 0
-    private var isForcedDisconnected = false
-
-    // Recovery backoff settings (in ms)
-    private var recoveryBackoffMs = INITIAL_RECOVERY_INTERVAL_MS
 
     companion object {
         private const val TAG = "NetworkFailover"
 
         private const val CHECK_INTERVAL_MS = 20_000L // 20s between checks
         private const val PROBE_TIMEOUT_MS = 3_500     // 3.5s socket timeout
-        private const val STRIKES_FOR_DISCONNECT = 3   // 3 consecutive failures = 60s
-        private const val STRIKES_FOR_RECOVERY = 2     // 2 consecutive successes to confirm stable WLAN
-
-        private const val INITIAL_RECOVERY_INTERVAL_MS = 120_000L // 2 minutes initial backoff
-        private const val MAX_RECOVERY_INTERVAL_MS = 300_000L     // 5 minutes max backoff
+        private const val STRIKES_FOR_FAILOVER = 3    // 3 consecutive failures = 60s without internet
 
         @Volatile
         var isWifiWithInternet: Boolean = false
@@ -72,7 +64,6 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
         @JvmStatic
         fun isWifiHealthy(): Boolean {
             val inst = instance ?: return false
-            if (inst.isForcedDisconnected) return false
             if (isWifiWithInternet) return true
 
             // Fast fallback: check ConnectivityManager
@@ -120,9 +111,6 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                             if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) {
                                 isWifiWithInternet = true
                             }
-                            if (isForcedDisconnected) {
-                                log.info(TAG, "Wi-Fi re-connected during recovery window; verifying internet...")
-                            }
                             scheduleNextCheck(1000L)
                         }
                     }
@@ -159,12 +147,6 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
             val wlanActive = isWlanInterfaceUp()
             isWifiAssociated = wlanActive
 
-            if (isForcedDisconnected) {
-                // We are currently in forced disconnection (suppressing zombie Wi-Fi)
-                // The recovery timer handles attempts to reconnect.
-                return
-            }
-
             if (!wlanActive) {
                 // Wi-Fi is physically off or disconnected naturally
                 consecutiveWifiFailures = 0
@@ -177,113 +159,29 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
             val hasInternet = probeInternetConnectivity()
 
             if (hasInternet) {
-                isWifiWithInternet = true
-                consecutiveWifiSuccesses++
-                if (consecutiveWifiFailures > 0) {
-                    log.info(TAG, "Wi-Fi connectivity restored (successes=$consecutiveWifiSuccesses)")
+                if (!isWifiWithInternet) {
+                    log.info(TAG, "Wi-Fi internet access CONFIRMED! Routing directly via Wi-Fi.")
+                    isWifiWithInternet = true
+                    try {
+                        com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
+                    } catch (ignored: Throwable) {}
                 }
+                consecutiveWifiSuccesses++
                 consecutiveWifiFailures = 0
-                recoveryBackoffMs = INITIAL_RECOVERY_INTERVAL_MS
             } else {
-                isWifiWithInternet = false
+                if (isWifiWithInternet) {
+                    log.warn(TAG, "Wi-Fi has NO internet! Failing over Overdrive traffic to sing-box proxy.")
+                    isWifiWithInternet = false
+                    try {
+                        com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
+                    } catch (ignored: Throwable) {}
+                }
                 consecutiveWifiFailures++
                 consecutiveWifiSuccesses = 0
-                log.warn(TAG, "Wi-Fi associated but NO internet detected (strike $consecutiveWifiFailures/$STRIKES_FOR_DISCONNECT)")
-
-                if (consecutiveWifiFailures >= STRIKES_FOR_DISCONNECT) {
-                    handleZombieWifiDetected()
-                }
             }
         } catch (e: Exception) {
             log.warn(TAG, "Error in watchdog tick: ${e.message}")
         }
-    }
-
-    /**
-     * Wi-Fi is stuck in "Zombie" state: associated to local hotspot with no internet gateway.
-     * Force disconnect wlan0 so Overdrive routes via sing-box on vlan4 (T-Box SIM).
-     */
-    private fun handleZombieWifiDetected() {
-        log.warn(TAG, ">>> Zombie Wi-Fi detected! Forcing disconnect to failover to internal SIM (vlan4) <<<")
-        isForcedDisconnected = true
-        isWifiWithInternet = false
-        consecutiveWifiFailures = 0
-
-        try {
-            com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
-        } catch (ignored: Throwable) {}
-
-        // Disconnect wlan0 so traffic is not trapped in dead Wi-Fi route
-        execShell("cmd wifi disconnect 2>/dev/null")
-
-        // Schedule periodic recovery test with backoff
-        log.info(TAG, "Scheduled Wi-Fi recovery probe in ${recoveryBackoffMs / 1000}s")
-        workerHandler.postDelayed({
-            attemptWifiRecovery()
-        }, recoveryBackoffMs)
-
-        // Increment backoff for subsequent attempts (up to MAX_RECOVERY_INTERVAL_MS)
-        recoveryBackoffMs = (recoveryBackoffMs * 1.5).toLong().coerceAtMost(MAX_RECOVERY_INTERVAL_MS)
-    }
-
-    /**
-     * Periodic test to see if the Wi-Fi hotspot has regained cell reception.
-     */
-    private fun attemptWifiRecovery() {
-        if (!isRunning.get() || !isForcedDisconnected) return
-
-        log.info(TAG, "Attempting Wi-Fi recovery (cmd wifi reconnect)...")
-        execShell("cmd wifi reconnect 2>/dev/null")
-
-        // Give the radio 12 seconds to re-associate and acquire DHCP
-        workerHandler.postDelayed({
-            val wlanUp = isWlanInterfaceUp()
-            if (!wlanUp) {
-                log.info(TAG, "Wi-Fi recovery attempt: wlan0 did not associate; staying on SIM BYD")
-                scheduleNextRecoveryAttempt()
-                return@postDelayed
-            }
-
-            // Probe internet on the newly reconnected Wi-Fi
-            val internetOk = probeInternetConnectivity()
-            if (internetOk) {
-                log.info(TAG, "Wi-Fi recovery attempt: Internet REACHABLE! Validating stability (1/2)...")
-                // Test second probe after 5 seconds to prevent flapping
-                workerHandler.postDelayed({
-                    if (probeInternetConnectivity()) {
-                        log.info(TAG, ">>> Wi-Fi recovery CONFIRMED! Restoring primary WLAN operation <<<")
-                        isForcedDisconnected = false
-                        isWifiWithInternet = true
-                        consecutiveWifiFailures = 0
-                        consecutiveWifiSuccesses = STRIKES_FOR_RECOVERY
-                        recoveryBackoffMs = INITIAL_RECOVERY_INTERVAL_MS
-                        try {
-                            com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
-                        } catch (ignored: Throwable) {}
-                    } else {
-                        log.warn(TAG, "Wi-Fi recovery second strike failed; suppressing unstable Wi-Fi")
-                        reDisconnectZombieWifi()
-                    }
-                }, 5000L)
-            } else {
-                log.warn(TAG, "Wi-Fi recovery attempt: wlan0 associated but STILL NO INTERNET; staying on SIM BYD")
-                reDisconnectZombieWifi()
-            }
-        }, 12000L)
-    }
-
-    private fun reDisconnectZombieWifi() {
-        isWifiWithInternet = false
-        execShell("cmd wifi disconnect 2>/dev/null")
-        scheduleNextRecoveryAttempt()
-    }
-
-    private fun scheduleNextRecoveryAttempt() {
-        log.info(TAG, "Next Wi-Fi recovery attempt in ${recoveryBackoffMs / 1000}s")
-        workerHandler.postDelayed({
-            attemptWifiRecovery()
-        }, recoveryBackoffMs)
-        recoveryBackoffMs = (recoveryBackoffMs * 1.5).toLong().coerceAtMost(MAX_RECOVERY_INTERVAL_MS)
     }
 
     /**
