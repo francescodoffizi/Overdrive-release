@@ -39,7 +39,7 @@ public class AppUpdater {
 
     private static final String TAG = "AppUpdater";
     private static final String GITHUB_REPO = (BuildConfig.UPDATE_REPO != null && !BuildConfig.UPDATE_REPO.isEmpty())
-            ? BuildConfig.UPDATE_REPO : "francescodoffizi/Overdrive-release";
+            ? BuildConfig.UPDATE_REPO : "yash-srivastava/Overdrive-release";
     private static final String PREFS_NAME = "app_updater";
     // LEGACY (pre-channel) baseline key/file. Still read once by
     // migrateBaseline() to seed the per-channel "alpha" slot, then unused.
