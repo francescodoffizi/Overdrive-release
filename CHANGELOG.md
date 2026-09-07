@@ -2,7 +2,16 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
-## [In corso / Unreleased]
+## [v51.8] - 2026-09-07
+
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
+- **Prevenzione Conflitti Hardware AVM 360 Nativo e Crash SystemUI (`DiLink5QCarCamBackend.java`, `TsAvmCoordinator.java`, `AndroidManifest.xml`)**:
+  - **Rilevamento Attivo e Precedenza ad AVM 360 (`TsAvmCoordinator.java`, `DiLink5QCarCamBackend.java`)**: Integrato monitoraggio in tempo reale del processo (`com.byd.avm`) e dello stato del servizio AIDL di sistema (`com.ts.avm.AvmAndroidService`). Se l'app 360 nativa è attiva a video (durante manovre di parcheggio in R o D a bassa velocità, o attivazione da pulsante al volante), `fast_cam_capture` cede immediatamente il passo terminando il processo di cattura hardware e rimanendo in attesa finché AVM non è completamente chiuso.
+  - **Eliminazione Ripresa Cieca su Cambio Marcia R -> D**: `scheduleResumeAfterReverse()` ora verifica la reale chiusura di `com.byd.avm` prima di riattivare la registrazione, impedendo la contesa simultanea sul driver Qualcomm QCarCam/AIS.
+  - **Blindatura Finestra `MainActivity` (`AndroidManifest.xml`)**: Aggiunto `orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|fontScale|uiMode` a `MainActivity`, evitando distruzioni asincrone di finestra durante le commutazioni di layout e dock della barra inferiore di `SystemUI`.
+- **Azzeramento Immediato Falsa Ricarica in Marcia e Standby (`ChargingDetector.java`)**:
+  - In `recompute()`, se il veicolo è in marcia (`!inPark`: D, R, N) o se il sensore pistola indica cavo scollegato (`chargingGunState == 1`), lo stato OFF viene marcato come autoritativo immediato (`authoritativeOff = true`), scavalcando all'istante il debounce di 12 secondi ed eliminando la notifica residua di "veicolo in carica".
 
 ## [v51.7] - 2026-09-07
 

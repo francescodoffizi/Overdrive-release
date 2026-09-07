@@ -27,6 +27,21 @@ public class TsAvmCoordinator {
     private final Context context;
     private IAvmServiceInterface avmService;
     private final AtomicBoolean isBound = new AtomicBoolean(false);
+    private volatile int avmStatus = 0;
+
+    public interface AvmStateListener {
+        void onAvmStateChanged(boolean active);
+    }
+
+    private final java.util.List<AvmStateListener> listeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public void addListener(AvmStateListener l) {
+        if (l != null && !listeners.contains(l)) listeners.add(l);
+    }
+
+    public void removeListener(AvmStateListener l) {
+        if (l != null) listeners.remove(l);
+    }
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
@@ -37,12 +52,16 @@ public class TsAvmCoordinator {
 
             try {
                 int status = avmService.getAvmStatus();
+                avmStatus = status;
                 logger.info("Initial AVM Status: " + status);
+                notifyListeners(isAvmActive());
 
                 avmService.registerAvmStatusListener(new IAvmServiceListener.Stub() {
                     @Override
                     public void onAvmServiceStatusChanged(int status, String extra) {
+                        avmStatus = status;
                         logger.info(String.format("AVM status changed: status=%d, extra='%s'", status, extra));
+                        notifyListeners(status > 0 || isAvmProcessAlive());
                     }
                 });
             } catch (Exception e) {
@@ -54,9 +73,21 @@ public class TsAvmCoordinator {
         public void onServiceDisconnected(ComponentName name) {
             isBound.set(false);
             avmService = null;
+            avmStatus = 0;
             logger.info("Disconnected from com.ts.avm.AvmAndroidService");
+            notifyListeners(isAvmProcessAlive());
         }
     };
+
+    private void notifyListeners(boolean active) {
+        for (AvmStateListener l : listeners) {
+            try {
+                l.onAvmStateChanged(active);
+            } catch (Throwable t) {
+                logger.error("Error in AvmStateListener: " + t.getMessage(), t);
+            }
+        }
+    }
 
     public static TsAvmCoordinator getInstance(Context context) {
         if (sInstance == null) {
@@ -125,6 +156,45 @@ public class TsAvmCoordinator {
         if (sInstance != null) {
             return sInstance.isConnected();
         }
+        return false;
+    }
+
+    public static boolean isAvmProcessAlive() {
+        try {
+            java.io.File procDir = new java.io.File("/proc");
+            java.io.File[] pids = procDir.listFiles((dir, name) -> {
+                int len = name.length();
+                if (len == 0) return false;
+                for (int i = 0; i < len; i++) {
+                    char c = name.charAt(i);
+                    if (c < '0' || c > '9') return false;
+                }
+                return true;
+            });
+            if (pids != null) {
+                byte[] buf = new byte[128];
+                for (java.io.File p : pids) {
+                    java.io.File cmd = new java.io.File(p, "cmdline");
+                    if (cmd.exists()) {
+                        try (java.io.FileInputStream fis = new java.io.FileInputStream(cmd)) {
+                            int len = fis.read(buf);
+                            if (len > 0) {
+                                String s = new String(buf, 0, len);
+                                if (s.contains("com.byd.avm")) {
+                                    return true;
+                                }
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    public static boolean isAvmActive() {
+        if (isAvmProcessAlive()) return true;
+        if (sInstance != null && sInstance.avmStatus > 0) return true;
         return false;
     }
 

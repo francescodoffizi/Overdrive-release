@@ -201,6 +201,35 @@ public class DiLink5QCarCamBackend {
     private static volatile int sConsecutiveFailures = 0;
     private static volatile long sLastFailureTimeMs = 0;
     private static volatile long sLastGearChangeTimeMs = 0;
+    private static volatile boolean sAvmListenerRegistered = false;
+
+    private static synchronized void ensureAvmListenerRegistered() {
+        if (!sAvmListenerRegistered) {
+            sAvmListenerRegistered = true;
+            try {
+                android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+                if (ctx != null) {
+                    TsAvmCoordinator coord = TsAvmCoordinator.getInstance(ctx);
+                    coord.bind();
+                    coord.addListener(active -> {
+                        if (active) {
+                            logger.info("BYD native AVM (360) became ACTIVE: immediately yielding Qualcomm AIS hardware capture...");
+                            terminateHardwareProcess();
+                        } else {
+                            logger.info("BYD native AVM (360) became INACTIVE: scheduling cooperative capture resumption in 2500ms...");
+                            scheduleResumeAfterReverse();
+                        }
+                    });
+                }
+            } catch (Throwable t) {
+                logger.warn("Failed to register TsAvmCoordinator listener: " + t.getMessage());
+            }
+        }
+    }
+
+    public static boolean isAvmActive() {
+        return TsAvmCoordinator.isAvmActive();
+    }
 
     private static synchronized void ensureGearListenerRegistered() {
         if (!sGearListenerRegistered) {
@@ -217,6 +246,7 @@ public class DiLink5QCarCamBackend {
 
     public static void onGearChanged(int oldGear, int newGear) {
         sLastGearChangeTimeMs = System.currentTimeMillis();
+        ensureAvmListenerRegistered();
         if (newGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
             logger.info("Gear shifted to REVERSE: gracefully yielding Qualcomm AIS capture to native BYD 360 app...");
             sYieldedForReverse = true;
@@ -228,7 +258,7 @@ public class DiLink5QCarCamBackend {
             }
             terminateHardwareProcess();
         } else if (oldGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
-            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 3500ms...");
+            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 3500ms (checking AVM)...");
             sYieldedForReverse = false;
             scheduleResumeAfterReverse();
         } else {
@@ -246,7 +276,7 @@ public class DiLink5QCarCamBackend {
                 t.setDaemon(true);
                 return t;
             });
-            // 3500ms cooperative yield allows native BYD 360/AVM view to close cleanly without AIS contention
+            // Cooperative yield allows native BYD 360/AVM view to close cleanly without AIS contention
             sGearResumeExecutor.schedule(() -> {
                 int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
                 if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
@@ -257,11 +287,16 @@ public class DiLink5QCarCamBackend {
                     logger.info("Capture resumption deferred: vehicle is yielding for ACC-ON");
                     return;
                 }
+                if (isAvmActive()) {
+                    logger.info("Capture resumption deferred: BYD native AVM (360) is still active on screen. Waiting for AVM to close...");
+                    scheduleResumeAfterReverse();
+                    return;
+                }
                 if (hasActiveStreamingBackend()) {
-                    logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after reverse yield...");
+                    logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after reverse/AVM yield...");
                     ensureHardwareProcess();
                 }
-            }, 3500, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }, 3000, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 
@@ -293,6 +328,7 @@ public class DiLink5QCarCamBackend {
             try {
                 ensureGearListenerRegistered();
                 ensureAccListenerRegistered();
+                ensureAvmListenerRegistered();
 
                 if (sYieldedForAccOn) {
                     logger.info("Skipping ensureHardwareProcess: vehicle currently yielding for ACC-ON transition");
@@ -302,6 +338,11 @@ public class DiLink5QCarCamBackend {
                 int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
                 if (sYieldedForReverse || curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
                     logger.info("Skipping ensureHardwareProcess: vehicle currently in REVERSE (yielding to native AVM)");
+                    return;
+                }
+
+                if (isAvmActive()) {
+                    logger.info("Skipping ensureHardwareProcess: BYD native 360 camera (AVM) is currently ACTIVE (yielding camera hardware pipeline)");
                     return;
                 }
 

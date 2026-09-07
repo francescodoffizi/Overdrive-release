@@ -2091,6 +2091,14 @@ public final class ChargingDetector {
             next = false;
             source = "completed-session-barrier";
             authoritativeOff = true;
+        } else if (!inPark) {
+            next = false;
+            source = "driving-gear-not-charging";
+            authoritativeOff = true;
+        } else if (chargingGunState == 1) { // CHARGING_GUN_STATE_DISCONNECTED
+            next = false;
+            source = "gun-disconnected";
+            authoritativeOff = true;
         } else {
             // L1: BMS direct.
             boolean l1Says = bmsState == ChargingStateData.CHARGING_BATTERY_STATE_CHARGING

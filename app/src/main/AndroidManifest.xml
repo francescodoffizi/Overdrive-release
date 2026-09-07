@@ -252,7 +252,7 @@
             android:name="com.overdrive.app.ui.MainActivity"
             android:exported="true"
             android:screenOrientation="unspecified"
-            android:configChanges="keyboardHidden"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|fontScale|uiMode"
             android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
