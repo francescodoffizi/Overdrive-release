@@ -4,6 +4,13 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In sviluppo] - 2026-09-07
 
+- **Risoluzione Contesa Vold/CarPlay ed Eliminazione Dumpsys**:
+  - In corso di implementazione.
+
+## [v51.13] - 2026-09-07
+
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
 - **Stabilizzazione Risveglio & Prevenzione Freeze al Boot (DiLink 5.0 / SA8155P)**:
   - **Disarmo Riavvio Prematuro Telecamere (`DiLink5QCarCamBackend.java`)**: Rimosso l'auto-restart forzato a 4s di `fast_cam_capture` su ACC-ON; applicato periodo di grazia di sicurezza di 30s che sblocca il gate senza auto-spawn, demandando l'avvio delle telecamere solo a esplicita richiesta utente (Live View / Mosaic) o Sentry mode (ACC-OFF), eliminando la contesa con AVM e navigatore.
   - **Rollback Chiusura Forzata Navigatore Neusoft (`AccMonitor.java`, `AccSentryDaemon.java`)**: Eliminato `am force-stop com.neusoft.na.navigation` su ACC-OFF per preservare il ciclo di vita nativo Android ed evitare il pesante cold-boot concorrente all'accensione del veicolo e la corruzione della GPU Adreno (`validate_resource_memory_layout_metadata`).
