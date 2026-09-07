@@ -198,6 +198,10 @@ public class DiLink5QCarCamBackend {
         }
     }
 
+    private static volatile int sConsecutiveFailures = 0;
+    private static volatile long sLastFailureTimeMs = 0;
+    private static volatile long sLastGearChangeTimeMs = 0;
+
     private static synchronized void ensureGearListenerRegistered() {
         if (!sGearListenerRegistered) {
             sGearListenerRegistered = true;
@@ -212,6 +216,7 @@ public class DiLink5QCarCamBackend {
     }
 
     public static void onGearChanged(int oldGear, int newGear) {
+        sLastGearChangeTimeMs = System.currentTimeMillis();
         if (newGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
             logger.info("Gear shifted to REVERSE: gracefully yielding Qualcomm AIS capture to native BYD 360 app...");
             sYieldedForReverse = true;
@@ -223,9 +228,11 @@ public class DiLink5QCarCamBackend {
             }
             terminateHardwareProcess();
         } else if (oldGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
-            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 3000ms...");
+            logger.info("Gear shifted from REVERSE to " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": scheduling capture resumption in 3500ms...");
             sYieldedForReverse = false;
             scheduleResumeAfterReverse();
+        } else {
+            logger.info("Gear transition " + com.overdrive.app.monitor.GearMonitor.gearToString(oldGear) + " -> " + com.overdrive.app.monitor.GearMonitor.gearToString(newGear) + ": transient settle timer armed (2000ms)");
         }
     }
 
@@ -239,7 +246,7 @@ public class DiLink5QCarCamBackend {
                 t.setDaemon(true);
                 return t;
             });
-            // 3000ms cooperative yield allows native BYD 360/AVM view to close cleanly without AIS contention
+            // 3500ms cooperative yield allows native BYD 360/AVM view to close cleanly without AIS contention
             sGearResumeExecutor.schedule(() -> {
                 int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
                 if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
@@ -254,7 +261,7 @@ public class DiLink5QCarCamBackend {
                     logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after reverse yield...");
                     ensureHardwareProcess();
                 }
-            }, 3000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }, 3500, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 
@@ -276,6 +283,9 @@ public class DiLink5QCarCamBackend {
             sHardwareProcess = null;
         }
         gracefulStopProcess("fast_cam_capture");
+        try {
+            Runtime.getRuntime().exec(new String[]{"pkill", "-9", "-f", "/data/local/tmp/fast_cam_capture"}).waitFor(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {}
     }
 
     private static void ensureHardwareProcess() {
@@ -293,6 +303,14 @@ public class DiLink5QCarCamBackend {
                 if (sYieldedForReverse || curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R) {
                     logger.info("Skipping ensureHardwareProcess: vehicle currently in REVERSE (yielding to native AVM)");
                     return;
+                }
+
+                // Settle delay on gear transitions: give BYD native AVM / camera HAL 2000ms to stabilize
+                long timeSinceGearChange = System.currentTimeMillis() - sLastGearChangeTimeMs;
+                if (timeSinceGearChange < 2000L) {
+                    long settleDelay = 2000L - timeSinceGearChange;
+                    logger.info("Deferring ensureHardwareProcess by " + settleDelay + "ms for vehicle transition settle...");
+                    Thread.sleep(settleDelay);
                 }
 
                 // Ensure fast_cam_capture binary exists in /data/local/tmp and is up to date with APK assets
@@ -325,10 +343,14 @@ public class DiLink5QCarCamBackend {
                 }
 
                 String camArgs = getCameraMappingArgs();
-                ProcessBuilder pb = new ProcessBuilder(
-                        "/system/bin/sh", "-c",
-                        "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && exec " + binPath + " " + camArgs + " --socket @fast_cam.sock --time 0"
-                );
+                int myPid = android.os.Process.myPid();
+                // Watchdog: ensures fast_cam_capture terminates automatically if OverDrive parent process exits
+                String cmd = "APP_PID=" + myPid + "; "
+                        + "(while kill -0 $APP_PID 2>/dev/null; do sleep 2; done; killall -9 fast_cam_capture 2>/dev/null) & "
+                        + "export LD_LIBRARY_PATH=/vendor/lib64:/system/lib64:/data/local/tmp && "
+                        + "exec " + binPath + " " + camArgs + " --socket @fast_cam.sock --time 0";
+
+                ProcessBuilder pb = new ProcessBuilder("/system/bin/sh", "-c", cmd);
                 pb.redirectErrorStream(true);
                 sHardwareProcess = pb.start();
 
@@ -364,6 +386,14 @@ public class DiLink5QCarCamBackend {
 
                     if (exitCode == 42) {
                         logger.info("Qualcomm fast_cam_capture exited cleanly due to hardware preemption (exit code 42)");
+                    } else if (exitCode != 0) {
+                        long now = System.currentTimeMillis();
+                        if (now - sLastFailureTimeMs < 60000L) {
+                            sConsecutiveFailures++;
+                        } else {
+                            sConsecutiveFailures = 1;
+                        }
+                        sLastFailureTimeMs = now;
                     }
 
                     if (hasActiveStreamingBackend()) {
@@ -378,10 +408,22 @@ public class DiLink5QCarCamBackend {
                             return;
                         }
 
-                        // Exit 42 means native BYD app (e.g. 360 panoramic view) preempted AIS. Give it 5s to finish.
-                        // For other unexpected exits, wait 3s instead of 500ms to prevent rapid crashloops.
-                        long backoffMs = (exitCode == 42) ? 5000L : 3000L;
-                        logger.warn("Qualcomm fast_cam_capture process exited (code " + exitCode + "). Scheduling auto-recovery supervisor in " + backoffMs + "ms...");
+                        // Circuit breaker: backoff exponentially if failing repeatedly in short window
+                        long backoffMs;
+                        if (exitCode == 42) {
+                            backoffMs = 5000L;
+                        } else if (sConsecutiveFailures >= 3) {
+                            backoffMs = 30000L;
+                            logger.warn("Qualcomm fast_cam_capture CIRCUIT BREAKER tripped (" + sConsecutiveFailures
+                                    + " consecutive crashes in <60s). Pausing auto-recovery for 30s to protect GPU memory and system stability.");
+                        } else if (sConsecutiveFailures == 2) {
+                            backoffMs = 10000L;
+                            logger.warn("Qualcomm fast_cam_capture repeated exit (code " + exitCode + ", attempt 2/3). Scheduling recovery in 10s...");
+                        } else {
+                            backoffMs = 5000L;
+                            logger.warn("Qualcomm fast_cam_capture process exited (code " + exitCode + "). Scheduling auto-recovery in " + backoffMs + "ms...");
+                        }
+
                         try {
                             Thread.sleep(backoffMs);
                             // Re-verify vehicle state after backoff before respawning
@@ -694,6 +736,9 @@ public class DiLink5QCarCamBackend {
      * Called from native C++ streamClientLoop when a new zero-copy hardware frame is fully ready.
      */
     public static void onNativeFrameAvailable(long timestampNs) {
+        if (sConsecutiveFailures > 0) {
+            sConsecutiveFailures = 0;
+        }
         FrameListener listener = sFrameListener;
         if (listener != null) {
             listener.onFrameAvailable(timestampNs);

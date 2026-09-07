@@ -4,6 +4,17 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+## [v51.6] - 2026-09-07
+
+- **Prevenzione Crashloop `fast_cam_capture`, Esaurimento Buffer Adreno GPU (1024 slots) e Hard Reboot Sistema (`DiLink5QCarCamBackend.java`, `fast_cam_bridge.cpp`)**:
+  - **Circuit Breaker Auto-Recovery**: Tracciamento dei crash consecutivi di `fast_cam_capture` (<60s). Al terzo crash consecutivo il supervisore entra in protezione e attiva un backoff di 30 secondi (anziché riavviare all'infinito ogni 3s), azzerando l'accumulo di allocazioni ION e proteggendo la VRAM della GPU Adreno 640.
+  - **Prevenzione Saturazione Slot GPU Adreno**: In `fast_cam_bridge.cpp`, corretto il ciclo di disconnessione e `mmap`/`munmap`: ora esegue sempre la chiusura di tutti i file descriptor ricevuti e l'unmap delle regioni ION su ogni riconnessione, impedendo il raggiungimento del limite di 1024 slot GPU che portava a `SIGABRT` in `surfaceflinger` e `init`.
+  - **Watchdog Morte Processo Padre (`APP_PID`)**: Avvio di `fast_cam_capture` incapsulato con un watchdog shell che monitora il PID dell'app OverDrive (`kill -0 $APP_PID`). Se l'app esce, viene terminata o disinstallata, `fast_cam_capture` viene abbattuto immediatamente entro 2 secondi, garantendo l'assenza totale di processi orfani o zombie nel sistema.
+  - **Settle Delay Transizioni Cambio / Modalità di Guida (2000ms)**: Durante i cambi di marcia (es. P->D, D->P), inserito un delay di stabilizzazione di 2000ms prima di qualsiasi tentativo di avvio o ripresa, evitando contese hardware con il caricamento delle viste AVM/radar native di BYD.
+- **Risoluzione Visualizzazione Striscia Compressa e Stallo Rendering GL (`qcarcam_bridge.cpp`, `GpuSurveillancePipeline.java`)**:
+  - **Disaccoppiamento Trigger Mosaico da Cam 0**: In `streamClientLoop`, rimosso l'ancoraggio rigido a `slot == 0`: se la telecamera frontale (Cam 0) non produce frame o fallisce l'apertura, il bridge attiva il fallback temporale a cadenza 30 FPS (~33ms), evitando che il thread GL resti bloccato (`GL thread blocked for 8258ms`).
+  - **Default 2x2 Decimated Mosaic (1920x1080)**: Impostata la modalità attiva predefinita su 4 (mosaico 2x2 composito 1920x1080 a 4 telecamere) sia nel bridge nativo C++ che all'avvio della pipeline in `GpuSurveillancePipeline.java`, eliminando la visualizzazione a striscia compressa orizzontale non proporzionata e garantendo il corretto formato 16:9 sia per la registrazione sentry che per la visualizzazione live.
+
 ## [v51.5] - 2026-09-07
 
 - **Estensione Timer Ripresa Fotocamera e Prevenzione Contesa Qualcomm AIS (`DiLink5QCarCamBackend.java`, `BydCameraCoordinator.java`)**:

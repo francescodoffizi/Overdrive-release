@@ -22,13 +22,18 @@ struct FastCamClientCtx {
 
 FastCamClientCtx* fast_cam_client_create(void) {
     FastCamClientCtx* ctx = (FastCamClientCtx*)calloc(1, sizeof(FastCamClientCtx));
-    if (ctx) ctx->sock_fd = -1;
+    if (ctx) {
+        ctx->sock_fd = -1;
+        for (int i = 0; i < FAST_CAM_MAX_TOTAL_BUFS; i++) {
+            ctx->received_fds[i] = -1;
+        }
+    }
     return ctx;
 }
 
 void fast_cam_client_disconnect(FastCamClientCtx* ctx) {
     if (!ctx) return;
-    for (uint32_t i = 0; i < ctx->handshake.total_fds; i++) {
+    for (int i = 0; i < FAST_CAM_MAX_TOTAL_BUFS; i++) {
         if (ctx->mapped_ptrs[i]) {
             munmap(ctx->mapped_ptrs[i], 4992000);
             ctx->mapped_ptrs[i] = NULL;
@@ -38,6 +43,7 @@ void fast_cam_client_disconnect(FastCamClientCtx* ctx) {
             ctx->received_fds[i] = -1;
         }
     }
+    memset(&ctx->handshake, 0, sizeof(ctx->handshake));
     if (ctx->sock_fd >= 0) {
         close(ctx->sock_fd);
         ctx->sock_fd = -1;
@@ -93,20 +99,32 @@ bool fast_cam_client_connect(FastCamClientCtx* ctx, const char* sock_path) {
         return false;
     }
 
+    for (int i = 0; i < FAST_CAM_MAX_TOTAL_BUFS; i++) {
+        ctx->received_fds[i] = -1;
+    }
+
     // Receive handshake and all passed ION FDs via SCM_RIGHTS
     int num_received = 0;
     int rc = recv_fds(ctx->sock_fd, ctx->received_fds, FAST_CAM_MAX_TOTAL_BUFS,
                       &num_received, &ctx->handshake, sizeof(ctx->handshake));
     if (rc <= 0 || ctx->handshake.magic != FAST_CAM_MAGIC) {
+        for (int i = 0; i < num_received; i++) {
+            if (ctx->received_fds[i] >= 0) {
+                close(ctx->received_fds[i]);
+                ctx->received_fds[i] = -1;
+            }
+        }
         fast_cam_client_disconnect(ctx);
         return false;
     }
 
     // Map each received ION FD into process virtual address space (Zero-Copy)
     for (uint32_t i = 0; i < ctx->handshake.total_fds; i++) {
-        ctx->mapped_ptrs[i] = mmap(NULL, 4992000, PROT_READ, MAP_SHARED, ctx->received_fds[i], 0);
-        if (ctx->mapped_ptrs[i] == MAP_FAILED) {
-            ctx->mapped_ptrs[i] = NULL;
+        if (ctx->received_fds[i] >= 0) {
+            ctx->mapped_ptrs[i] = mmap(NULL, 4992000, PROT_READ, MAP_SHARED, ctx->received_fds[i], 0);
+            if (ctx->mapped_ptrs[i] == MAP_FAILED) {
+                ctx->mapped_ptrs[i] = NULL;
+            }
         }
     }
 

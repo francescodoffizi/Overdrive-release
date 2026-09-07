@@ -2224,6 +2224,10 @@ public class GpuSurveillancePipeline {
         // is re-applied when enableSurveillance() runs).
         applyActiveLayoutProfile();
 
+        if (com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.isSupported()) {
+            com.overdrive.app.camera.dilink5.DiLink5QCarCamBackend.setActiveCamera(4); // 2x2 Decimated Mosaic
+        }
+
         // Camera FPS config — must match the encoder FPS used above (loadTargetFps())
         // so that camera frame delivery rate matches the encoder's KEY_FRAME_RATE.
         camera.setTargetFps(fps);

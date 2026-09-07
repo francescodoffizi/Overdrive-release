@@ -49,7 +49,7 @@ static inline uint64_t getCurrentNanoTime() {
 }
 
 std::atomic<bool> g_streaming{false};
-std::atomic<int> g_active_camera{0};
+std::atomic<int> g_active_camera{4}; // Default to 4 (2x2 Decimated Mosaic) for full panoramic surveillance
 pthread_t g_streamThread = 0;
 
 // Completely decoupled CPU double-buffer pool for GL_TEXTURE_2D upload via glTexSubImage2D.
@@ -292,6 +292,8 @@ void* streamClientLoop(void* arg) {
     int current_win_h = 0;
     uint32_t rendered_frames = 0;
 
+    uint64_t last_composite_ts_ns = 0;
+
     while (g_streaming.load()) {
         if (!client.isConnected()) {
             {
@@ -340,10 +342,22 @@ void* streamClientLoop(void* arg) {
         int target_w = FRAME_WIDTH_1080P;
         int target_h = FRAME_HEIGHT_1080P;
 
+        uint64_t now_ns = getCurrentNanoTime();
+        bool should_compose = false;
+        if (rendered_frames == 0) {
+            should_compose = true;
+        } else if (cam_ptrs[0] != nullptr) {
+            // Front camera is active: anchor on slot == 0 for smooth 30 FPS cadence
+            if (slot == 0) should_compose = true;
+        } else {
+            // Front camera is missing or failed: fallback anchor on 30 FPS interval (~33ms)
+            if (now_ns - last_composite_ts_ns >= 33333333ULL) should_compose = true;
+        }
+
         if (desired_cam == 5) {
             // Mode 5 = 4K Ultra-HD Native Grid (3840x2160, 100% native sensor pixels 16:9)
-            // Anchor on Cam 0 (slot == 0, Front) arriving at 30 FPS to avoid 120 FPS CPU overload
-            if (slot == 0 || rendered_frames == 0) {
+            if (should_compose) {
+                last_composite_ts_ns = now_ns;
                 if (!mosaic_buf_4k) {
                     mosaic_buf_4k = std::make_unique<uint8_t[]>(FRAME_WIDTH_4K * FRAME_HEIGHT_4K * 2);
                 }
@@ -359,8 +373,8 @@ void* streamClientLoop(void* arg) {
             }
         } else if (desired_cam == 4) {
             // Mode 4 = 2x2 Decimated Mosaic (1920x1080)
-            // Anchor on Cam 0 (slot == 0, Front) arriving at 30 FPS to avoid 120 FPS CPU overload
-            if (slot == 0 || rendered_frames == 0) {
+            if (should_compose) {
+                last_composite_ts_ns = now_ns;
                 const uint8_t* p0 = cam_ptrs[0] ? cam_ptrs[0] : frame.pixels;
                 const uint8_t* p1 = cam_ptrs[1] ? cam_ptrs[1] : p0;
                 const uint8_t* p2 = cam_ptrs[2] ? cam_ptrs[2] : p0;
@@ -375,6 +389,9 @@ void* streamClientLoop(void* arg) {
             // Specific single camera channel requested (0..3 surround or 6 internal dashcam)
             if (slot == desired_cam) {
                 // Vertical center-crop 1920x1300 to 1920x1080 (110 rows margin top/bottom)
+                render_pixels = frame.pixels + (110 * 1920 * 2);
+            } else if (cam_ptrs[desired_cam] == nullptr && rendered_frames == 0) {
+                // First frame fallback if requested camera hasn't arrived
                 render_pixels = frame.pixels + (110 * 1920 * 2);
             }
             target_w = FRAME_WIDTH_1080P;
