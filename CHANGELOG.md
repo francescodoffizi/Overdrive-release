@@ -1,6 +1,13 @@
 # Changelog
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
+## [v51.10] - 2026-09-07
+
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
+- **Chiusura Automatica Navigatore DiLink (`com.neusoft.na.navigation`) ad ACC OFF (`AccMonitor.java`, `AccSentryDaemon.java`)**:
+  - Al rilevamento dello spegnimento del veicolo (ACC OFF / ingresso in Sentry Mode), viene eseguito `am force-stop com.neusoft.na.navigation` (in modo asincrono su `AccMonitor.notifyAccEdge` e al completamento del setup sentry in `AccSentryDaemon.applySentrySetupState`).
+  - Elimina il busy-loop di polling continuo del motore di navigazione Neusoft (`:OneCore`) a veicolo spento, che altrimenti saturava un intero core CPU al 113% e occupava oltre 500 MB di RAM durante la sosta a schermo spento.
 
 ## [v51.9] - 2026-09-07
 

@@ -249,6 +249,21 @@ public class AccMonitor {
             } catch (Throwable t) {
                 CameraDaemon.log("notifyAccEdge ACC-off cluster force-close failed: " + t.getMessage());
             }
+            // ACC-OFF: terminate the factory navigation process (com.neusoft.na.navigation).
+            // Prevents ~113% CPU busy-loop and 500MB memory consumption while the vehicle is parked.
+            try {
+                new Thread(() -> {
+                    try {
+                        CameraDaemon.log("ACC-off edge: stopping factory navigation (com.neusoft.na.navigation)");
+                        Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", "am force-stop com.neusoft.na.navigation 2>/dev/null"});
+                        p.waitFor();
+                    } catch (Throwable t) {
+                        CameraDaemon.log("notifyAccEdge ACC-off nav stop failed: " + t.getMessage());
+                    }
+                }, "NavStop-AccOff").start();
+            } catch (Throwable t) {
+                CameraDaemon.log("notifyAccEdge ACC-off nav stop dispatch failed: " + t.getMessage());
+            }
             return;
         }
         // ACC-ON: wake the panel from THIS process too. AccSentryDaemon already
