@@ -2,6 +2,16 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
+## [v51.9] - 2026-09-07
+
+- **Ripristino Live View post-AVM con Registrazione su NONE (`TsAvmCoordinator.java`, `DiLink5QCarCamBackend.java`, `GpuSurveillancePipeline.java`)**:
+  - Sostituita la verifica statica su `/proc` in `TsAvmCoordinator.isAvmActive()` con il controllo dinamico dell'attività foreground su schermo (`mResumedActivity`): in questo modo, il fatto che il processo Android `com.byd.avm` rimanga memorizzato in cache non blocca più indefinitamente la riattivazione hardware di `fast_cam_capture`.
+  - In `DiLink5QCarCamBackend.java`, aggiornato `isYielded()` includendo `isAvmActive()` per evitare falsi allarmi del frame-stall detector GL durante l'uso dell'AVM.
+  - In `hasActiveStreamingBackend()`, aggiunta la verifica di `pipeline.isStreamingEnabled()` e la presenza di client WebSocket attivi (`hasActiveStreamClients()`), garantendo il rilancio del processo di cattura anche a registrazione disattivata (`recordingMode == NONE`).
+- **Eliminazione Falso Stato "Charging" e "Plugged" in Park (`CarSvcChargeSessionAdmit.java`, `CarSvcChargingDebounce.java`, `CarSvcTelemetry.kt`)**:
+  - Risolto l'aggancio indebito su consumi stazionari di cabina (clima/infotainment ~1.2 kW): `CarSvcChargeSessionAdmit` ora rifiuta ammissioni per potenze inferiori a 3.0 kW (`STRONG_KW`) se il cavo non è fisicamente inserito (`gunConnected == false`).
+  - In `CarSvcTelemetry.kt`, aggiunto fallback su `VehicleDataMonitor` per conoscere lo stato del connettore anche se `dumpsys car_service` non ha ancora emesso l'evento; se il connettore risulta scollegato (`gun == 0`), `sessionAdmit.reset()` e `chargingDebounce.reset()` azzerano istantaneamente lo stato di ricarica senza ritardi di debounce.
+
 ## [v51.8] - 2026-09-07
 
 > **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.

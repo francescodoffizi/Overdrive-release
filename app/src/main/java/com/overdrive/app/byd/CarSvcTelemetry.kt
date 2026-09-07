@@ -575,7 +575,13 @@ object CarSvcTelemetry {
      */
     fun gunConnected(): Int {
         val raw = stickyInt(dumpsysText(), PROP_CHARGING_GUN_STATE, 0, 1)
-        return if (raw == 0 || raw == 1) raw else -1
+        if (raw == 0 || raw == 1) return raw
+        try {
+            val halGun = com.overdrive.app.monitor.VehicleDataMonitor.getInstance()?.vd?.chargingGunState ?: -1
+            if (halGun == 1) return 0
+            if (halGun in 2..4) return 1
+        } catch (ignored: Throwable) {}
+        return -1
     }
 
     /**
@@ -1110,21 +1116,21 @@ object CarSvcTelemetry {
             val gear = gearValue()
             val speed = resolvedSpeedKmh()
             val notDriving = (gear == GEAR_PARK) || (speed == 0) || (gear == -1 && speed == -1)
-            val charging = sessionAdmit.admit(
-                    rawCharging, notDriving, pluggedBase, snapshot[1],
-                    now)
 
-            // Debounce the DISPLAYED charging/plugged/powerKw too, not just the
-            // feed into the session-tracking manager below. A durably-open
-            // session with real recorded power samples is exactly what this
-            // debounce protects: a single missed/blipped car_service read
-            // (confirmed this session to happen even mid-charge, with no
-            // change on the vehicle side) previously flickered the dashboard
-            // straight to charging=false while the session stayed open
-            // underneath it -- the two could visibly disagree. Held for
-            // NOT_CHARGING_DEBOUNCE_MS (60s) after the last real charging=true
-            // reading before actually reporting false.
-            val debouncedCharging = chargingDebounce.apply(charging, now)
+            val debouncedCharging: Boolean
+            if (gun == 0) {
+                // Physical gun is explicitly disconnected: impossible to charge.
+                // Reset session admit and debounce immediately so standby cabin load
+                // (HVAC/screens/electronics ~1.2 kW in Park) never latches false "charging" / "plugged".
+                sessionAdmit.reset()
+                chargingDebounce.reset()
+                debouncedCharging = false
+            } else {
+                val charging = sessionAdmit.admit(
+                        rawCharging, notDriving, pluggedBase, snapshot[1],
+                        now)
+                debouncedCharging = chargingDebounce.apply(charging, now)
+            }
             val plugged = notDriving && (pluggedBase || debouncedCharging)
 
             feedSessionManager(debouncedCharging)

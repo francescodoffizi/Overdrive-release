@@ -159,43 +159,45 @@ public class TsAvmCoordinator {
         return false;
     }
 
-    public static boolean isAvmProcessAlive() {
+    private static volatile long sLastForegroundCheckMs = 0;
+    private static volatile boolean sCachedAvmForeground = false;
+
+    /**
+     * Checks if the BYD AVM 360 camera app is currently resumed / visible in the foreground.
+     * Cached with a 500ms TTL to avoid repeated shell executions.
+     */
+    public static boolean isAvmForeground() {
+        long now = System.currentTimeMillis();
+        if (now - sLastForegroundCheckMs < 500L) {
+            return sCachedAvmForeground;
+        }
+        sLastForegroundCheckMs = now;
+        boolean foreground = false;
         try {
-            java.io.File procDir = new java.io.File("/proc");
-            java.io.File[] pids = procDir.listFiles((dir, name) -> {
-                int len = name.length();
-                if (len == 0) return false;
-                for (int i = 0; i < len; i++) {
-                    char c = name.charAt(i);
-                    if (c < '0' || c > '9') return false;
-                }
-                return true;
+            Process p = Runtime.getRuntime().exec(new String[]{
+                    "/system/bin/sh", "-c",
+                    "dumpsys activity activities | grep -m 1 'mResumedActivity'"
             });
-            if (pids != null) {
-                byte[] buf = new byte[128];
-                for (java.io.File p : pids) {
-                    java.io.File cmd = new java.io.File(p, "cmdline");
-                    if (cmd.exists()) {
-                        try (java.io.FileInputStream fis = new java.io.FileInputStream(cmd)) {
-                            int len = fis.read(buf);
-                            if (len > 0) {
-                                String s = new String(buf, 0, len);
-                                if (s.contains("com.byd.avm")) {
-                                    return true;
-                                }
-                            }
-                        } catch (Throwable ignored) {}
-                    }
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()))) {
+                String line = reader.readLine();
+                if (line != null && (line.contains("com.byd.avm") || line.contains("com.ts.avm"))) {
+                    foreground = true;
                 }
             }
+            p.waitFor();
         } catch (Throwable ignored) {}
-        return false;
+        sCachedAvmForeground = foreground;
+        return foreground;
+    }
+
+    public static boolean isAvmProcessAlive() {
+        return isAvmForeground();
     }
 
     public static boolean isAvmActive() {
-        if (isAvmProcessAlive()) return true;
         if (sInstance != null && sInstance.avmStatus > 0) return true;
-        return false;
+        return isAvmForeground();
     }
 
     public synchronized void unbind() {

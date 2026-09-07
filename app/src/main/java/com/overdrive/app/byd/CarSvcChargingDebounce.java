@@ -34,4 +34,9 @@ final class CarSvcChargingDebounce {
         notChargingSinceMs = 0L;
         return false;
     }
+
+    synchronized void reset() {
+        armed = false;
+        notChargingSinceMs = 0L;
+    }
 }

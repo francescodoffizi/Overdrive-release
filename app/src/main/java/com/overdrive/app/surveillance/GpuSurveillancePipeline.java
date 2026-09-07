@@ -8770,6 +8770,11 @@ public class GpuSurveillancePipeline {
         return streamingEnabled;
     }
 
+    public boolean hasActiveStreamClients() {
+        com.overdrive.app.streaming.WebSocketStreamServer ws = wsStreamServer;
+        return ws != null && ws.hasActiveClients();
+    }
+
     /**
      * Re-runs Od.authorize() to recover from a transient boot-time
      * authorization failure. enableStreamingInternal() authorizes once at

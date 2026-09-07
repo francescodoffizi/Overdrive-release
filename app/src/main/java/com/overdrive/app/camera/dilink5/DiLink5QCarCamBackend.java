@@ -81,7 +81,7 @@ public class DiLink5QCarCamBackend {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
                     com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
-            if (pipeline != null && pipeline.isRunning()) {
+            if (pipeline != null && (pipeline.isRunning() || pipeline.isStreamingEnabled() || pipeline.hasActiveStreamClients())) {
                 return true;
             }
         } catch (Throwable ignored) {}
@@ -795,7 +795,7 @@ public class DiLink5QCarCamBackend {
     }
 
     public static boolean isYielded() {
-        return sYieldedForReverse || sYieldedForAccOn;
+        return sYieldedForReverse || sYieldedForAccOn || isAvmActive();
     }
 
     /**

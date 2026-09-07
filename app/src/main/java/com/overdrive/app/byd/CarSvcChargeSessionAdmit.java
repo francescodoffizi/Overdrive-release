@@ -49,19 +49,13 @@ final class CarSvcChargeSessionAdmit {
             return true;
         }
         if (latched && weak) return true;
-        if (weak) {
-            if (weakSinceMs == 0L) weakSinceMs = nowMs;
-            if (nowMs - weakSinceMs >= SUSTAIN_MS) {
-                latched = true;
-                return true;
-            }
-            return false;
-        }
+        // Standby cabin load (HVAC, screens, 12V DC-DC) routinely draws 1.0 - 1.5 kW in Park.
+        // Weak power (< 3.0 kW) must never open a fresh session without gunConnected == true.
         reset();
         return false;
     }
 
-    private void reset() {
+    synchronized void reset() {
         latched = false;
         weakSinceMs = 0L;
     }
