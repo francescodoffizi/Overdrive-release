@@ -177,29 +177,16 @@ public class DiLink5PowerDiagnostics {
                     }
                 }
 
-                // Wi-Fi Reconnection with Exponential Backoff (prevents IPC/binder saturation)
+                // Passive Wi-Fi observation (native Android auto-reconnect handles link association safely)
                 if (!wifiConnected) {
-                    if (now - lastWifiReconnectAttempt >= currentWifiBackoffMs) {
+                    if (now - lastWifiReconnectAttempt >= 60_000L) {
                         lastWifiReconnectAttempt = now;
-                        logger.info("Wi-Fi disconnected. Proactive reconnect attempt (backoff interval: " + (currentWifiBackoffMs / 1000) + "s)");
-                        currentWifiBackoffMs = Math.min(currentWifiBackoffMs * 2, 120_000L); // Cap at 2 minutes
-
-                        if (wm != null) {
-                            try {
-                                if (!wm.isWifiEnabled()) {
-                                    wm.setWifiEnabled(true);
-                                }
-                                wm.reconnect();
-                            } catch (Throwable ignored) {}
-                        }
+                        logger.debug("Wi-Fi not associated (waiting for native Android auto-connection)");
                     }
-                } else {
-                    // Reset backoff once connection is healthy
-                    currentWifiBackoffMs = 15_000L;
                 }
 
-                // 3. Hardware Camera Status (Sampled every 6 seconds to avoid constant pgrep forks)
-                if (now - lastQcarcamSampleTime >= 6_000L) {
+                // 3. Hardware Camera Status (Sampled every 10 seconds to avoid pgrep overhead)
+                if (now - lastQcarcamSampleTime >= 10_000L) {
                     lastQcarcamSampleTime = now;
                     cachedQcarcamPid = execShell("pgrep -f fast_cam_capture").trim();
                     cachedQcarcamRunning = !cachedQcarcamPid.isEmpty();
@@ -228,7 +215,7 @@ public class DiLink5PowerDiagnostics {
 
                 appendLog(logFile, entry);
 
-                Thread.sleep(2000);
+                Thread.sleep(10000);
             } catch (InterruptedException e) {
                 break;
             } catch (Throwable t) {

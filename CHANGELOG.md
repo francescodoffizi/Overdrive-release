@@ -2,6 +2,14 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
+## [In sviluppo] - 2026-09-07
+
+- **Stabilizzazione Risveglio & Prevenzione Freeze al Boot (DiLink 5.0 / SA8155P)**:
+  - **Disarmo Riavvio Prematuro Telecamere (`DiLink5QCarCamBackend.java`)**: Rimosso l'auto-restart forzato a 4s di `fast_cam_capture` su ACC-ON; applicato periodo di grazia di sicurezza di 30s che sblocca il gate senza auto-spawn, demandando l'avvio delle telecamere solo a esplicita richiesta utente (Live View / Mosaic) o Sentry mode (ACC-OFF), eliminando la contesa con AVM e navigatore.
+  - **Rollback Chiusura Forzata Navigatore Neusoft (`AccMonitor.java`, `AccSentryDaemon.java`)**: Eliminato `am force-stop com.neusoft.na.navigation` su ACC-OFF per preservare il ciclo di vita nativo Android ed evitare il pesante cold-boot concorrente all'accensione del veicolo.
+  - **Disattivazione Watchdog Rete Shell (`OverdriveApplication.kt`, `NetworkFailoverWatchdog.kt`)**: Rimosso l'avvio automatico del watchdog e sanitizzati i comandi shell distruttivi (`svc wifi disable`, `cmd wifi disconnect`) per impedire la saturazione dei thread Binder di `system_server`.
+  - **Silenziamento Diagnostica Energetica (`DiLink5PowerDiagnostics.java`)**: Rimossa l'invocazione periodica di `wm.reconnect()` e ridotta la frequenza di campionamento a 10s per azzerare l'overhead della CPU e dei processi shell durante l'accensione.
+
 ## [v51.12] - 2026-09-07
 
 > **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.

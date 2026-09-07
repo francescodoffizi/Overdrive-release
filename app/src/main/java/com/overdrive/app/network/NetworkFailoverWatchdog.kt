@@ -177,8 +177,8 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
         isForcedDisconnected = true
         consecutiveWifiFailures = 0
 
-        // Force disconnect via shell command
-        execShell("cmd wifi disconnect 2>/dev/null || svc wifi disable 2>/dev/null")
+        // Passive observation only; avoid invasive shell svc/cmd calls that deadlock system_server
+        log.warn(TAG, "Wi-Fi link unroutable to internet, staying passive to protect system_server")
 
         // Schedule periodic recovery test with backoff
         log.info(TAG, "Scheduled Wi-Fi recovery probe in ${recoveryBackoffMs / 1000}s")

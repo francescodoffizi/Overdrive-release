@@ -156,7 +156,10 @@ public class DiLink5QCarCamBackend {
                 }
             }
             terminateHardwareProcess();
-            scheduleResumeAfterAccOn();
+            // Disarm automatic hardware capture resumption during vehicle start/wake.
+            // System services (AVM, factory navigation, cluster, display) require uninhibited access.
+            // Arm a 30s grace period that only clears the yield flag without force-spawning the daemon.
+            scheduleGraceClearAfterAccOn();
         } else {
             logger.info("ACC switched to OFF: entering Sentry mode capture");
             sYieldedForAccOn = false;
@@ -172,29 +175,22 @@ public class DiLink5QCarCamBackend {
         }
     }
 
-    private static void scheduleResumeAfterAccOn() {
+    private static void scheduleGraceClearAfterAccOn() {
         synchronized (sAccLock) {
             if (sAccResumeExecutor != null) {
                 sAccResumeExecutor.shutdownNow();
             }
             sAccResumeExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "fast-cam-acc-resume");
+                Thread t = new Thread(r, "fast-cam-acc-grace");
                 t.setDaemon(true);
                 return t;
             });
-            // 4000 ms cooperative yield allows native BYD AVM / camera HAL, SystemUI, and vehicle services to initialize cleanly
+            // 30-second safe grace window: clears the yield lock after system stabilization,
+            // but NEVER auto-spawns hardware processes. Hardware capture will only start on-demand.
             sAccResumeExecutor.schedule(() -> {
+                logger.info("ACC-ON stabilization grace period expired (30s): clearing yield gate (capture remains idle until requested)");
                 sYieldedForAccOn = false;
-                if (hasActiveStreamingBackend()) {
-                    int curGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-                    if (curGear == com.overdrive.app.monitor.GearMonitor.GEAR_R || sYieldedForReverse) {
-                        logger.info("Capture resumption after ACC-ON deferred: vehicle is in REVERSE");
-                        return;
-                    }
-                    logger.info("Resuming Qualcomm fast_cam_capture hardware pipeline after ACC-ON yield...");
-                    ensureHardwareProcess();
-                }
-            }, 4000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }, 30000, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 

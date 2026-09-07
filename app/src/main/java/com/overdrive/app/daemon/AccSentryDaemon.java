@@ -3523,7 +3523,6 @@ public class AccSentryDaemon {
             return false;
         }
         log("Sentry mode setup complete");
-        execShell("am force-stop com.neusoft.na.navigation 2>/dev/null");
         return true;
     }
 
