@@ -116,10 +116,14 @@ public class LocationSidecarService extends Service implements LocationListener 
         // Create notification channel FIRST
         createNotificationChannel();
         
-        // FIX #1: Load previous location immediately from disk cache.
-        // Even if GPS is currently off/dead, we report where the car was last seen.
-        // This prevents the "0,0 silence trap" when service restarts.
-        loadFromLocalCache();
+        // Offload disk cache reading and location updates initialization to worker looper
+        // to keep onCreate execution time under 10ms and avoid MainThreadMonitor warnings.
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                loadFromLocalCache();
+            }
+        });
         
         // Check location permission BEFORE starting foreground with location type
         // Android 14+ (SDK 34+) requires runtime permission to be granted before
@@ -165,8 +169,10 @@ public class LocationSidecarService extends Service implements LocationListener 
                             }
                         }
                         
-                        startLocationUpdates();
-                        startPeriodicSender();
+                        handler.post(() -> {
+                            startLocationUpdates();
+                            startPeriodicSender();
+                        });
                     } else {
                         Log.d(TAG, "Still waiting for location permission...");
                         handler.postDelayed(this, 5000); // Check every 5 seconds
@@ -178,11 +184,14 @@ public class LocationSidecarService extends Service implements LocationListener 
         
         permissionGranted = true;
         
-        // Start location updates
-        startLocationUpdates();
-        
-        // Start periodic sender
-        startPeriodicSender();
+        // Start location updates & periodic sender on worker looper
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                startLocationUpdates();
+                startPeriodicSender();
+            }
+        });
     }
     
     private void startPeriodicSender() {

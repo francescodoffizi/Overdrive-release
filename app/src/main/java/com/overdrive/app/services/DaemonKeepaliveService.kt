@@ -171,33 +171,27 @@ class DaemonKeepaliveService : Service() {
             }
         }
         
-        // Bring the status pill back if the process was restarted without the
-        // Activity running (e.g. system killed the process, then Android
-        // respawned this keepalive service via START_STICKY).
-        try {
-            com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(applicationContext)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to kick status overlay: ${e.message}")
-        }
+        // Bring back the status pill & RoadSense overlay asynchronously.
+        // Doing this synchronously on the main thread in onStartCommand risks an ANR
+        // if system_server is busy bringing up OEM packages (e.g. Navigation, SystemUI),
+        // as syncWithConfig / startIfPermitted perform Binder IPC calls (startService / stopService).
+        Thread({
+            try {
+                // Short grace delay to allow system_server to finish binding critical services
+                Thread.sleep(3000)
+                com.overdrive.app.overlay.StatusOverlayService.startIfPermitted(applicationContext)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to kick status overlay: ${e.message}")
+            }
 
+            try {
+                com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
+                    .syncWithConfig(applicationContext)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to kick RoadSense overlay: ${e.message}")
+            }
+        }, "AsyncOverlayKick").start()
 
-        // Same for the RoadSense overlay: it must be visible whenever the feature is
-        // enabled, NOT only after the user opens MainActivity (its sole other launch
-        // path, onResume). The app process is killed/respawned across ACC cycles, so
-        // without this an ACC-on with RoadSense already enabled would leave the overlay
-        // absent until the user manually opened the app. Gated on the enabled flag
-        // (forceReload — the daemon/web UI may have just toggled it cross-UID) so a
-        // disabled feature stays silent. The overlay itself only renders daemon-
-        // published state, so showing it early just yields the idle/scanning pill.
-        try {
-            // The shared lifecycle policy also honours the user's overlayVisible
-            // opt-out, and actively stops a stale service when the master is off.
-            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService
-                .syncWithConfig(applicationContext)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to kick RoadSense overlay: ${e.message}")
-        }
-        
         // START_STICKY ensures service restarts if killed
         return START_STICKY
     }

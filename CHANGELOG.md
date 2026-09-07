@@ -6,9 +6,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 - **Stabilizzazione Risveglio & Prevenzione Freeze al Boot (DiLink 5.0 / SA8155P)**:
   - **Disarmo Riavvio Prematuro Telecamere (`DiLink5QCarCamBackend.java`)**: Rimosso l'auto-restart forzato a 4s di `fast_cam_capture` su ACC-ON; applicato periodo di grazia di sicurezza di 30s che sblocca il gate senza auto-spawn, demandando l'avvio delle telecamere solo a esplicita richiesta utente (Live View / Mosaic) o Sentry mode (ACC-OFF), eliminando la contesa con AVM e navigatore.
-  - **Rollback Chiusura Forzata Navigatore Neusoft (`AccMonitor.java`, `AccSentryDaemon.java`)**: Eliminato `am force-stop com.neusoft.na.navigation` su ACC-OFF per preservare il ciclo di vita nativo Android ed evitare il pesante cold-boot concorrente all'accensione del veicolo.
+  - **Rollback Chiusura Forzata Navigatore Neusoft (`AccMonitor.java`, `AccSentryDaemon.java`)**: Eliminato `am force-stop com.neusoft.na.navigation` su ACC-OFF per preservare il ciclo di vita nativo Android ed evitare il pesante cold-boot concorrente all'accensione del veicolo e la corruzione della GPU Adreno (`validate_resource_memory_layout_metadata`).
   - **Disattivazione Watchdog Rete Shell (`OverdriveApplication.kt`, `NetworkFailoverWatchdog.kt`)**: Rimosso l'avvio automatico del watchdog e sanitizzati i comandi shell distruttivi (`svc wifi disable`, `cmd wifi disconnect`) per impedire la saturazione dei thread Binder di `system_server`.
   - **Silenziamento Diagnostica Energetica (`DiLink5PowerDiagnostics.java`)**: Rimossa l'invocazione periodica di `wm.reconnect()` e ridotta la frequenza di campionamento a 10s per azzerare l'overhead della CPU e dei processi shell durante l'accensione.
+  - **Disaccoppiamento Asincrono Overlay e Riduzione Latenza Main Thread (`DaemonKeepaliveService.kt`, `LocationSidecarService.java`)**:
+    - Spostata la sincronizzazione e l'avvio degli overlay (`StatusOverlayService`, `RoadSenseOverlayService`) fuori dal Main Thread in `DaemonKeepaliveService.onStartCommand()` con un ritardo di grazia di 3s per prevenire deadlock Binder e ANR verso `system_server`.
+    - Spostata la lettura della cache GPS su disco e la registrazione iniziale dei provider su thread worker in `LocationSidecarService.onCreate()`, azzerando i blocchi del ciclo di vita del processo al boot.
 
 ## [v51.12] - 2026-09-07
 
