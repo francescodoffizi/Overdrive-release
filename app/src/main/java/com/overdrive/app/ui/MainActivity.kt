@@ -175,6 +175,15 @@ open class MainActivity : AppCompatActivity() {
 
         com.overdrive.app.byd.dilink5.Dilink5SdkInjector.ensure(this)
 
+        if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+            // SurfaceFlinger TaskSnapshot shield: on DiLink 5.0 (Snapdragon SA8155P),
+            // TaskSnapshotController invokes SurfaceFlinger::captureScreenCommon when the
+            // user presses HOME or switches apps. The Qualcomm Adreno GPU driver
+            // segfaults in validate_resource_memory_layout_metadata inside libadreno_utils.so.
+            // Setting FLAG_SECURE natively instructs Android to skip transition snapshotting.
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        }
+
         setContentView(R.layout.activity_main_new)
 
         // Storage setup is posted off the onCreate critical path so a failure
@@ -810,9 +819,11 @@ open class MainActivity : AppCompatActivity() {
         if (remoteDevSession) return
         try {
             val pinEnabled = com.overdrive.app.auth.PinManager.isEnabled()
-            // Apply / clear FLAG_SECURE based on current lock state, regardless
-            // of whether we're about to gate (covers the unlock-now path too).
-            if (pinEnabled && !com.overdrive.app.auth.PinSession.isUnlocked()) {
+            val dilink5 = com.overdrive.app.byd.DiLink5Platform.isActive()
+            // Apply / clear FLAG_SECURE based on current lock state.
+            // On DiLink 5.0, FLAG_SECURE must NEVER be cleared to shield SurfaceFlinger
+            // and the Qualcomm Adreno driver against TaskSnapshotController crashes on Home/recents.
+            if ((pinEnabled && !com.overdrive.app.auth.PinSession.isUnlocked()) || dilink5) {
                 window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
             } else {
                 window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)

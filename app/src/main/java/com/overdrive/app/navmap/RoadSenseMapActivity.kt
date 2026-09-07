@@ -427,6 +427,9 @@ open class RoadSenseMapActivity : AppCompatActivity() {
         com.overdrive.app.navmap.nav.MapNetworking.installMapLibreHttpClient()
 
         super.onCreate(savedInstanceState)
+        if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_roadsense_map)
 

@@ -94,11 +94,14 @@ public final class VideoPlaybackActivity extends Activity {
     private void ensurePlaybackUi() {
         if (playbackUiReady) return;
         playbackUiReady = true;
-        getWindow().addFlags(
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        int flags = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                | WindowManager.LayoutParams.FLAG_FULLSCREEN);
+                | WindowManager.LayoutParams.FLAG_FULLSCREEN;
+        if (com.overdrive.app.byd.DiLink5Platform.isActive()) {
+            flags |= WindowManager.LayoutParams.FLAG_SECURE;
+        }
+        getWindow().addFlags(flags);
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);

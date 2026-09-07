@@ -4,6 +4,16 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+## [v51.7] - 2026-09-07
+
+- **Protezione Completa Crash SurfaceFlinger & Panic Kernel su Rientro Home / Cambio App (`MainActivity.kt`, `VideoPlaybackActivity.java`, `RoadSenseMapActivity.kt`)**:
+  - **Identificazione Causa Radice (`SYSTEM_TOMBSTONE` `validate_resource_memory_layout_metadata`)**: L'analisi del crash dump delle 08:35:10 ha isolato un crash `SIGSEGV (SEGV_ACCERR)` nel driver Qualcomm Adreno 640 (`libadreno_utils.so` / `libGLESv2_adreno.so`) dentro il thread `ImageManager` di `SurfaceFlinger`. Quando l'utente preme il tasto Home o passa a un'altra app, il gestore finestre di Android 11 (`TaskSnapshotController`) invoca `SurfaceControl.captureLayers()` per generare l'animazione di uscita e il thumbnail per le app recenti, innescando il bug del driver GPU e provocando la morte a catena di SurfaceFlinger e il riavvio forzato (`init SIGABRT`) dell'infotainment.
+  - **Estensione Shield `FLAG_SECURE` su Finestre Principali**:
+    - In `MainActivity.kt`: impostato `FLAG_SECURE` permanente su piattaforme DiLink 5.0 in `onCreate()`.
+    - In `maybeShowPinLock()`: corretto il bug per cui `FLAG_SECURE` veniva ripulito (`window.clearFlags`) se il blocco PIN era disattivato; ora su DiLink 5.0 il flag rimane blindato a prescindere dallo stato del PIN.
+    - In `VideoPlaybackActivity.java` e `RoadSenseMapActivity.kt`: applicato `FLAG_SECURE` su DiLink 5.0 per proteggere il rientro da schermate video o mappe a pieno schermo.
+
+
 ## [v51.6] - 2026-09-07
 
 - **Prevenzione Crashloop `fast_cam_capture`, Esaurimento Buffer Adreno GPU (1024 slots) e Hard Reboot Sistema (`DiLink5QCarCamBackend.java`, `fast_cam_bridge.cpp`)**:
