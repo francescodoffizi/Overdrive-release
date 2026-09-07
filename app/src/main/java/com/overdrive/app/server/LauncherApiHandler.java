@@ -654,10 +654,12 @@ public final class LauncherApiHandler {
             } catch (Throwable ignored) {}
             if (tempC == JSONObject.NULL) {
                 try {
-                    android.hardware.bydauto.instrument.BYDAutoInstrumentDevice inst =
-                            android.hardware.bydauto.instrument.BYDAutoInstrumentDevice.getInstance(null);
+                    Class<?> instrumentClass = Class.forName("android.hardware.bydauto.instrument.BYDAutoInstrumentDevice");
+                    java.lang.reflect.Method getInst = instrumentClass.getMethod("getInstance", android.content.Context.class);
+                    Object inst = getInst.invoke(null, (android.content.Context) null);
                     if (inst != null) {
-                        int t = inst.getOutCarTemperature();
+                        java.lang.reflect.Method getTemp = instrumentClass.getMethod("getOutCarTemperature");
+                        int t = (Integer) getTemp.invoke(inst);
                         if (t > -60 && t < 80) { tempC = t; any = true; }
                     }
                 } catch (Throwable ignored) {}

@@ -4,7 +4,31 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
-## [v51.4] - 2026-09-06
+## [v51.4] - 2026-09-07
+
+- **Hardening Wi-Fi Background Keep-Awake, Force-Reconnect L2/L3 & Anti-DTIM Sleep (`AccSentryDaemon.java`)**:
+  - **Watchdog L2/L3 e Force-Reconnect su `wlan0`**: In `ensureWifiEnabled()`, integrata la verifica attiva dell'assegnazione dell'indirizzo IP; se la radio è abilitata ma disconnessa dall'AP, esegue `cmd wifi reconnect` e `wpa_cli -i wlan0 reconnect`. Se la disconnessione persiste per 3 tick consecutivi (~30s), esegue un soft-cycle completo dell'adattatore (`svc wifi disable; sleep 1; svc wifi enable; cmd wifi reconnect`).
+  - **Prevenzione DTIM Sleep per Chipset Qualcomm (`wlan.ko`)**: A display spento in Sentry Mode, invia periodicamente (~30s) il comando driver `POWERSAVE 0` via `wpa_cli` e un probe ping verso il default gateway, impedendo al chip Wi-Fi Qualcomm di entrare in sospensione profonda DTIM e perdere la sincronizzazione con i beacon del router.
+  - **Riconnessione Proattiva su ACC-ON**: In `exitSentryMode()`, invia immediatamente il trigger di riconnessione Wi-Fi alla riaccensione della vettura, eliminando i ritardi di riassociazione post-sosta.
+  - **Risoluzione Blocco Hotspot in `reconcileStrandedHotspotSuppression()`**: Implementata la verifica multi-tier dello stato SoftAP (controllo subnet IP `192.168.43.1`/`44.1` e token estesi `dumpsys wifi`) con fail-safe progressivo che azzera la soppressione orfana dopo 6 tick di probe non conclusive, evitando che il Wi-Fi resti disattivato indefinitamente.
+  - **Auto-Enforcement Periodico Impostazioni Wi-Fi e Doze**: In `enforceAdbAndDaemonHealth()` (UID 2000 shell ogni 60s), integrato il ripristino continuo di `wifi_sleep_policy 2`, `byd_wifi_always_on 1`, `byd_wifi_keep_alive 1`, `wifi_scan_throttle_enabled 0` e l'inclusione di `com.android.wifi` e `com.overdrive.app` nella whitelist Doze (`deviceidle whitelist`).
+
+- **Prevenzione Crash Fatale Hardware Composer / SurfaceFlinger (`BsNativeLayer.java`, `ScreenDeterrent.java`)**:
+  - Risolto il crash fatale `SIGSEGV (SEGV_ACCERR)` in `sdm::HWCLayer::ValidateAndSetCSC` / `hwcomposer.msmnile.so` e `android.hardware.graphics.composer@2.4-service`, che portava al crash a cascata di `surfaceflinger` e al panic di sistema (`Fatal signal 6 SIGABRT in tid init`).
+  - Il crash era causato dalla distruzione sincrona e immediata delle handle native (`SurfaceControl.release()` e `Surface.release()`) al termine del rendering prima che il ciclo di composizione VSYNC di SurfaceFlinger potesse ritirare il GraphicBuffer in-flight.
+  - Introdotto un periodo di grazia (drain pause di 60ms) dopo l'applicazione della transazione di rimozione e sganciamento dal compositor (`Transaction.hide()`, `Transaction.reparent(null)`, `Transaction.remove()`), permettendo a SurfaceFlinger e al modulo Qualcomm HWC di completare la validazione e il commit del frame corrente prima di invalidare le risorse native.
+
+- **Risoluzione Black Screen Permanente e Auto-Recovery Luminosità Display (`AccSentryDaemon.java`, `BootReceiver.kt`, `BydDataCollector.java`)**:
+  - Rimossa la scrittura dannosa `settings put system screen_brightness 0` nel fallback di spegnimento pannello in `AccSentryDaemon.java`: la scrittura nel provider `Settings.System` persisteva in `/data/system/users/0/settings_system.xml` sopravvivendo ai riavvii e ai cicli 12V, provocando l'accensione a schermo nero (backlight spento) da parte del `DisplayPowerController` di Android all'avvio.
+  - Lo spegnimento visivo del display durante la sosta è ora delegato in sicurezza a `StealthPanel.turnOff()` (overlay nero a tutto schermo) senza mai azzerare la luminosità globale di sistema.
+  - Inserito in `BootReceiver.kt` il meccanismo di auto-healing all'avvio (`recoverStrandedScreenBrightness`): su ogni boot, sblocco o transizione veicolo rileva se la luminosità di sistema è bloccata a `<= 0` e la ripristina automaticamente al valore operativo (128), riaccendendo immediatamente il display.
+  - In `exitSentryMode()` e nelle transizioni di avvio veicolo, forzato il ripristino incondizionato della luminosità a 128 e inviato l'evento di risveglio `input keyevent 224`.
+  - In `BydDataCollector.java`, impostato un limite minimo di sicurezza di 10/255 nel controllo manuale della luminosità per prevenire l'azzeramento involontario della retroilluminazione.
+
+- **Prevenzione Crash `NoClassDefFoundError: BYDAutoInstrumentDevice` su DiLink 5 (`TripApiHandler.java`, `LauncherApiHandler.java`)**:
+  - Risolto il crash fatale del demone (`FATAL EXCEPTION: java.lang.NoClassDefFoundError` in `nanohttpd-worker`) nell'endpoint di stima autonomia `handleRangeEstimate`.
+  - Su piattaforma DiLink 5.0 (Android 11), la classe `BYDAutoInstrumentDevice` non è presente nel framework OEM e il linking statico della classe causava la terminazione immediata del processo `byd_cam_daemon`.
+  - Convertito l'accesso a `BYDAutoInstrumentDevice` tramite reflection dinamica con intercettazione di `Throwable`, garantendo la massima stabilità e continuità del demone anche in assenza delle API strumentazione proprietarie DiLink 4.
 
 - **Richiesta Immediata Sync-Frame IDR al Cambio Visuale Telecamere in Live View (`GpuSurveillancePipeline.java`)**:
   - In `setStreamViewMode(mode)`: introdotta la chiamata esplicita a `streamEncoder.requestSyncFrame()` non appena viene commutata la telecamera (da mosaico a singola Front, Right, Rear, Left o viceversa).

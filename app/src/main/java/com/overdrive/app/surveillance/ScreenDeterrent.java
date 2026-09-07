@@ -1707,6 +1707,8 @@ public final class ScreenDeterrent {
             try { txCls.getMethod("remove", sc).invoke(tx, surface); } catch (Throwable ignored) {}
             txCls.getMethod("apply").invoke(tx);
             try { txCls.getMethod("close").invoke(tx); } catch (Throwable ignored) {}
+            // Allow SurfaceFlinger and HWComposer 2-3 VSYNC cycles to process layer removal
+            try { Thread.sleep(60); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             try { sc.getMethod("release").invoke(surface); } catch (Throwable ignored) {}
         } catch (Throwable t) {
             logger.debug("Surface release failed: " + t.getMessage());

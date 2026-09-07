@@ -14892,7 +14892,7 @@ public class BydDataCollector {
      * park the caller. Returns true when the write command completes without error.
      */
     private boolean setAndroidScreenBrightness(int percent) {
-        int v255 = Math.max(0, Math.min(255, Math.round(percent / 100f * 255f)));
+        int v255 = Math.max(10, Math.min(255, Math.round(percent / 100f * 255f)));
         String script = "settings put system screen_brightness_mode 0; "
                 + "settings put system screen_brightness " + v255;
         try {

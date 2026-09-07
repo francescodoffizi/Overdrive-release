@@ -916,6 +916,10 @@ public final class BsNativeLayer {
             // (TaskSnapshotController/captureScreenCommon) do not attempt to draw an orphaned layer.
             try { txCls.getMethod("remove", scCls).invoke(tx, sc); } catch (Throwable ignored) {}
             txCls.getMethod("apply").invoke(tx);
+            // Allow SurfaceFlinger and HWComposer (sdm::HWCLayer::ValidateAndSetCSC) 2-3 VSYNC
+            // cycles to process layer removal and retire any in-flight GraphicBuffers before
+            // native handles are destroyed.
+            try { Thread.sleep(60); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             try { scCls.getMethod("release").invoke(sc); } catch (Throwable ignored) {}
         } catch (Throwable t) {
             logger.debug("releaseSurfaceControl failed: " + t.getMessage());

@@ -209,6 +209,13 @@ public class AccSentryDaemon {
     private static volatile PowerManager.WakeLock wakeLock;
     private static volatile android.net.wifi.WifiManager.WifiLock wifiLock;
 
+    // Wi-Fi L2/L3 watchdog & Anti-DTIM sleep tracking
+    private static int wifiDisconnectedTicks = 0;
+    private static long lastWifiAntiDtimTick = 0;
+    private static final int MAX_DISCONNECTED_TICKS_BEFORE_RESET = 3;
+    private static int staleHotspotProbeTicks = 0;
+    private static final int MAX_STALE_HOTSPOT_PROBE_TICKS = 6;
+
     // Original screen timeout (saved before sentry mode)
     private static String originalScreenTimeout = "60000";
 
@@ -3595,6 +3602,11 @@ public class AccSentryDaemon {
         // generation-owned teardown and ACC notification.
         acquireWakeLock();
 
+        // Proactively trigger Wi-Fi reconnect so station mode is restored immediately on ACC-ON
+        execShell("svc wifi enable 2>/dev/null; cmd wifi reconnect 2>/dev/null; wpa_cli -i wlan0 reconnect 2>/dev/null");
+        // Ensure screen brightness and wake are restored on vehicle start
+        execShell("settings put system screen_brightness 128 2>/dev/null; input keyevent 224 2>/dev/null");
+
         if (transitionGeneration < 0L) {
             log("Not in sentry mode");
             return;
@@ -3670,6 +3682,7 @@ public class AccSentryDaemon {
             try {
                 CameraDaemon.setSafeZoneSuppressed(false);
             } catch (Throwable ignored) {}
+            execShell("settings put system screen_brightness 128 2>/dev/null; input keyevent 224 2>/dev/null");
         }
 
         SentryTransitionState transition =
@@ -4361,6 +4374,7 @@ public class AccSentryDaemon {
                     }
                     lower.invoke(pm, android.os.SystemClock.uptimeMillis());
                     log("Backlight: PowerManager." + (on ? "turnBacklightOn" : "turnBacklightOff") + " SUCCESS");
+                    restoreScreenBrightnessIfOn(on, ownership);
                     return true;
                 }
 
@@ -4378,6 +4392,7 @@ public class AccSentryDaemon {
                         }
                         pascal.invoke(pm, android.os.SystemClock.uptimeMillis());
                         log("Backlight: PowerManager." + (on ? "TurnBacklightOn" : "TurnBacklightOff") + " SUCCESS");
+                        restoreScreenBrightnessIfOn(on, ownership);
                         return true;
                     } catch (Exception e2) {
                         // Fall through to BYD path
@@ -4399,6 +4414,7 @@ public class AccSentryDaemon {
                         }
                         bydMethod.invoke(device);
                         log("Backlight: BYDAutoSettingDevice." + (on ? "turnBacklightOn" : "turnBacklightOff") + " SUCCESS");
+                        restoreScreenBrightnessIfOn(on, ownership);
                         return true;
                     }
                 }
@@ -4408,14 +4424,13 @@ public class AccSentryDaemon {
         }
 
         // Fallback: Settings brightness & StealthPanel
-        int brightness = on ? 128 : 0;
-        ShellResult brightnessResult = execShellResult(
-                "settings put system screen_brightness " + brightness,
-                DEFAULT_SHELL_TIMEOUT_MS, ownership);
-        if (!brightnessResult.success) {
-            return false;
-        }
         if (on) {
+            ShellResult brightnessResult = execShellResult(
+                    "settings put system screen_brightness 128",
+                    DEFAULT_SHELL_TIMEOUT_MS, ownership);
+            if (!brightnessResult.success) {
+                return false;
+            }
             ShellResult keyResult = execShellResult(
                     "input keyevent 224",
                     DEFAULT_SHELL_TIMEOUT_MS, ownership);
@@ -4427,12 +4442,24 @@ public class AccSentryDaemon {
             // CRITICAL: Do NOT send "input keyevent 223" (KEYCODE_SLEEP).
             // KEYCODE_SLEEP forces mWakefulness to Asleep, which triggers mHalAutoSuspendModeEnabled
             // and kernel suspend-to-RAM, freezing CPU, Wi-Fi, and LTE.
-            // Brightness 0 + turnBacklightOff keeps mWakefulness Awake while display is fully dark.
+            // CRITICAL: Do NOT write "settings put system screen_brightness 0".
+            // Writing brightness 0 persists into /data/system/users/0/settings_system.xml and
+            // causes the display backlight to remain completely black on subsequent boots!
+            // Darkening is safely handled via StealthPanel full-screen black overlay without touching persistent system brightness.
             try {
                 com.overdrive.app.power.StealthPanel.turnOff(appContext);
             } catch (Throwable ignored) {}
             return true;
         }
+    }
+
+    private static void restoreScreenBrightnessIfOn(boolean on, ShellOwnership ownership) {
+        if (!on) return;
+        try {
+            execShellResult(
+                    "settings put system screen_brightness 128; input keyevent 224",
+                    DEFAULT_SHELL_TIMEOUT_MS, ownership);
+        } catch (Throwable ignored) {}
     }
 
     /**
@@ -5334,6 +5361,46 @@ public class AccSentryDaemon {
                 () -> isKeepAliveCommitCurrent(transitionGeneration));
         if (!result.success && !result.canceled) {
             log("Wi-Fi keepalive command failed: " + result.describeFailure());
+        }
+
+        if (!isKeepAliveCommitCurrent(transitionGeneration)) {
+            return;
+        }
+
+        // L2/L3 Health-Check: Verify if wlan0 has a valid IP assigned.
+        // On Android 11 / DiLink 5.0, `svc wifi enable` leaves the radio on but disconnected
+        // if the AP dropped beacon sync or after deep sleep.
+        String ipOut = execShell("ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1").trim();
+        boolean hasValidIp = !ipOut.isEmpty() && !"0.0.0.0".equals(ipOut) && !"127.0.0.1".equals(ipOut);
+
+        if (!hasValidIp) {
+            wifiDisconnectedTicks++;
+            log("Wi-Fi has no IP on wlan0 (disconnected ticks: " + wifiDisconnectedTicks + ")");
+
+            if (wifiDisconnectedTicks >= MAX_DISCONNECTED_TICKS_BEFORE_RESET) {
+                log("Wi-Fi stalled for " + wifiDisconnectedTicks + " ticks — performing soft radio cycle");
+                execShell("svc wifi disable 2>/dev/null; sleep 1; svc wifi enable 2>/dev/null; cmd wifi reconnect 2>/dev/null; wpa_cli -i wlan0 reconnect 2>/dev/null");
+                wifiDisconnectedTicks = 0;
+            } else {
+                log("Forcing Wi-Fi reconnect via cmd wifi / wpa_cli...");
+                execShell("cmd wifi reconnect 2>/dev/null; wpa_cli -i wlan0 reconnect 2>/dev/null");
+            }
+        } else {
+            if (wifiDisconnectedTicks > 0) {
+                log("Wi-Fi reconnected successfully (IP: " + ipOut + ")");
+                wifiDisconnectedTicks = 0;
+            }
+            // Anti-DTIM sleep keep-alive for Qualcomm wlan.ko driver while display is off.
+            // Disables driver powersave and sends periodic micro-pings to gateway every ~30s.
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastWifiAntiDtimTick >= 30_000L) {
+                lastWifiAntiDtimTick = now;
+                execShell("wpa_cli -i wlan0 driver \"POWERSAVE 0\" 2>/dev/null");
+                String gateway = execShell("ip route show dev wlan0 2>/dev/null | grep default | awk '{print $3}'").trim();
+                if (!gateway.isEmpty()) {
+                    execShell("ping -c 1 -W 1 " + gateway + " >/dev/null 2>&1 &");
+                }
+            }
         }
     }
 
@@ -8975,27 +9042,25 @@ public class AccSentryDaemon {
                         + " ticks — no longer holding off the keep-alive");
             }
             enablingHoldOffTicks = 0;
-            // Otherwise ask the RADIO, not a stored snapshot. Earlier revisions
-            // inferred liveness from published timestamps, but every variant broke on
-            // some clock-step or short-reboot combination: an owner that looked dead
-            // got its AP torn down, or a dead one looked alive and stranded WiFi off.
-            // The framework's own AP state is ground truth and needs no clock.
-            // `; echo` keeps the exit status at 0: grep exits 1 when it counts zero
-            // matches, and execShell reports any non-zero exit as "ERROR", which the
-            // unusable-probe branch below would read as "can't tell" — stranding WiFi
-            // off on every ordinary AP-down case, the exact failure this method exists
-            // to prevent. The marker text is what we test, not the exit code.
+            // Multi-tier SoftAP probe:
+            // 1. Check if an active SoftAP IP exists (default 192.168.43.1 / 192.168.44.1)
+            String ipDump = execShell("ip addr show 2>/dev/null | grep -E 'inet 192\\.168\\.(43|44)\\.1'").trim();
+            boolean apIpActive = !ipDump.isEmpty();
+
+            // 2. Query dumpsys wifi for curState=SoftApState, mSoftApState=13, or curState=Started
             String apDump = execShell(
-                    "dumpsys wifi 2>/dev/null | grep -c curState=SoftApState"
+                    "dumpsys wifi 2>/dev/null | grep -E -c '(curState=SoftApState|mSoftApState=13|curState=Started)'"
                             + "; echo PROBE_OK");
-            boolean apUp = false;
-            boolean probeWorked = false;
+            boolean apUp = apIpActive;
+            boolean probeWorked = apIpActive;
             if (apDump != null && apDump.contains("PROBE_OK")) {
                 for (String line : apDump.split("\\r?\\n")) {
                     String t = line.trim();
                     if (t.isEmpty() || t.equals("PROBE_OK")) continue;
                     try {
-                        apUp = Integer.parseInt(t) > 0;
+                        if (Integer.parseInt(t) > 0) {
+                            apUp = true;
+                        }
                         probeWorked = true;
                     } catch (NumberFormatException ignored) {
                         // Not the count line; keep looking.
@@ -9003,11 +9068,14 @@ public class AccSentryDaemon {
                 }
             }
             if (!probeWorked) {
-                // Can't see the radio, so we can't prove the owner is gone. Leaving
-                // the suppression costs connectivity until the next tick; clearing it
-                // could kill a live AP. Prefer the recoverable option.
-                log("Hotspot suppression reconcile skipped — AP state probe failed");
-                return false;
+                staleHotspotProbeTicks++;
+                if (staleHotspotProbeTicks < MAX_STALE_HOTSPOT_PROBE_TICKS) {
+                    log("Hotspot suppression reconcile skipped — AP state probe failed (ticks: " + staleHotspotProbeTicks + ")");
+                    return false;
+                }
+                log("Hotspot probe failed for " + staleHotspotProbeTicks + " consecutive ticks — fail-safe clearing stale suppression");
+            } else {
+                staleHotspotProbeTicks = 0;
             }
             if (apUp) {
                 return false;
@@ -9210,6 +9278,16 @@ public class AccSentryDaemon {
                     Runtime.getRuntime().exec(new String[]{"sh", "-c", "nohup sh /data/local/tmp/start_telegram.sh > /dev/null 2>&1 &"});
                 }
             }
+
+            // 4. Periodically enforce Wi-Fi persistent settings, sleep policies & Doze whitelist
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "wifi_sleep_policy", "2"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "wifi_suspend_optimizations_enabled", "0"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "wifi_scan_throttle_enabled", "0"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "wifi_scan_always_enabled", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "global", "byd_wifi_always_on", "1"});
+            Runtime.getRuntime().exec(new String[]{"settings", "put", "system", "byd_wifi_keep_alive", "1"});
+            Runtime.getRuntime().exec(new String[]{"dumpsys", "deviceidle", "whitelist", "+com.android.wifi"});
+            Runtime.getRuntime().exec(new String[]{"dumpsys", "deviceidle", "whitelist", "+com.overdrive.app"});
         } catch (Throwable t) {
             log("enforceAdbAndDaemonHealth error: " + t.getMessage());
         }

@@ -29,6 +29,28 @@ class BootReceiver : BroadcastReceiver() {
         @Volatile
         private var lastStartTime = 0L
         private const val MIN_RESTART_INTERVAL = 5000L // 5 seconds debounce
+
+        fun recoverStrandedScreenBrightness(context: Context) {
+            try {
+                val currentBrightness = android.provider.Settings.System.getInt(
+                    context.contentResolver,
+                    android.provider.Settings.System.SCREEN_BRIGHTNESS,
+                    -1
+                )
+                if (currentBrightness <= 0) {
+                    Log.w(TAG, "Stranded screen brightness detected ($currentBrightness) — restoring to 128")
+                    try {
+                        Runtime.getRuntime().exec(
+                            arrayOf("sh", "-c", "settings put system screen_brightness 128; input keyevent 224")
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Shell brightness recovery failed: ${e.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to inspect screen brightness: ${e.message}")
+            }
+        }
     }
     
     override fun onReceive(context: Context, intent: Intent) {
@@ -91,6 +113,9 @@ class BootReceiver : BroadcastReceiver() {
             // Continue anyway - core daemons can start without preferences
         }
         
+        // Auto-heal stranded screen brightness (<= 0) caused by legacy sentry fallbacks
+        recoverStrandedScreenBrightness(context)
+
         when (action) {
             // Boot events - start daemons and launch activity minimized.
             // Launching the activity keeps the app process alive (Android is less

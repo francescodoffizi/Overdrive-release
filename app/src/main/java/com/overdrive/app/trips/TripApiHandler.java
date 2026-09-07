@@ -673,14 +673,16 @@ public class TripApiHandler {
 
             int extTemp = 20; // Default mild temperature
             try {
-                // Read external temperature from BYD instrument device
-                android.hardware.bydauto.instrument.BYDAutoInstrumentDevice instrumentDevice =
-                        android.hardware.bydauto.instrument.BYDAutoInstrumentDevice.getInstance(null);
+                // Read external temperature via reflection (safe against NoClassDefFoundError on DiLink 5)
+                Class<?> instrumentClass = Class.forName("android.hardware.bydauto.instrument.BYDAutoInstrumentDevice");
+                java.lang.reflect.Method getInst = instrumentClass.getMethod("getInstance", android.content.Context.class);
+                Object instrumentDevice = getInst.invoke(null, (android.content.Context) null);
                 if (instrumentDevice != null) {
-                    extTemp = instrumentDevice.getOutCarTemperature();
+                    java.lang.reflect.Method getTemp = instrumentClass.getMethod("getOutCarTemperature");
+                    extTemp = (Integer) getTemp.invoke(instrumentDevice);
                 }
-            } catch (Exception e) {
-                logger.debug("Could not read external temp: " + e.getMessage());
+            } catch (Throwable t) {
+                logger.debug("Could not read external temp: " + t.getMessage());
             }
 
             int dnaOverall = 50; // Default mid-range
