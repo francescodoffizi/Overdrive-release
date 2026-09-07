@@ -72,6 +72,9 @@ class OverdriveApplication : Application() {
         // App-process listener that binds Telenav's OEM AIDL for the daemon's
         // HTTP endpoint (the daemon can't bindService itself). Idempotent.
         com.overdrive.app.telenav.TelenavIpcServer.start(this)
+
+        // Start NetworkFailoverWatchdog for robust failover between Wi-Fi and internal BYD SIM
+        com.overdrive.app.network.NetworkFailoverWatchdog.getInstance(this).start()
     }
 
     /**

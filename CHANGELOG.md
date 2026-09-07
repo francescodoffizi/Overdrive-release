@@ -2,6 +2,20 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
+## [v51.12] - 2026-09-07
+
+> **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
+
+- **Failover Automatico & Anti "Wi-Fi Zombie" verso SIM BYD interna (`NetworkFailoverWatchdog.kt`, `OverdriveApplication.kt`)**:
+  - Introdotto `NetworkFailoverWatchdog`: monitora continuamente l'effettiva raggiungibilità di Internet su rete Wi-Fi tramite probe socket veloci (Google/Cloudflare DNS e server VLESS primario).
+  - Risolto il problema del "Wi-Fi Zombie" (saponetta 4G priva di connettività internet ma con Wi-Fi ancora associato): dopo 3 strike consecutivi senza internet, il watchdog esegue una disconnessione forzata di `wlan0` (`cmd wifi disconnect`), costringendo il kernel Android a promuovere la SIM interna (`rmnet_data0`) come default route.
+  - Implementato failback resiliente con backoff graduale (2 min → 3 min → max 5 min): tenta periodicamente il riallaccio Wi-Fi (`cmd wifi reconnect`) e convalida la stabilità del collegamento solo dopo 2 probe consecutivi positivi (protezione anti-flapping/isteresi).
+- **Inversione Timing & Binding SOCKS Obbligatorio per Tailscale (`TailscaleLauncher.kt`)**:
+  - In `TailscaleLauncher.kt`, quando `SINGBOX_PROXY` è abilitato nelle impostazioni, viene garantito che Tailscale utilizzi sempre `ALL_PROXY=socks5://127.0.0.1:8119`.
+  - Aggiunto probe con loop di attesa fino a 5 secondi per permettere a sing-box di completare il bind sulla porta 8119, evitando che `tailscaled` venga avviato per errore senza proxy rimanendo bloccato dal firewall proprietario BYD su rete cellulare.
+- **Risoluzione Vuoto Health Check ADB per sing-box e Tailscale (`DaemonStartupManager.kt`)**:
+  - Aggiunti i rami di riavvio ADB per `SINGBOX_PROXY`, `TAILSCALE_TUNNEL`, `TELEGRAM_DAEMON` e `CLOUDFLARED_TUNNEL` nel gestore `doRelaunchDaemon`, consentendo il ripristino autonomo in background a schermo spento anche quando il `daemonsViewModel` non è presente.
+
 ## [v51.11] - 2026-09-07
 
 > **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.

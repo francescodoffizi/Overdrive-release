@@ -1117,6 +1117,26 @@ class DaemonStartupManager(
                         override fun onError(error: String) { log.error(TAG, "HealthCheck: Zrok restart failed: $error") }
                     })
                 }
+                DaemonType.SINGBOX_PROXY -> {
+                    log.info(TAG, "HealthCheck: relaunching Singbox proxy via boot-path fallback")
+                    adbLauncher.startSingbox(createLogCallback("HealthCheck-Singbox"))
+                }
+                DaemonType.TAILSCALE_TUNNEL -> {
+                    log.info(TAG, "HealthCheck: relaunching Tailscale tunnel via boot-path fallback")
+                    startTailscaleOnBoot()
+                }
+                DaemonType.TELEGRAM_DAEMON -> {
+                    log.info(TAG, "HealthCheck: relaunching Telegram Bot via boot-path fallback")
+                    adbLauncher.launchTelegramDaemon(createLogCallback("HealthCheck-TelegramBot"))
+                }
+                DaemonType.CLOUDFLARED_TUNNEL -> {
+                    log.info(TAG, "HealthCheck: relaunching Cloudflared tunnel via boot-path fallback")
+                    adbLauncher.launchTunnel(object : AdbDaemonLauncher.TunnelCallback {
+                        override fun onLog(message: String) { log.debug(TAG, "[Cloudflared HealthCheck] $message") }
+                        override fun onTunnelUrl(url: String) { log.info(TAG, "HealthCheck: Cloudflared URL: $url") }
+                        override fun onError(error: String) { log.error(TAG, "HealthCheck: Cloudflared restart failed: $error") }
+                    })
+                }
                 else -> {
                     log.warn(TAG, "Health check: no ADB fallback for ${type.displayName}")
                 }

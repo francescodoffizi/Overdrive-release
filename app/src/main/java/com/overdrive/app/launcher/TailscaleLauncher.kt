@@ -4,6 +4,9 @@ import android.content.Context
 import com.overdrive.app.logging.LogManager
 import com.overdrive.app.mqtt.ProxyHelper
 
+import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.util.PreferencesManager
+
 /**
  * Launches Tailscale tunnel processes via ADB shell for remote access.
  * 
@@ -78,13 +81,43 @@ class TailscaleLauncher(
                 }
             } else {
                 checkAndInstallTailscale(callback) {
-                    val useProxy = ProxyHelper.probePort(PROXY_PORT)
-                    isProxyEnabled { enableProxy ->
-                        launchTailscaleDaemon(useProxy, enableProxy, callback)
+                    determineUseProxy { useProxy ->
+                        isProxyEnabled { enableProxy ->
+                            launchTailscaleDaemon(useProxy, enableProxy, callback)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private fun determineUseProxy(onResult: (Boolean) -> Unit) {
+        val singboxPrefEnabled = try {
+            PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)
+        } catch (e: Exception) {
+            false
+        }
+
+        // Run probing on background thread with retry if singbox is enabled
+        Thread({
+            var bound = ProxyHelper.probePort(PROXY_PORT)
+            if (!bound && singboxPrefEnabled) {
+                logManager.info(TAG, "Singbox enabled in prefs but port $PROXY_PORT not bound yet; waiting up to 5s...")
+                for (i in 1..5) {
+                    try { Thread.sleep(1000) } catch (ignored: Exception) {}
+                    if (ProxyHelper.probePort(PROXY_PORT)) {
+                        bound = true
+                        logManager.info(TAG, "Singbox port $PROXY_PORT bound after ${i}s")
+                        break
+                    }
+                }
+            }
+            // If user explicitly enabled sing-box, ALWAYS route through it
+            // even if the probe timed out (sing-box may be moments from finishing startup)
+            val finalUseProxy = bound || singboxPrefEnabled
+            logManager.info(TAG, "Tailscale proxy routing determined: useProxy=$finalUseProxy (bound=$bound, pref=$singboxPrefEnabled)")
+            onResult(finalUseProxy)
+        }, "Tailscale-Proxy-Probe").start()
     }
 
     fun launchTailscaleDaemon(useProxy: Boolean, enableProxy: Boolean, callback: TailscaleCallback) {
