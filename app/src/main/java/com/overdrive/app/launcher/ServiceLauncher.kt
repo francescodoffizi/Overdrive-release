@@ -21,6 +21,7 @@ class ServiceLauncher(
     companion object {
         private const val TAG = "ServiceLauncher"
         private const val PACKAGE_NAME = "com.overdrive.app"
+        @Volatile private var accWhitelistInjectedThisSession = false
     }
     
     interface LaunchCallback {
@@ -194,16 +195,19 @@ class ServiceLauncher(
      * This allows WiFi to stay active when car is powered off.
      */
     fun injectAccWhitelist(packageName: String, callback: LaunchCallback) {
+        if (accWhitelistInjectedThisSession) {
+            logManager.info(TAG, "ACC whitelist already injected this session — skipping redundant shell execution")
+            callback.onLaunched()
+            return
+        }
         logManager.info(TAG, "Injecting ACC whitelist for $packageName...")
         callback.onLog("Injecting ACC whitelist for $packageName...")
         
         val commands = listOf(
             // Method 1: setprop (persistent property)
             "setprop persist.sys.acc.whitelist '$packageName' 2>&1",
-            // Method 2: service call with different transaction codes
+            // Method 2: service call (transaction 1 is supported by accmodemanager)
             "service call accmodemanager 1 s16 '$packageName' 2>/dev/null",
-            "service call accmodemanager 2 s16 '$packageName' 2>/dev/null",
-            "service call accmodemanager 3 s16 '$packageName' 2>/dev/null",
             // Method 3: appops
             "appops set $packageName RUN_IN_BACKGROUND allow 2>/dev/null",
             "appops set $packageName RUN_ANY_IN_BACKGROUND allow 2>/dev/null",
@@ -218,12 +222,11 @@ class ServiceLauncher(
             "CUR=\$(settings get global ssc_whitelist 2>/dev/null); [ \"\$CUR\" = null ] && CUR=; case \",\$CUR,\" in *,$packageName,*) ;; *) settings put global ssc_whitelist \"\${CUR:+\$CUR,}$packageName\" 2>/dev/null;; esac",
             "CUR=\$(settings get secure ssc_whitelist 2>/dev/null); [ \"\$CUR\" = null ] && CUR=; case \",\$CUR,\" in *,$packageName,*) ;; *) settings put secure ssc_whitelist \"\${CUR:+\$CUR,}$packageName\" 2>/dev/null;; esac",
             // Method 6: BYD app startup manager
-            "content call --uri content://com.byd.appstartup/whitelist --method add --arg '$packageName' 2>/dev/null",
-            "cmd appops set $packageName AUTO_START allow 2>/dev/null",
-            "cmd appops set $packageName BOOT_COMPLETED allow 2>/dev/null"
+            "content call --uri content://com.byd.appstartup/whitelist --method add --arg '$packageName' 2>/dev/null"
         )
         
         executeCommandSequence(commands, 0, callback) {
+            accWhitelistInjectedThisSession = true
             logManager.info(TAG, "ACC whitelist injection complete")
             callback.onLog("ACC whitelist injection complete")
             callback.onLaunched()

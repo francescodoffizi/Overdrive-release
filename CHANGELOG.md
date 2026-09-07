@@ -4,6 +4,15 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In sviluppo] - 2026-09-07
 
+- **Coesistenza CarPlay & Soppressione Overlay anti-Crash GPU (`ProjectionStateMonitor.kt`, `KeepAliveAccessibilityService.java`, `StatusOverlayService.java`, `RoadSenseOverlayService.kt`)**:
+  - Introdotto `ProjectionStateMonitor`: rileva in tempo reale la transizione in primo piano di flussi di proiezione video ad alto throughput (Apple CarPlay `com.ts.carplay`, Android Auto `com.google.android.projection.gearhead`, telecamere 360 / retromarcia BYD) intercettando gli eventi `TYPE_WINDOW_STATE_CHANGED` da `KeepAliveAccessibilityService`.
+  - In `StatusOverlayService` e `RoadSenseOverlayService`: rimozione immediata della finestra overlay (`removeOverlay()`) da `WindowManager` quando CarPlay o le telecamere vanno a pieno schermo, liberando i buffer grafici `dmabuf` nel driver Adreno ed eliminando i crash a catena di `surfaceflinger` (`SIGSEGV` in `validate_resource_memory_layout_metadata`).
+  - Ripristino automatico e non bloccante degli overlay al ritorno alla schermata Home o ad altre applicazioni.
+- **Ottimizzazione IPC Config e Protezione Main Thread (`UnifiedConfigManager.kt`)**:
+  - Ridotto il timeout di connessione socket su localhost a 250 ms (da 1500 ms) per `routeWriteIfApp`, azzerando i freeze del Main Looper (`Dispatch took 1851ms on main`, `Skipped 60 frames`) nei momenti in cui il daemon locale non è in ascolto.
+- **Throttling e Caching Comandi Shell (`ServiceLauncher.kt`)**:
+  - Introdotto gate di sessione `accWhitelistInjectedThisSession`: la catena di comandi shell per l'iniezione whitelist viene eseguita al massimo una volta per boot/sessione, eliminando cicli ripetuti di `fork()` ed `exec()` di `/system/bin/sh`.
+  - Rimossi i transaction code inesistenti di `accmodemanager` (exit code 10) e comandi `cmd appops` non validi su DiLink 5.0.
 - **Gestione Smontaggio USB Vold & Prevenzione Crash CarPlay (`StorageManager.java`)**:
   - Intercettazione sincrona degli eventi `ACTION_MEDIA_EJECT`, `ACTION_MEDIA_UNMOUNTED`, `ACTION_MEDIA_BAD_REMOVAL` e `ACTION_MEDIA_REMOVED`.
   - Arresto immediato e rilascio sincrono degli inotify watches di `RecordingsIndexFileWatcher` e chiusura di eventuali file aperti su disco del muxer (`HardwareEventRecorderGpu`) prima della scansione di `/proc/<pid>/fd/` da parte di `vold`, impedendo il kill forzato (`vold: Sending Interrupt to <pid>`) causato dalla rinegoziazione USB host/peripheral all'avvio di CarPlay.

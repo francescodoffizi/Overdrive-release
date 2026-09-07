@@ -135,11 +135,12 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         // update the same cache from onAccessibilityEvent().
         AccessibilityNodeInfo root = null;
         try {
-            root = getRootInActiveWindow();
-            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
-                    root != null ? stringValue(root.getPackageName()) : null);
+            String seedPkg = root != null ? stringValue(root.getPackageName()) : null;
+            KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(seedPkg);
+            com.overdrive.app.monitor.ProjectionStateMonitor.onForegroundPackageChanged(seedPkg);
         } catch (Throwable t) {
             KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            com.overdrive.app.monitor.ProjectionStateMonitor.onForegroundPackageChanged(null);
             Log.w(TAG, "Unable to seed active package: " + t.getMessage());
         } finally {
             if (root != null) {
@@ -199,13 +200,19 @@ public class KeepAliveAccessibilityService extends AccessibilityService {
         final int type = event.getEventType();
 
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            String activePkg = null;
             try {
-                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(
-                        stringValue(event.getPackageName()));
+                activePkg = stringValue(event.getPackageName());
+                KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(activePkg);
             } catch (Throwable t) {
                 // Foreground detection is advisory. Unknown must fail open so a
                 // conditional mapping never suppresses the vehicle's default key action.
                 KeyMapDispatcher.INSTANCE.onForegroundPackageChanged(null);
+            }
+            try {
+                com.overdrive.app.monitor.ProjectionStateMonitor.onForegroundPackageChanged(activePkg);
+            } catch (Throwable t) {
+                Log.w(TAG, "ProjectionStateMonitor dispatch failed: " + t.getMessage());
             }
             return;
         }

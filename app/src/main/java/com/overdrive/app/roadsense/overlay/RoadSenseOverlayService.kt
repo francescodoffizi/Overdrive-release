@@ -23,6 +23,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.monitor.ProjectionStateMonitor
 import com.overdrive.app.overlay.OverlayPermissionChecker
 import com.overdrive.app.roadsense.config.RoadSenseConfig
 import com.overdrive.app.roadsense.warn.OverlayState
@@ -107,6 +108,25 @@ class RoadSenseOverlayService : Service() {
     @Volatile private var selectedSeverity = 0
     @Volatile private var selectedType = 2
 
+    private val projectionListener = ProjectionStateMonitor.Listener { active, pkg ->
+        if (active) {
+            Log.i(TAG, "Projection active ($pkg) — removing RoadSense overlay to protect GPU")
+            removeOverlay()
+        } else {
+            Log.i(TAG, "Projection inactive — checking if RoadSense overlay should be restored")
+            if (overlayView == null && OverlayPermissionChecker.isGranted(this)) {
+                val shouldShow = try {
+                    RoadSenseConfig.snapshot(forceReload = false).overlayShouldShow()
+                } catch (_: Throwable) {
+                    false
+                }
+                if (shouldShow) {
+                    createOverlay()
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -114,6 +134,7 @@ class RoadSenseOverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         ioThread = android.os.HandlerThread("roadsense-overlay-io").also { it.start() }
         ioHandler = Handler(ioThread!!.looper)
+        ProjectionStateMonitor.addListener(projectionListener)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -161,6 +182,7 @@ class RoadSenseOverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         if (instance === this) instance = null
+        ProjectionStateMonitor.removeListener(projectionListener)
         pollRunnable?.let { ioHandler?.removeCallbacks(it) }
         pollRunnable = null
         ioThread?.quitSafely()
@@ -211,6 +233,10 @@ class RoadSenseOverlayService : Service() {
 
     private fun createOverlay() {
         if (overlayView != null) return
+        if (ProjectionStateMonitor.isProjectionActive) {
+            Log.d(TAG, "createOverlay: projection active — suppressing RoadSense overlay")
+            return
+        }
         // Cache the themed context so runtime color lookups resolve against the SAME
         // day/night configuration the views were inflated with (rebuilt on config
         // change via onConfigurationChanged → removeOverlay()+createOverlay()).

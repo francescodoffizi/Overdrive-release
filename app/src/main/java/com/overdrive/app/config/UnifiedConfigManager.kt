@@ -113,7 +113,7 @@ object UnifiedConfigManager {
     // down (the update window) so the caller falls through to the guarded local
     // write without a long stall; read timeout covers the daemon's full-JSON
     // rewrite under CONFIG_LOCK contention.
-    private const val IPC_CONNECT_TIMEOUT_MS = 1500
+    private const val IPC_CONNECT_TIMEOUT_MS = 250
     private const val IPC_READ_TIMEOUT_MS = 5000
     private const val IPC_RECONCILE_ATTEMPTS = 4
     private const val IPC_RECONCILE_DELAY_MS = 75L

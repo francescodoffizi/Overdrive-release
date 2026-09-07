@@ -107,6 +107,19 @@ public class StatusOverlayService extends Service {
     private boolean actionBarExpanded = false;
     private final Runnable autocollapseRunnable = () -> setActionBarExpanded(false);
 
+    private final com.overdrive.app.monitor.ProjectionStateMonitor.Listener projectionListener =
+            (active, pkg) -> {
+                if (active) {
+                    Log.i(TAG, "Projection active (" + pkg + ") — removing status overlay to protect GPU");
+                    removeOverlay();
+                } else {
+                    Log.i(TAG, "Projection inactive — restoring status overlay");
+                    if (running.get()) {
+                        handler.post(this::updateUI);
+                    }
+                }
+            };
+
     // State
     private volatile String configuredMode = "NONE";
     private volatile boolean isRecording = false;
@@ -511,6 +524,7 @@ public class StatusOverlayService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        com.overdrive.app.monitor.ProjectionStateMonitor.INSTANCE.addListener(projectionListener);
     }
 
     @Override
@@ -966,6 +980,7 @@ public class StatusOverlayService extends Service {
         //     stop() is documented (in AppAudioCaptureController) as fast —
         //     thread joins use a bounded wait inside cleanup().
         running.set(false);
+        com.overdrive.app.monitor.ProjectionStateMonitor.INSTANCE.removeListener(projectionListener);
         handler.removeCallbacksAndMessages(null);
         executor.shutdownNow();
         com.overdrive.app.audio.AppAudioCaptureController
@@ -1946,6 +1961,13 @@ public class StatusOverlayService extends Service {
         // sees a ghost pill they can't dismiss without killing the
         // app process.
         if (!running.get()) return;
+        if (com.overdrive.app.monitor.ProjectionStateMonitor.INSTANCE.isProjectionActive()) {
+            Log.d(TAG, "updateUI: projection active ("
+                    + com.overdrive.app.monitor.ProjectionStateMonitor.INSTANCE.getActiveProjectionPackage()
+                    + ") — suppressing status overlay");
+            removeOverlay();
+            return;
+        }
         // User-facing visibility toggles. Stored in the unified config file
         // (/data/local/tmp/overdrive_config.json) rather than SharedPreferences
         // because both the app UID and the shell/daemon UID need to see the
