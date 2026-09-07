@@ -186,6 +186,25 @@ public class ProxyHelper {
      * Returns Proxy.NO_PROXY if proxy is not available.
      */
     public static Proxy getHttpProxy() {
+        // If user explicitly enabled Tailscale/Proxy-only mode:
+        if (isProxyExpected()) {
+            if (isProxyAvailable()) {
+                Proxy.Type type = (proxyPort == TAILSCALE_PROXY_PORT)
+                        ? Proxy.Type.SOCKS
+                        : Proxy.Type.HTTP;
+                return new Proxy(type, new InetSocketAddress(PROXY_HOST, proxyPort));
+            }
+            return Proxy.NO_PROXY;
+        }
+
+        // If Wi-Fi is connected and has validated internet, prefer direct Wi-Fi (unmetered, full speed)
+        try {
+            if (com.overdrive.app.network.NetworkFailoverWatchdog.isWifiHealthy()) {
+                return Proxy.NO_PROXY;
+            }
+        } catch (Throwable ignored) {}
+
+        // Fallback: Wi-Fi is off, disconnected, or zombie without internet -> route via sing-box on vlan4 (T-Box SIM)
         if (isProxyAvailable()) {
             // Proxy TYPE must match the resolved backend port:
             //  - Tailscale (8539) is a `tailscaled --socks5-server` that ONLY speaks

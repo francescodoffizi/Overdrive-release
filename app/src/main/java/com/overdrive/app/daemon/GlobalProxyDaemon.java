@@ -203,6 +203,7 @@ public class GlobalProxyDaemon {
                 "      \"tag\": \"" + OUTBOUND_PROXY() + "\",\n" +
                 "      \"server\": \"" + SERVER_IP() + "\",\n" +
                 "      \"server_port\": 443,\n" +
+                "      \"bind_interface\": \"vlan4\",\n" +
                 "      \"uuid\": \"" + UUID() + "\",\n" +
                 "      \"flow\": \"" + FLOW_XTLS() + "\",\n" +
                 "      \"tls\": {\n" +
@@ -290,6 +291,9 @@ public class GlobalProxyDaemon {
 
         // Run sing-box - it will run as the same UID as this daemon (1000)
         // The binary is world-executable so this should work
+        // Ensure static route for VLESS server through vlan4
+        execShell("GW=$(ip route show dev vlan4 2>/dev/null | grep default | awk '{print $3}' | head -n 1); [ -z \"$GW\" ] && GW=\"172.16.0.101\"; ip route replace " + SERVER_IP() + "/32 via \"$GW\" dev vlan4 2>/dev/null || true");
+
         String cmd = "nohup " + singboxPath + " run -c " + configPath + " > " + logPath + " 2>&1 &";
         log("Starting " + SINGBOX_NAME() + ": " + cmd);
         execShell(cmd);

@@ -72,6 +72,16 @@ class OverdriveApplication : Application() {
         // App-process listener that binds Telenav's OEM AIDL for the daemon's
         // HTTP endpoint (the daemon can't bindService itself). Idempotent.
         com.overdrive.app.telenav.TelenavIpcServer.start(this)
+
+        // Resilient network failover watchdog: starts with 45s delay after boot
+        // to prevent any Binder contention during system_server stabilization.
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            try {
+                com.overdrive.app.network.NetworkFailoverWatchdog.getInstance(this).start()
+            } catch (e: Throwable) {
+                Log.w("OverdriveApplication", "Failed to start NetworkFailoverWatchdog: ${e.message}")
+            }
+        }, 45_000L)
     }
 
     /**

@@ -57,11 +57,34 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
         private const val MAX_RECOVERY_INTERVAL_MS = 300_000L     // 5 minutes max backoff
 
         @Volatile
+        var isWifiWithInternet: Boolean = false
+            internal set
+
+        @Volatile
         private var instance: NetworkFailoverWatchdog? = null
 
         fun getInstance(context: Context): NetworkFailoverWatchdog {
             return instance ?: synchronized(this) {
                 instance ?: NetworkFailoverWatchdog(context.applicationContext).also { instance = it }
+            }
+        }
+
+        @JvmStatic
+        fun isWifiHealthy(): Boolean {
+            val inst = instance ?: return false
+            if (inst.isForcedDisconnected) return false
+            if (isWifiWithInternet) return true
+
+            // Fast fallback: check ConnectivityManager
+            try {
+                val cm = inst.context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+                val net = cm.activeNetwork ?: return false
+                val caps = cm.getNetworkCapabilities(net) ?: return false
+                val isWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                val isValidated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                return isWifi && isValidated
+            } catch (e: Exception) {
+                return false
             }
         }
     }
@@ -94,9 +117,13 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                         if (isWifi) {
                             log.info(TAG, "Wi-Fi link became available")
                             isWifiAssociated = true
+                            if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) {
+                                isWifiWithInternet = true
+                            }
                             if (isForcedDisconnected) {
                                 log.info(TAG, "Wi-Fi re-connected during recovery window; verifying internet...")
                             }
+                            scheduleNextCheck(1000L)
                         }
                     }
                 }
@@ -104,6 +131,7 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                 override fun onLost(network: Network) {
                     workerHandler.post {
                         log.info(TAG, "Network link lost")
+                        isWifiWithInternet = false
                         // Immediate probe on next tick to adapt
                         scheduleNextCheck(2000L)
                     }
@@ -141,6 +169,7 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                 // Wi-Fi is physically off or disconnected naturally
                 consecutiveWifiFailures = 0
                 consecutiveWifiSuccesses = 0
+                isWifiWithInternet = false
                 return
             }
 
@@ -148,6 +177,7 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
             val hasInternet = probeInternetConnectivity()
 
             if (hasInternet) {
+                isWifiWithInternet = true
                 consecutiveWifiSuccesses++
                 if (consecutiveWifiFailures > 0) {
                     log.info(TAG, "Wi-Fi connectivity restored (successes=$consecutiveWifiSuccesses)")
@@ -155,6 +185,7 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                 consecutiveWifiFailures = 0
                 recoveryBackoffMs = INITIAL_RECOVERY_INTERVAL_MS
             } else {
+                isWifiWithInternet = false
                 consecutiveWifiFailures++
                 consecutiveWifiSuccesses = 0
                 log.warn(TAG, "Wi-Fi associated but NO internet detected (strike $consecutiveWifiFailures/$STRIKES_FOR_DISCONNECT)")
@@ -170,15 +201,20 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
 
     /**
      * Wi-Fi is stuck in "Zombie" state: associated to local hotspot with no internet gateway.
-     * Force disconnect wlan0 to release Android's default route to cellular (rmnet_data0).
+     * Force disconnect wlan0 so Overdrive routes via sing-box on vlan4 (T-Box SIM).
      */
     private fun handleZombieWifiDetected() {
-        log.warn(TAG, ">>> Zombie Wi-Fi detected! Forcing disconnect to failover to internal SIM (rmnet_data0) <<<")
+        log.warn(TAG, ">>> Zombie Wi-Fi detected! Forcing disconnect to failover to internal SIM (vlan4) <<<")
         isForcedDisconnected = true
+        isWifiWithInternet = false
         consecutiveWifiFailures = 0
 
-        // Passive observation only; avoid invasive shell svc/cmd calls that deadlock system_server
-        log.warn(TAG, "Wi-Fi link unroutable to internet, staying passive to protect system_server")
+        try {
+            com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
+        } catch (ignored: Throwable) {}
+
+        // Disconnect wlan0 so traffic is not trapped in dead Wi-Fi route
+        execShell("cmd wifi disconnect 2>/dev/null")
 
         // Schedule periodic recovery test with backoff
         log.info(TAG, "Scheduled Wi-Fi recovery probe in ${recoveryBackoffMs / 1000}s")
@@ -217,9 +253,13 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
                     if (probeInternetConnectivity()) {
                         log.info(TAG, ">>> Wi-Fi recovery CONFIRMED! Restoring primary WLAN operation <<<")
                         isForcedDisconnected = false
+                        isWifiWithInternet = true
                         consecutiveWifiFailures = 0
                         consecutiveWifiSuccesses = STRIKES_FOR_RECOVERY
                         recoveryBackoffMs = INITIAL_RECOVERY_INTERVAL_MS
+                        try {
+                            com.overdrive.app.mqtt.ProxyHelper.invalidateCache()
+                        } catch (ignored: Throwable) {}
                     } else {
                         log.warn(TAG, "Wi-Fi recovery second strike failed; suppressing unstable Wi-Fi")
                         reDisconnectZombieWifi()
@@ -233,6 +273,7 @@ class NetworkFailoverWatchdog private constructor(private val context: Context) 
     }
 
     private fun reDisconnectZombieWifi() {
+        isWifiWithInternet = false
         execShell("cmd wifi disconnect 2>/dev/null")
         scheduleNextRecoveryAttempt()
     }

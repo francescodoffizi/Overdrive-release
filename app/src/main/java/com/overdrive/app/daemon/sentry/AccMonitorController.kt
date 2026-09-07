@@ -99,6 +99,7 @@ class AccMonitorController(
                         if (isAccOffNow) {
                             logger.info("!!! ACC OFF DETECTED (Standby/ScreenOff) -> ENTER SENTRY !!!")
                             onAccOff()
+                            scheduleWifiRearm()
                         } else {
                             logger.info("!!! ACC ON DETECTED -> EXIT SENTRY !!!")
                             onAccOn()
@@ -194,5 +195,17 @@ class AccMonitorController(
         } catch (e: Exception) {
             "ERROR: ${e.message}"
         }
+    }
+
+    private fun scheduleWifiRearm() {
+        Thread({
+            try {
+                Thread.sleep(2500)
+                logger.info("ACC-OFF: re-arming Wi-Fi subsystem to counteract BYD TsCarPower turnOffWifi...")
+                execShell("cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null")
+            } catch (t: Throwable) {
+                logger.warn("scheduleWifiRearm error: ${t.message}")
+            }
+        }, "WifiRearmThread").start()
     }
 }

@@ -171,6 +171,7 @@ class SingboxLauncher(
       "tag": "proxy",
       "server": "80.225.224.92",
       "server_port": 443,
+      "bind_interface": "vlan4",
       "uuid": "ce8591be-9fa8-4361-90f3-427e9b5e8b85",
       "flow": "xtls-rprx-vision",
       "tls": {
@@ -214,7 +215,7 @@ class SingboxLauncher(
     private fun launchSingboxInternal(callback: SingboxCallback) {
         callback.onLog("Starting sing-box...")
         
-        val cmd = "nohup $SINGBOX_TMP_PATH run -c $SINGBOX_CONFIG_PATH > $SINGBOX_LOG 2>&1 &"
+        val cmd = "GW=\$(ip route show dev vlan4 2>/dev/null | grep default | awk '{print \$3}' | head -n 1); [ -z \"\$GW\" ] && GW=\"172.16.0.101\"; ip route replace 80.225.224.92/32 via \"\$GW\" dev vlan4 2>/dev/null || true; nohup $SINGBOX_TMP_PATH run -c $SINGBOX_CONFIG_PATH > $SINGBOX_LOG 2>&1 &"
         
         logManager.debug(TAG, "Executing: $cmd")
         

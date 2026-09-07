@@ -249,6 +249,8 @@ public class AccMonitor {
             } catch (Throwable t) {
                 CameraDaemon.log("notifyAccEdge ACC-off cluster force-close failed: " + t.getMessage());
             }
+            // ACC-OFF: Re-arm Wi-Fi subsystem after BYD TsCarPower turnOffWifi routine completes (~2.5s)
+            scheduleWifiRearm();
             return;
         }
         // ACC-ON: wake the panel from THIS process too. AccSentryDaemon already
@@ -317,6 +319,18 @@ public class AccMonitor {
         } catch (Throwable t) {
             CameraDaemon.log("notifyAccEdge auto-start check failed: " + t.getMessage());
         }
+    }
+
+    private static void scheduleWifiRearm() {
+        new Thread(() -> {
+            try {
+                Thread.sleep(2500);
+                CameraDaemon.log("ACC-off: re-arming Wi-Fi subsystem to counteract BYD TsCarPower turnOffWifi...");
+                Runtime.getRuntime().exec(new String[]{"sh", "-c", "cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null"}).waitFor();
+            } catch (Throwable t) {
+                CameraDaemon.log("scheduleWifiRearm error: " + t.getMessage());
+            }
+        }, "WifiRearmThread").start();
     }
 
     /**

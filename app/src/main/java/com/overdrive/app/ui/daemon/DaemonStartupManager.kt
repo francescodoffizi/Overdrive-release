@@ -526,23 +526,19 @@ class DaemonStartupManager(
         }
         log.info(TAG, "Starting optional daemons from preferences...")
 
-        // Singbox starts iff the user enabled it AND hasn't stopped it via a
-        // sentinel. Tunnels are independent toggles.
-        if (PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)) {
-            vm.singboxController.isRunning { isRunning ->
-                if (isRunning) {
-                    log.info(TAG, "Singbox already running, skipping start")
-                    handler.postDelayed({ startTunnelFromPreferences(vm) }, 1000)
-                } else {
-                    ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
-                        log.info(TAG, "Starting Singbox (user enabled)...")
-                        vm.startDaemon(DaemonType.SINGBOX_PROXY, userInitiated = false)
-                    }
-                    handler.postDelayed({ startTunnelFromPreferences(vm) }, 5000)
+        // Singbox starts for cellular failover unless the user explicitly stopped it via sentinel.
+        // Tunnels are independent toggles.
+        vm.singboxController.isRunning { isRunning ->
+            if (isRunning) {
+                log.info(TAG, "Singbox already running, skipping start")
+                handler.postDelayed({ startTunnelFromPreferences(vm) }, 1000)
+            } else {
+                ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
+                    log.info(TAG, "Starting Singbox for cellular failover...")
+                    vm.startDaemon(DaemonType.SINGBOX_PROXY, userInitiated = false)
                 }
+                handler.postDelayed({ startTunnelFromPreferences(vm) }, 5000)
             }
-        } else {
-            startTunnelFromPreferences(vm)
         }
 
         // Start Telegram Bot daemon if user enabled it and hasn't stopped it.
@@ -638,16 +634,13 @@ class DaemonStartupManager(
     internal fun startOptionalDaemonsViaAdb() {
         log.info(TAG, "Starting optional daemons via ADB...")
         try {
-            // Singbox is gated by its own user toggle AND the disable sentinel
-            // (a Telegram stop writes only the sentinel, never the pref).
-            if (PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)) {
-                ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
-                    log.info(TAG, "Boot: Starting Singbox (user enabled)...")
-                    adbLauncher.startSingbox(createLogCallback("Singbox"))
-                }
+            // Singbox runs as core failover proxy for Overdrive unless explicitly stopped
+            ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
+                log.info(TAG, "Boot: Starting Singbox for resilient cellular failover...")
+                adbLauncher.startSingbox(createLogCallback("Singbox"))
             }
 
-            val tunnelDelay = if (PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)) 5_000L else 0L
+            val tunnelDelay = 5_000L
 
             handler.postDelayed({
                 // Cloudflared and Zrok are mutually exclusive
