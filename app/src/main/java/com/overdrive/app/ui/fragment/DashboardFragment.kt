@@ -1604,7 +1604,7 @@ class DashboardFragment : Fragment() {
                 // value rather than leaving the field showing the previous
                 // model's number.
                 if (entry.nominalKwh > 0) {
-                    capInput.setText(String.format("%.1f", entry.nominalKwh))
+                    capInput.setText(String.format(java.util.Locale.US, "%.1f", entry.nominalKwh))
                 }
             }
         }
@@ -1725,7 +1725,7 @@ class DashboardFragment : Fragment() {
                 if (!isAdded || view == null) return@post
 
                 // Capacity input — current user value if any.
-                if (initialKwh > 0) capInput.setText(String.format("%.1f", initialKwh))
+                if (initialKwh > 0) capInput.setText(String.format(java.util.Locale.US, "%.1f", initialKwh))
 
                 // Model dropdown — populate using a Material adapter so the
                 // popup uses M3 list-item styling. setText(filter=false) sets
@@ -1828,8 +1828,8 @@ class DashboardFragment : Fragment() {
         dialog.setOnShowListener {
             dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
                 val raw = capInput.text?.toString()?.trim().orEmpty()
-                val kwh = raw.toDoubleOrNull()
-                if (kwh == null || kwh < 15.0 || kwh > 120.0) {
+                val kwh = raw.replace(',', '.').toDoubleOrNull()
+                if (kwh == null || kwh < 8.0 || kwh > 120.0) {
                     capLayout.error = getString(R.string.vehicle_dialog_invalid_capacity)
                     return@setOnClickListener
                 }

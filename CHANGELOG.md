@@ -4,6 +4,12 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [Unreleased]
 
+- **Ripristino Validazione Decimale Capacità Batteria nella Nuova UI Material 3 & Bump `versionCode` (`DashboardFragment.kt`, `app/build.gradle.kts`)**:
+  - **Supporto Virgola e Punto Decimale (`replace(',', '.')`)**: Ripristinata la normalizzazione dell'input utente per la capacità batteria, evitando che valori con virgola (es. `82,5` kWh nel locale italiano) vengano considerati non validi dalla nuova interfaccia M3.
+  - **Formattazione `Locale.US`**: Forzato l'uso esplicito di `java.util.Locale.US` nel pre-popolamento dei campi di testo per prevenire conflitti con la localizzazione di sistema.
+  - **Range di Validità Esteso a 8.0 - 120.0 kWh**: Corretto il limite minimo accettato nella nuova interfaccia M3 (riallineato da `15.0` a `8.0 kWh`, coerente con i modelli PHEV e con i backend `SohEstimator` e `PerformanceApiHandler`).
+  - **Allineamento `versionCode = 125`**: Aggiornato il fallback di `versionCode` da 120 a 125 in `app/build.gradle.kts` per garantire l'aggiornamento pulito rispetto al pacchetto sul veicolo (versione upstream `123`).
+
 - **Integrazione Upstream origin/main (PR #272, PR #275, PR #276, PR #277, PR #278)**:
   - **PR #272 (Dashboard Visual Redesign - UnrealSalty)**:
     - Nuova interfaccia nativa Material 3 con Hero Card veicolo riprogettata con schede a raggio 8dp (`fragment_dashboard.xml`, `DashboardFragment.kt`).
