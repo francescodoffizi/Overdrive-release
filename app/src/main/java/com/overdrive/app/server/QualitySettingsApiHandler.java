@@ -717,7 +717,8 @@ public class QualitySettingsApiHandler {
                 }
             }
             // A blind-spot card-rotation change must take effect live. The value is a
-            // fixed quarter turn (0/90/180/270) or "auto" (direction-of-travel); the
+            // fixed quarter turn (0/90/180/270), one of the free-angle presets (40/310,
+            // which carry a whole framing), or "auto" (direction-of-travel); the
             // base angle for "auto" is the sibling "rotationBase". Only honoured for
             // single-view modes (the daemon gates it); persisted by updateSection
             // above, then re-resolved onto the running GL scaler (vertex-shader output

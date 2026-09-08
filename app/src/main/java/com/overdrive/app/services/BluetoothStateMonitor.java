@@ -76,9 +76,13 @@ public final class BluetoothStateMonitor {
     // truth with the dedup BYPASSED. It's cheap and safe: the daemon's update() is edge-gated,
     // so a same-value re-assert fires no trigger — it only reseeds the map.
     private static final long REASSERT_SECONDS = 60;
-    // Delay for the post-connect name re-resolve (see scheduleNameRecheck). Long enough for the
-    // profile/SDP handshake to publish the friendly name, short enough to feel immediate.
-    private static final long NAME_RECHECK_MS = 1200L;
+    // Delays for the post-connect name re-resolves (see scheduleNameRecheck), in ms from the
+    // ACL_CONNECTED edge. The first is short enough to feel immediate; the later ones cover head
+    // units / phones whose profile+SDP handshake publishes the friendly name seconds after the
+    // link comes up, so the name lands well before the 60s re-assert would have caught it.
+    // Each attempt self-cancels once the name is known (see scheduleNameRecheck), so on the
+    // common path only the 1.2s tick does any work.
+    private static final long[] NAME_RECHECK_MS = {1200L, 3000L, 5000L, 10_000L};
     private final ScheduledExecutorService reassert = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "bt-state-reassert");
         t.setDaemon(true);
@@ -277,18 +281,53 @@ public final class BluetoothStateMonitor {
     }
 
     /**
-     * One short re-resolve after a connect edge, for the case where the device was known but its
-     * friendly name was not yet readable (name fetched over SDP after the link comes up). Without
-     * it, a connect that published an empty/stale name had to wait for the 60s re-assert — the
-     * reported device-name lag. Cheap and idempotent: relay() dedups, so if the name was already
-     * correct this sends nothing.
+     * A short ladder of re-resolves after a connect edge, for the case where the device was known
+     * but its friendly name was not yet readable (name fetched over SDP after the link comes up).
+     * Without it, a connect that published an empty/stale name had to wait for the 60s re-assert —
+     * the reported device-name lag.
+     *
+     * <p>Only scheduled on an ACL_CONNECTED edge (never on disconnect, adapter state or name
+     * changes), so this is a one-shot ladder per connect, not a background poll. Cheap and
+     * idempotent twice over: each tick returns immediately once a real friendly name has been
+     * accepted by the daemon, and relay() dedups anyway, so a slow phone costs at most four
+     * adapter reads and the common path costs one.
      */
     private void scheduleNameRecheck() {
-        try {
-            reassert.schedule(() -> publish(false), NAME_RECHECK_MS, TimeUnit.MILLISECONDS);
-        } catch (Throwable ignored) {
-            // Executor shutting down — the periodic re-assert still covers it.
+        for (long delayMs : NAME_RECHECK_MS) {
+            try {
+                reassert.schedule(() -> {
+                    // Already resolved and accepted by the daemon — nothing left to correct.
+                    // A disconnect in the meantime is handled by its own broadcast, and a
+                    // stale tick that does run only re-resolves ground truth (hint is null),
+                    // so it can never republish a device that has since gone away.
+                    if (nameResolved()) return;
+                    publish(false);
+                }, delayMs, TimeUnit.MILLISECONDS);
+            } catch (Throwable ignored) {
+                // Executor shutting down — the periodic re-assert still covers it.
+            }
         }
+    }
+
+    // A name that is really just the MAC address, i.e. deviceName()'s getAddress() fallback.
+    private static final java.util.regex.Pattern MAC_SHAPED =
+            java.util.regex.Pattern.compile("(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}");
+
+    /**
+     * True once a connected state with a REAL friendly name has been accepted by the daemon.
+     *
+     * <p>The MAC test is not cosmetic: {@link #deviceName} falls back to {@code getAddress()}
+     * when {@code getName()} is still null, so an unresolved name reaches the daemon as
+     * "AA:BB:CC:DD:EE:FF" — non-empty, and therefore indistinguishable from success by a plain
+     * isEmpty() check. Treating that as resolved would cancel the whole ladder in exactly the
+     * case it exists for, leaving the friendly name to the 60s re-assert.
+     */
+    private boolean nameResolved() {
+        String n = lastName;
+        return "on".equals(lastState)
+                && n != null
+                && !n.isEmpty()
+                && !MAC_SHAPED.matcher(n).matches();
     }
 
     /**

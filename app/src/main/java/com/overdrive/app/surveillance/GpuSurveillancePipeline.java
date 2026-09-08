@@ -5711,7 +5711,9 @@ public class GpuSurveillancePipeline {
                 // knob from recording.rectifyStrength; the shader applies it ONLY in the
                 // merge 1/2 passthrough (identity at 0, and never touches 'both'). The
                 // Match the active shared-lane buffer aspect.
-                s.setBlindSpotRectifyStrength((float) bs.optInt("rectifyStrength", 0));
+                // Applied via applyBsAngleToScaler below, which drops it on a preset
+                // angle (those framings were measured with no dewarp).
+                int fisheye = bs.optInt("rectifyStrength", 0);
                 s.setBlindSpotRectifyAspect((float) sharedLaneHeight / (float) BS_WIDTH);
                 // On-screen card rotation is done in the GL vertex shader (output
                 // geometry), NOT via the SurfaceControl layer transform — this
@@ -5761,12 +5763,15 @@ public class GpuSurveillancePipeline {
                     org.json.JSONObject g = bs.optJSONObject(geomKey);
                     alignX = bsCornerAlignX(resolveBsCorner(g));
                 }
-                s.setContentRotation(rot, alignX);
+                applyBsAngleToScaler(s, rot, alignX, fisheye, viewMode);
             }
         } catch (Throwable t) {
             logger.warn("blindspot calib apply failed: " + t.getMessage());
         }
     }
+
+    /** View 8 is the right camera; everything else is the left one. */
+    private static boolean right(int viewMode) { return viewMode == 8; }
 
     /**
      * Enable the dedicated blind-spot lane: a second scaler+encoder (1280×960 @
@@ -6246,7 +6251,11 @@ public class GpuSurveillancePipeline {
             // the current side just above (preset branch), so align the rotated card to
             // that corner's edge — a 90/270 card hugs left/right per side, not centered.
             com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
-            if (bss != null) bss.setContentRotation(bsRotationDeg, bsRotationAlignX());
+            if (bss != null) {
+                int fisheye = (bs != null) ? bs.optInt("rectifyStrength", 0) : 0;
+                applyBsAngleToScaler(bss, bsRotationDeg, bsRotationAlignX(), fisheye,
+                        bsViewMode);
+            }
         } catch (Throwable t) {
             logger.warn("resolveBsGeometry failed: " + t.getMessage());
             if (bsGeomRect[2] <= 0) {
@@ -6305,13 +6314,62 @@ public class GpuSurveillancePipeline {
         }
         // Fixed angle: read the per-side key when present, else the legacy global.
         int fixed = bs.has(sideKey) ? bs.optInt(sideKey, 0) : bs.optInt("rotation", 0);
-        return snapDeg(fixed);
+        return snapOrPreset(fixed);
     }
 
     /** Normalise an angle into {0,90,180,270} (mod 360, nearest quarter turn). */
     private static int snapDeg(int deg) {
         deg = ((deg % 360) + 360) % 360;
         return (Math.round(deg / 90f) * 90) % 360;
+    }
+
+    /** Normalise a FIXED angle, keeping the free-angle presets intact.
+     *
+     *  <p>Everything else still snaps to a quarter turn. The snap is not validation —
+     *  it exists because the card used to be turned by rotating its output quad, which
+     *  only maps a rectangle onto a rectangle at multiples of 90. The presets are
+     *  rendered by turning the video inside a card that stays rectangular, so that
+     *  constraint does not apply to them, and snapping would silently round 40 to 90
+     *  and 310 to 270 — the setting would appear to work and show the wrong view.
+     *
+     *  <p>AUTO keeps using {@link #snapDeg}: its base angle is flipped by 180 in
+     *  reverse, which is a quarter-turn idea and not defined for a preset framing. */
+    private static int snapOrPreset(int deg) {
+        if (BsAnglePreset.isPresetAngle(deg)) {
+            return ((deg % 360) + 360) % 360;
+        }
+        return snapDeg(deg);
+    }
+
+    /** Push the resolved angle to the scaler: a preset framing, or the quarter-turn
+     *  path exactly as before.
+     *
+     *  <p>The two are mutually exclusive by construction — a preset turns the video
+     *  inside a still-rectangular card, so the card's own rotation must be left at 0,
+     *  and clearing the preset is what restores the plain card for every other angle.
+     *  Both call sites that push an angle go through here so they cannot disagree.
+     *
+     *  @param fisheyeStrength the configured dewarp, applied only on the non-preset
+     *         path — the preset framings were measured without any dewarp, so leaving
+     *         one on would bend the picture away from the framing being reproduced. */
+    private int applyBsAngleToScaler(com.overdrive.app.streaming.GpuStreamScaler s,
+                                     int rot, int alignX, int fisheyeStrength,
+                                     int viewMode) {
+        BsAnglePreset preset = BsAnglePreset.forAngle(rot);
+        if (preset != null) {
+            s.setBlindSpotRectifyStrength(0f);
+            s.setBsPreset(preset.rotationDeg,
+                    preset.cropLeft, preset.cropTop, preset.cropRight, preset.cropBottom,
+                    preset.flipHorizontal, preset.flipVertical,
+                    preset.zoom, preset.translateXFrac, preset.translateYFrac,
+                    BsAnglePreset.PRESENT_ASPECT, alignX);
+            s.setContentRotation(0, alignX);
+            return 0;   // a preset framing carries no dewarp
+        }
+        s.clearBsPreset();
+        s.setBlindSpotRectifyStrength((float) fisheyeStrength);
+        s.setContentRotation(rot, alignX);
+        return fisheyeStrength;
     }
 
     /**
@@ -7752,8 +7810,14 @@ public class GpuSurveillancePipeline {
                     com.overdrive.app.streaming.GpuStreamScaler bss = bsScaler;
                     // bsCorner reflects the current side (setBlindSpotViewMode's
                     // reposition runs before this on a side change), so align the
-                    // rotated card to that side's edge.
-                    if (bss != null) bss.setContentRotation(wantRot, bsRotationAlignX());
+                    // rotated card to that side's edge. Routed through the shared
+                    // applier so a change AWAY from a preset also puts the card back to
+                    // full width — pushing the angle alone would leave the narrowed
+                    // card behind and letterbox an ordinary view.
+                    if (bss != null) {
+                        applyBsAngleToScaler(bss, wantRot, bsRotationAlignX(),
+                                bs.optInt("rectifyStrength", 0), bsViewMode);
+                    }
                 }
             }
             boolean debugPreview = bs.optBoolean("debugPreview", false);
@@ -8972,13 +9036,72 @@ public class GpuSurveillancePipeline {
      * the overlay renders), mirroring {@link #setBlindSpotMergeMode}. The dewarp is a
      * no-op in the merged 'both' view (shader only samples it in the merge 1/2
      * passthrough). No-op-safe when a lane isn't up.
+     *
+     * <p>A view showing a free-angle preset receives 0 instead. Those framings were
+     * measured with no dewarp, so applying one bends the picture away from the framing
+     * the preset exists to reproduce. The angle path already forces 0 while a preset is
+     * active, but this entry point is reached from the settings API and the automation
+     * action as well, and without the check a fisheye edit would land straight on the
+     * scaler and hold until the next re-resolve.
+     *
+     * <p>The decision is made per scaler by {@link #effectiveRectifyFor}, keyed on the
+     * ANGLE that scaler's view resolves to — see there for why the angle rather than
+     * live render state. Quarter turns and AUTO are unaffected: they are never preset
+     * angles, so they take the value exactly as before. The value is still persisted by
+     * the caller, and the angle path applies it the moment the driver picks a
+     * non-preset angle — nothing is lost, only deferred.
      */
     public void setBlindSpotRectifyStrength(int strength) {
         com.overdrive.app.streaming.GpuStreamScaler ss = streamScaler;
-        if (ss != null) ss.setBlindSpotRectifyStrength((float) strength);
+        int forStream = (ss != null) ? effectiveRectifyFor(ss, strength) : strength;
+        if (ss != null) ss.setBlindSpotRectifyStrength((float) forStream);
         com.overdrive.app.streaming.GpuStreamScaler bs = bsScaler;
-        if (bs != null) bs.setBlindSpotRectifyStrength((float) strength);
-        logger.info("Blind-spot fisheye strength set to " + strength);
+        int forCard = (bs != null) ? effectiveRectifyFor(bs, strength) : strength;
+        if (bs != null) bs.setBlindSpotRectifyStrength((float) forCard);
+        boolean held = (ss != null && forStream != strength)
+                || (bs != null && forCard != strength);
+        if (held) {
+            logger.info("Blind-spot fisheye strength " + strength
+                    + " stored; a preset framing keeps its own view at 0"
+                    + " (card=" + forCard + ", preview=" + forStream + ")");
+        } else {
+            logger.info("Blind-spot fisheye strength set to " + strength);
+        }
+    }
+
+    /**
+     * What a dewarp strength MEANS for the view a given scaler is rendering: the value
+     * itself, or 0 when that view is showing a free-angle preset.
+     *
+     * <p>Keyed on the ANGLE the view resolves to, not on whether a content transform
+     * happens to be active at this instant. The difference matters because the two
+     * sides can hold different angles — a quarter turn on one and a preset on the
+     * other — and a scaler renders whichever side is up at the time. Reading live state
+     * would make the outcome depend on the ORDER of a settings write against a side
+     * switch; reading the angle makes it depend on nothing but the angle, which is what
+     * the driver actually chose.
+     *
+     * <p>So with, say, 90 on the left and 40 on the right, a fisheye edit applies to the
+     * left view and never to the right, whichever side happens to be on screen when the
+     * edit lands. The quarter turns keep the setting exactly as they always had it.
+     *
+     * <p>Only the blind-spot views are gated. Any other view this scaler might be
+     * rendering takes the value unchanged — the setting is not ours to reinterpret
+     * there.
+     */
+    private int effectiveRectifyFor(com.overdrive.app.streaming.GpuStreamScaler s,
+                                    int strength) {
+        try {
+            int view = s.getViewMode();
+            if (view != 7 && view != 8) return strength;
+            org.json.JSONObject bs = com.overdrive.app.config.UnifiedConfigManager.getBlindSpot();
+            if (bs == null) return strength;
+            return BsAnglePreset.isPresetAngle(resolveBsRotation(bs, view)) ? 0 : strength;
+        } catch (Throwable t) {
+            // A preset framing losing its dewarp guard is worse than a quarter turn
+            // losing a dewarp it can re-apply on the next resolve, so fail closed.
+            return 0;
+        }
     }
 
     /** Map the persisted string merge mode to the scaler's int code. */

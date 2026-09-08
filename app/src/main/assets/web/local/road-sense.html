@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title data-i18n="app.road_sense_title">RoadSense - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
-    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/theme.js?v=6"></script>
     <script src="../shared/app-shell.js?v=6"></script>
     <!--
       Bottom-tab manifest. Tabs grouping the RoadSense settings cards:
@@ -27,7 +27,7 @@
         ];
     </script>
     <script src="../shared/app-tabs.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css?v=24">
+    <link rel="stylesheet" href="../shared/styles.css?v=25">
     <style>
         /* Blind-spot speed window: two narrow km/h fields on one row. .text-input is
            built for full-width fields (width:100% + min-width:200px), so a narrow
@@ -642,9 +642,11 @@
                             </div>
                             <div class="setting-control" style="display:flex;flex-wrap:wrap;">
                                 <button class="btn btn-secondary" id="bsRotL0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotL40" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 40)" data-i18n="road_sense.bs_rotation_40">40&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotL90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotL180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotL270" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotL310" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 310)" data-i18n="road_sense.bs_rotation_310">310&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotLAuto" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotation('left', 'auto')" data-i18n="road_sense.bs_rotation_auto">Auto</button>
                             </div>
                         </div>
@@ -667,9 +669,11 @@
                             </div>
                             <div class="setting-control" style="display:flex;flex-wrap:wrap;">
                                 <button class="btn btn-secondary" id="bsRotR0" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 0)" data-i18n="road_sense.bs_rotation_0">0&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotR40" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 40)" data-i18n="road_sense.bs_rotation_40">40&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotR90" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 90)" data-i18n="road_sense.bs_rotation_90">90&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotR180" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 180)" data-i18n="road_sense.bs_rotation_180">180&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotR270" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 270)" data-i18n="road_sense.bs_rotation_270">270&deg;</button>
+                                <button class="btn btn-secondary" id="bsRotR310" style="margin:0 8px 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 310)" data-i18n="road_sense.bs_rotation_310">310&deg;</button>
                                 <button class="btn btn-secondary" id="bsRotRAuto" style="margin:0 0 8px 0;" onclick="RoadSenseSettings.bsSetRotation('right', 'auto')" data-i18n="road_sense.bs_rotation_auto">Auto</button>
                             </div>
                         </div>

@@ -248,7 +248,11 @@ BYD.roadSense = {
                 // PER-SIDE rotation (left = view 7 / left turn, right = view 8 / right
                 // turn). Fall back to the legacy global rotation/rotationBase when a
                 // per-side key is absent so an un-migrated config still populates the UI.
-                var _rotOk = function (v) { return v === 0 || v === 90 || v === 180 || v === 270 || v === 'auto'; };
+                // 40 and 310 are the free-angle presets: picking one applies a whole
+                // framing (crop, mirror, zoom), not just an angle. 'auto' and the base
+                // angles stay quarter-turn only — 'auto' flips 180 in reverse, which is
+                // a quarter-turn idea that a preset framing has no meaning for.
+                var _rotOk = function (v) { return v === 0 || v === 40 || v === 90 || v === 180 || v === 270 || v === 310 || v === 'auto'; };
                 var _baseOk = function (v) { return v === 0 || v === 90 || v === 180 || v === 270; };
                 c.bsRotationLeft  = _rotOk(bs.rotationLeft)  ? bs.rotationLeft  : c.bsRotation;
                 c.bsRotationRight = _rotOk(bs.rotationRight) ? bs.rotationRight : c.bsRotation;
@@ -1588,12 +1592,25 @@ BYD.roadSense = {
         if (baseR) baseR.style.display = (single && this.config.bsRotationRight === 'auto') ? '' : 'none';
     },
 
+    /** Is this angle one of the free-angle presets, which bring their own framing? */
+    _bsIsPresetAngle(v) { return v === 40 || v === 310; },
+
     /** Fisheye/lens-dewarp applies only to the single-camera views — show the row
-     *  for side/rear, hide it for the merged 'both' view (libod handles that). */
+     *  for side/rear, hide it for the merged 'both' view (libod handles that).
+     *
+     *  Also hidden when BOTH sides use a free-angle preset. Those framings were
+     *  measured with no dewarp, so the daemon holds the setting back while one is
+     *  active; leaving the control on screen would offer a slider that does nothing.
+     *
+     *  Gated on BOTH sides, not either: the angle is per-side but the dewarp is one
+     *  global setting, so with a preset on one side and a quarter turn on the other it
+     *  still does something and has to stay reachable. */
     _bsReflectRectifyRow(mode) {
         var single = (mode === 'side' || mode === 'rear');
+        var bothPreset = this._bsIsPresetAngle(this.config.bsRotationLeft)
+            && this._bsIsPresetAngle(this.config.bsRotationRight);
         var row = document.getElementById('bsRectifyRow');
-        if (row) row.style.display = single ? '' : 'none';
+        if (row) row.style.display = (single && !bothPreset) ? '' : 'none';
     },
 
     /** Live-preview the fisheye strength while dragging (label + running scaler),
@@ -1887,14 +1904,16 @@ BYD.roadSense = {
         else { el.checked = !on; this._toastFailed(); }
     },
 
-    /** Select a SIDE's on-screen card rotation: a fixed quarter turn (0/90/180/270)
-     *  or 'auto' (direction-of-travel — the daemon holds that side's base angle moving
-     *  forward and flips 180° in reverse gear). side is 'left' (view 7) or 'right'
-     *  (view 8). Persists immediately and takes effect live on the running card. */
+    /** Select a SIDE's on-screen card rotation: a quarter turn (0/90/180/270), one of
+     *  the free-angle presets (40/310 — each also applies its own crop, mirror and
+     *  zoom, so no other setting has to be touched), or 'auto' (direction-of-travel —
+     *  the daemon holds that side's base angle moving forward and flips 180° in
+     *  reverse gear). side is 'left' (view 7) or 'right' (view 8). Persists immediately
+     *  and takes effect live on the running card. */
     async bsSetRotation(side, deg) {
         var isRight = (side === 'right');
         var d = (deg === 'auto') ? 'auto' : parseInt(deg, 10);
-        if (d !== 0 && d !== 90 && d !== 180 && d !== 270 && d !== 'auto') return;
+        if (d !== 0 && d !== 40 && d !== 90 && d !== 180 && d !== 270 && d !== 310 && d !== 'auto') return;
         var key = isRight ? 'bsRotationRight' : 'bsRotationLeft';
         var saveKey = isRight ? 'rotationRight' : 'rotationLeft';
         var prev = this.config[key];
@@ -1902,17 +1921,27 @@ BYD.roadSense = {
         this.config[key] = d;
         this._bsHighlightRotation(side, d);
         this._bsReflectAutoBaseRow(side, d);
+        // Picking a preset can make the fisheye control inert, so re-evaluate its row
+        // here as well — otherwise it would only update on a reload or a mode change.
+        this._bsReflectRectifyRow(this.config.bsMergeMode);
         var payload = {}; payload[saveKey] = d;
         const ok = await this._bsSave(payload);
         if (ok) { this._toastSaved(); }
-        else { this.config[key] = prev; this._bsHighlightRotation(side, prev); this._bsReflectAutoBaseRow(side, prev); this._toastFailed(); }
+        else {
+            this.config[key] = prev;
+            this._bsHighlightRotation(side, prev);
+            this._bsReflectAutoBaseRow(side, prev);
+            this._bsReflectRectifyRow(this.config.bsMergeMode);
+            this._toastFailed();
+        }
     },
 
     /** Highlight the selected rotation button for one side (M3 tonal selection). */
     _bsHighlightRotation(side, deg) {
         var isRight = (side === 'right');
         var pfx = isRight ? 'bsRotR' : 'bsRotL';
-        var map = { 0: pfx + '0', 90: pfx + '90', 180: pfx + '180', 270: pfx + '270', auto: pfx + 'Auto' };
+        var map = { 0: pfx + '0', 40: pfx + '40', 90: pfx + '90', 180: pfx + '180',
+                    270: pfx + '270', 310: pfx + '310', auto: pfx + 'Auto' };
         for (var k in map) {
             var el = document.getElementById(map[k]);
             if (el) {

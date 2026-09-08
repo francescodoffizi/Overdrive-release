@@ -835,6 +835,42 @@ public final class KeymapApiHandler {
                 && !a11yBoundProbeResult) {
             return false;
         }
+        // DEFINITIVE NEGATIVE, checked before the ServiceRecord heuristic below.
+        //
+        // AccessibilityManagerService keeps three separate lists, and the one that
+        // matters here is the one the heuristic cannot see: a service whose bind was
+        // started but never completed sits in "Binding services" and NEVER in
+        // "Bound services". onServiceConnected has not run for it, so everything it
+        // starts — the keymap key filter, and BluetoothStateMonitor with it — does
+        // not exist, while the process itself is alive and healthy-looking.
+        //
+        // The ServiceRecord probe below reports this state as BOUND. Its three
+        // contains() tests are evaluated against one flat dump and nothing requires
+        // them to describe the SAME record: on a wedged unit the dump carried a
+        // ServiceRecord for an unrelated service (.overlay.StatusOverlayService)
+        // with its own non-null app=, plus ConnectionRecord lines that merely
+        // mention our component (one of them marked DEAD). All three matched, so
+        // the watchdog concluded "healthy", stopped escalating, and never issued
+        // the force-restart that is the only thing that clears the wedge. Field
+        // capture: a11y stuck Binding for 11+ minutes across a power cycle, zero
+        // BluetoothStateMonitor lines, phone connected the whole time.
+        //
+        // So ask the component that owns the truth. This can only ever turn a false
+        // "bound" into "not bound", and only when AMS itself says the bind is still
+        // in flight — a genuinely bound service is not listed under Binding
+        // services, so no healthy unit can be pushed into a spurious restart.
+        try {
+            String a11y = execBounded("dumpsys accessibility 2>/dev/null");
+            if (a11y != null && isBindPending(a11y)) {
+                a11yBoundProbeResult = false;
+                a11yBoundProbeAtMs = android.os.SystemClock.elapsedRealtime();
+                return false;
+            }
+        } catch (Throwable ignored) {
+            // Dump unavailable — fall through to the heuristic, i.e. exactly the
+            // pre-existing behaviour. This check only ever adds detection.
+        }
+
         // Daemon path (UID 2000): an active ServiceRecord for the component proves
         // AMS has bound it. Mirrors ServiceLauncher.isLocationSidecarRunning's
         // "non-empty && !app=null" test. 2s ceiling so a slow dumpsys can never
@@ -871,6 +907,70 @@ public final class KeymapApiHandler {
             a11yBoundProbeResult = false;
             a11yBoundProbeAtMs = android.os.SystemClock.elapsedRealtime();
             return false;
+        }
+    }
+
+    /**
+     * True when AMS lists our component under "Binding services" — the bind was started
+     * but {@code onServiceConnected} never ran.
+     *
+     * <p>Scoped to that ONE list on purpose. "Enabled services" lists the same component
+     * whenever the user has switched the service on, and "Bound services" is printed
+     * immediately above, so a whole-dump {@code contains()} would match in every state and
+     * report a permanent wedge on a perfectly healthy unit.
+     *
+     * <p>The scope is taken by BRACE MATCHING, not by reading to the end of the line. AMS
+     * wraps a list onto continuation lines once it holds more than one entry — observed
+     * live, with "Bound services" spilling its second entry ({@code Service[label=OverDrive
+     * …]}) onto the next line. A line-bounded read would therefore silently miss a pending
+     * component whenever a second service happens to be binding at the same time, i.e. it
+     * would fail exactly in the busier situations this check exists for.
+     *
+     * <p>Note "Bound services" is NOT tested as the positive counterpart: it prints
+     * {@code label=} (a user-facing, translatable, rebrandable string), never the component,
+     * so keying "healthy" off it would turn a label change into a permanent restart loop.
+     * The pending list names components, so it is the one that can be trusted.
+     */
+    private static boolean isBindPending(String dump) {
+        int i = dump.indexOf("Binding services:");
+        if (i < 0) return false;   // list absent on this build — say nothing
+        int open = dump.indexOf('{', i);
+        if (open < 0) return false;
+        int depth = 0;
+        for (int p = open; p < dump.length(); p++) {
+            char c = dump.charAt(p);
+            if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) {
+                return dump.substring(open, p + 1).contains(A11Y_COMPONENT);
+            }
+        }
+        // Unbalanced (truncated dump): fall back to the conservative answer rather than
+        // scanning the remainder, which would sweep in the Window[...] entries below.
+        return false;
+    }
+
+    /**
+     * Run a shell command and return its output, or null on any failure. Bounded the same
+     * way as the ServiceRecord probe: output drained on this thread so the child cannot
+     * wedge on a full pipe, 2s ceiling so a slow dumpsys cannot park a watchdog tick, and
+     * force-killed either way.
+     */
+    private static String execBounded(String cmd) {
+        Process p = null;
+        try {
+            p = new ProcessBuilder("sh", "-c", cmd).redirectErrorStream(true).start();
+            StringBuilder sb = new StringBuilder();
+            try (java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            }
+            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+            return sb.toString();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (p != null) p.destroyForcibly();
         }
     }
 

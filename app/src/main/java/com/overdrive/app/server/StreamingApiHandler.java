@@ -23,6 +23,10 @@ import java.io.OutputStream;
  */
 public class StreamingApiHandler {
 
+    /** One message for every rejected rotation, so the accepted set is stated once. */
+    private static final String ROTATION_ERROR =
+            "rotation must be 0, 40, 90, 180, 270, 310 or 'auto'";
+
     private static String streamingQuality = "LOW";  // Default to LOW for better performance
 
     // Last view-mode the user explicitly picked, persisted across scaler
@@ -1036,7 +1040,8 @@ public class StreamingApiHandler {
      *       accepts {@code up}/{@code down} to step by {@link #BS_FISHEYE_STEP}, so one
      *       button can nudge it repeatedly.</li>
      *   <li>{@code cameras} both|side|rear — which camera(s) fill the card.</li>
-     *   <li>{@code rotation} 0|90|180|270|auto — on-screen quarter turn, with
+     *   <li>{@code rotation} 0|40|90|180|270|310|auto — on-screen turn; 40 and 310
+     *       are free-angle presets that also carry their own crop/mirror/zoom, with
      *       {@code side} = left|right|both choosing which mirror-imaged camera it
      *       applies to (default both). Only honoured in the single-camera modes; the
      *       daemon gates that, same as the settings UI.</li>
@@ -1091,7 +1096,9 @@ public class StreamingApiHandler {
         }
 
         // ── Per-side card rotation. "auto" stores the string the daemon's resolver
-        //    already understands; a fixed angle must be an exact quarter turn. ──
+        //    already understands; a fixed angle must be a quarter turn or one of the
+        //    two free-angle presets, which carry a whole framing rather than just an
+        //    angle (see BsAnglePreset). ──
         String rotation = p.get("rotation");
         if (rotation != null) {
             String r = rotation.trim().toLowerCase();
@@ -1107,11 +1114,12 @@ public class StreamingApiHandler {
                 int deg;
                 try { deg = Integer.parseInt(r); }
                 catch (NumberFormatException e) {
-                    HttpResponse.sendJsonError(out, "rotation must be 0, 90, 180, 270 or 'auto'");
+                    HttpResponse.sendJsonError(out, ROTATION_ERROR);
                     return;
                 }
-                if (deg != 0 && deg != 90 && deg != 180 && deg != 270) {
-                    HttpResponse.sendJsonError(out, "rotation must be 0, 90, 180, 270 or 'auto'");
+                if (deg != 0 && deg != 90 && deg != 180 && deg != 270
+                        && !com.overdrive.app.surveillance.BsAnglePreset.isPresetAngle(deg)) {
+                    HttpResponse.sendJsonError(out, ROTATION_ERROR);
                     return;
                 }
                 rotVal = deg;

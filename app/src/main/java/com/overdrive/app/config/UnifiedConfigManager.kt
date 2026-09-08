@@ -798,8 +798,9 @@ object UnifiedConfigManager {
         // "side" (side camera only), or "rear" (rear camera only). The single-camera
         // modes show one full-FOV feed instead of the merged panorama.
         if (!blindspot.has("mergeMode")) blindspot.put("mergeMode", "both")
-        // On-screen card rotation. Either a fixed quarter turn (int 0/90/180/270) or
-        // the string "auto". Applied by the SurfaceControl layer, and only honoured
+        // On-screen card rotation. A fixed quarter turn (int 0/90/180/270), one of the
+        // free-angle presets (40/310, which also carry their own crop/mirror/zoom — see
+        // BsAnglePreset), or the string "auto". Only honoured
         // for the single-camera merge modes (side/rear) — the merged panorama always
         // renders upright. 0 = shipping. In "auto" the daemon orients to direction of
         // travel: it holds "rotationBase" moving forward and flips 180° in reverse.
@@ -810,7 +811,7 @@ object UnifiedConfigManager {
         // camera (view 8, right turn) are physically mirror-imaged, so each needs its
         // own on-screen rotation — one global angle that reads upright on the left cam
         // reads wrong on the right. rotationLeft/rotationRight are the fixed per-side
-        // quarter turns (int 0/90/180/270 or the string "auto"); when rotation="auto",
+        // angles (int 0/40/90/180/270/310 or the string "auto"); when rotation="auto",
         // rotationBaseLeft/rotationBaseRight are that side's forward-gear base (reverse
         // flips 180°). Defaults mirror the legacy global keys so an existing config is
         // unchanged; resolveBsRotation falls back to the global keys when these are

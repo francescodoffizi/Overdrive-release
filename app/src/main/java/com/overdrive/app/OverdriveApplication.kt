@@ -73,6 +73,20 @@ class OverdriveApplication : Application() {
         // HTTP endpoint (the daemon can't bindService itself). Idempotent.
         com.overdrive.app.telenav.TelenavIpcServer.start(this)
 
+        // Signal relays for the daemon (it cannot read call/Bluetooth state from
+        // UID 2000). Started HERE, on plain process start, and not only from
+        // KeepAliveAccessibilityService.onServiceConnected as before.
+        try {
+            com.overdrive.app.services.CallStateMonitor.start(this)
+        } catch (ignored: Throwable) {
+            // Guard only: the a11y hook calls start() again if it ever binds.
+        }
+        try {
+            com.overdrive.app.services.BluetoothStateMonitor.start(this)
+        } catch (ignored: Throwable) {
+            // Guard only: the a11y hook calls start() again if it ever binds.
+        }
+
         // Resilient network failover watchdog: starts with 45s delay after boot
         // to prevent any Binder contention during system_server stabilization.
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({

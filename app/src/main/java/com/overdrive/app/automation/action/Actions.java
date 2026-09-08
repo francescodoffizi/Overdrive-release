@@ -1251,8 +1251,10 @@ public class Actions {
                         new Label("rear", "automation.bs_cameras_rear"))));
         // On-screen rotation of the card, per side. The left-turn and right-turn
         // cameras are mirror-imaged, so an angle that reads upright on one reads wrong
-        // on the other — hence the side picker. "Auto" tracks direction of travel
-        // (flips 180° in reverse). Applies to the single-camera views only.
+        // on the other — hence the side picker. 40° and 310° are not plain angles: each
+        // applies a whole ready-made blind-spot framing (crop, mirror, zoom) so an
+        // automation can select the view in one step. "Auto" tracks direction of travel
+        // (flips 180° in reverse) and stays quarter-turn only. Single-camera views only.
         addAction(new ApiAction(
                 new Label("blindSpotRotation", "automation.bs_rotation"),
                 "automation.bs_rotation_description",
@@ -1262,9 +1264,11 @@ public class Actions {
                 new EnumType(
                         new Label("rotation", "automation.bs_rotation_label"),
                         new Label("0", "automation.bs_rotation_0"),
+                        new Label("40", "automation.bs_rotation_40"),
                         new Label("90", "automation.bs_rotation_90"),
                         new Label("180", "automation.bs_rotation_180"),
                         new Label("270", "automation.bs_rotation_270"),
+                        new Label("310", "automation.bs_rotation_310"),
                         new Label("auto", "automation.bs_rotation_auto")),
                 new EnumType(
                         new Label("side", "automation.bs_side"),

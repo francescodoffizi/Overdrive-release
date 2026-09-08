@@ -86,6 +86,30 @@ public class GpuStreamScaler {
     private int uBsRectifyK1Location     = -1;
     private int uBsRectifyK2Location     = -1;
     private int uBsRectifyAspectLocation = -1;
+    // Free-angle CONTENT transform for the blind-spot card (views 7/8). Maps the
+    // card's local uv to the source uv, so the picture turns inside a card that
+    // stays rectangular. Identity + inactive by default: every existing path,
+    // including the 0/90/180/270 rotations (which keep using uRotation), renders
+    // exactly as before. Written by setBsContentTransform on the app/JS thread,
+    // read by drawFrame on the GL thread under bsContentLock.
+    private final Object bsContentLock = new Object();
+    private final float[] bsContentMat = { 1f, 0f, 0f, 1f };   // column-major mat2
+    private final float[] bsContentOff = { 0f, 0f };
+    private volatile boolean bsContentActive = false;
+    private final float[] scratchBsContentMat = new float[4];  // GL-thread snapshot
+    private final float[] scratchBsContentOff = new float[2];
+    private int uBsContentMatLocation    = -1;
+    private int uBsContentOffLocation    = -1;
+    private int uBsContentActiveLocation = -1;
+    // Card shape for the free-angle path: narrow the card inside the buffer and slide
+    // it back against its anchored edge. Full width / no shift = every existing path.
+    private volatile float bsCardWidthFrac = 1.0f;
+    private volatile float bsCardShiftX    = 0.0f;
+    // Shape the card actually ended up with, published so callers and tests can check
+    // the framing against it instead of re-deriving it.
+    private volatile float bsCardAspect    = 0.0f;
+    private int uBsCardWidthFracLocation = -1;
+    private int uBsCardShiftXLocation    = -1;
     private int uApaModeLocation;
     private int uTexMatrixLocation;
     private int uApplyManualYFlipLocation;
@@ -361,6 +385,11 @@ public class GpuStreamScaler {
         uBsRectifyK1Location     = GLES20.glGetUniformLocation(programId, "uBsRectifyK1");
         uBsRectifyK2Location     = GLES20.glGetUniformLocation(programId, "uBsRectifyK2");
         uBsRectifyAspectLocation = GLES20.glGetUniformLocation(programId, "uBsRectifyAspect");
+        uBsContentMatLocation    = GLES20.glGetUniformLocation(programId, "uBsContentMat");
+        uBsContentOffLocation    = GLES20.glGetUniformLocation(programId, "uBsContentOff");
+        uBsContentActiveLocation = GLES20.glGetUniformLocation(programId, "uBsContentActive");
+        uBsCardWidthFracLocation = GLES20.glGetUniformLocation(programId, "uBsCardWidthFrac");
+        uBsCardShiftXLocation    = GLES20.glGetUniformLocation(programId, "uBsCardShiftX");
         uApaModeLocation = GLES20.glGetUniformLocation(programId, "uApaMode");
         uTexMatrixLocation = GLES20.glGetUniformLocation(programId, "uTexMatrix");
         uApplyManualYFlipLocation = GLES20.glGetUniformLocation(programId, "uApplyManualYFlip");
@@ -551,6 +580,38 @@ public class GpuStreamScaler {
                 if (uBsRectifyK1Location     >= 0) GLES20.glUniform1f(uBsRectifyK1Location,     bsRectifyK1);
                 if (uBsRectifyK2Location     >= 0) GLES20.glUniform1f(uBsRectifyK2Location,     bsRectifyK2);
                 if (uBsRectifyAspectLocation >= 0) GLES20.glUniform1f(uBsRectifyAspectLocation, bsRectifyAspect);
+                // Free-angle content transform. Gated to the BS views for the same
+                // reason as uBsMargin: the branch is only reachable on 7/8, and
+                // forcing it inert elsewhere keeps a stale preset from ever leaking
+                // into another view's sampling. Copied under the lock so the mat2
+                // and its offset always publish as one consistent pair.
+                if (uBsContentActiveLocation >= 0) {
+                    float[] cm = scratchBsContentMat;
+                    float[] co = scratchBsContentOff;
+                    boolean act;
+                    synchronized (bsContentLock) {
+                        cm[0] = bsContentMat[0]; cm[1] = bsContentMat[1];
+                        cm[2] = bsContentMat[2]; cm[3] = bsContentMat[3];
+                        co[0] = bsContentOff[0]; co[1] = bsContentOff[1];
+                        act = bsContentActive;
+                    }
+                    boolean on = bsv && act;
+                    GLES20.glUniform1f(uBsContentActiveLocation, on ? 1.0f : 0.0f);
+                    if (uBsContentMatLocation >= 0) {
+                        GLES20.glUniformMatrix2fv(uBsContentMatLocation, 1, false, cm, 0);
+                    }
+                    if (uBsContentOffLocation >= 0) {
+                        GLES20.glUniform2f(uBsContentOffLocation, co[0], co[1]);
+                    }
+                }
+                // Card shape. Gated the same way, and forced back to full width on a
+                // non-BS view so no other path can inherit a narrowed card.
+                if (uBsCardWidthFracLocation >= 0) {
+                    GLES20.glUniform1f(uBsCardWidthFracLocation, bsv ? bsCardWidthFrac : 1.0f);
+                }
+                if (uBsCardShiftXLocation >= 0) {
+                    GLES20.glUniform1f(uBsCardShiftXLocation, bsv ? bsCardShiftX : 0.0f);
+                }
             }
             if (uApplyManualYFlipLocation >= 0) {
                 // SurfaceTexture layouts 1/3 use the matrix's Y-flip. Layout 0 / DiLink 5 needs manual Y-flip.
@@ -818,6 +879,291 @@ public class GpuStreamScaler {
 
     /** Current on-screen card rotation in degrees (0/90/180/270). */
     public int getContentRotation() { return contentRotationDeg; }
+
+    /**
+     * Turn the blind-spot card's VIDEO by a free angle, inside a card that stays
+     * rectangular — the counterpart to {@link #setContentRotation(int, int)}, which
+     * turns the card itself.
+     *
+     * <p>{@code setContentRotation} rotates the output quad. That is correct for a
+     * quarter turn, where a rectangle maps onto a rectangle, but at any other angle
+     * the card would become a diamond. Here the SAMPLING coordinate is transformed
+     * instead: the card keeps its rectangle, its rounded corners and its lit bevel,
+     * and the picture spins within it, clipped at the card edge. Regions the source
+     * frame does not cover are left transparent rather than smeared, so a rotated
+     * view shows empty corners the way a rotated rectangular viewport does.
+     *
+     * <p>The two are independent — a caller using this must leave the quad rotation
+     * at 0, or the card would turn as well.
+     *
+     * <h4>Parameters</h4>
+     * The framing is described the way a viewer would: crop the source, mirror it,
+     * turn it, zoom it, nudge it. In order of application:
+     * <ol>
+     *   <li>crop to the sub-rectangle left after removing the four edge fractions,</li>
+     *   <li>mirror horizontally and/or vertically,</li>
+     *   <li>rotate {@code rotationDeg} clockwise (screen sense, y down),</li>
+     *   <li>scale by {@code zoom} about the crop centre,</li>
+     *   <li>translate by the two fractions.</li>
+     * </ol>
+     *
+     * <h4>Why an inverse</h4>
+     * A fragment shader asks "which source texel feeds THIS output pixel", so the
+     * uniform pair holds the inverse of that visual transform, pre-composed into one
+     * affine {@code source = M·uv + off}. Folding it here keeps the shader to a
+     * single mat2 multiply and keeps the whole derivation in one readable place.
+     *
+     * <h4>Aspect</h4>
+     * A rotation is only rigid in a space with square pixels, but card uv is
+     * normalised to [0,1] on both axes, so a turn applied naively to it would shear.
+     * {@code cardAspect} folds the correction in. It must be the card's aspect AS
+     * DISPLAYED (dest rect width/height on the panel), NOT the GL buffer's — when
+     * those two differ the buffer is being stretched into the rect, and the buffer's
+     * own ratio would leave the picture sheared by exactly that difference.
+     *
+     * @param rotationDeg    clockwise rotation in degrees, any value
+     * @param cropLeft       fraction removed from the left edge, clamped to [0, 0.95]
+     * @param cropTop        fraction removed from the top edge
+     * @param cropRight      fraction removed from the right edge
+     * @param cropBottom     fraction removed from the bottom edge
+     * @param flipHorizontal mirror across the vertical axis
+     * @param flipVertical   mirror across the horizontal axis
+     * @param zoom           scale about the crop centre, clamped to [0.1, 10]
+     * @param translateXFrac shift as a fraction of card width, + = right
+     * @param translateYFrac shift as a fraction of card height, + = down
+     * @param cardAspect     displayed card width / height; values <= 0 are treated as 1
+     */
+    public void setBsContentTransform(float rotationDeg,
+                                      float cropLeft, float cropTop,
+                                      float cropRight, float cropBottom,
+                                      boolean flipHorizontal, boolean flipVertical,
+                                      float zoom,
+                                      float translateXFrac, float translateYFrac,
+                                      float cardAspect) {
+        float cl = clampCrop(cropLeft);
+        float ct = clampCrop(cropTop);
+        float cr = clampCrop(cropRight);
+        float cb = clampCrop(cropBottom);
+        float cropWn = 1.0f - cl - cr;      // kept width, as a fraction of the source
+        float cropHn = 1.0f - ct - cb;
+        // A degenerate crop has no source rectangle to show. Fall back to the
+        // untransformed card rather than uploading a singular matrix.
+        if (cropWn <= 1e-4f || cropHn <= 1e-4f) {
+            clearBsContentTransform();
+            return;
+        }
+        float z = Math.max(0.1f, Math.min(10.0f, zoom));
+        float a = (cardAspect > 1e-4f) ? cardAspect : 1.0f;
+
+        double rad = Math.toRadians(((rotationDeg % 360.0f) + 360.0f) % 360.0f);
+        float cos = (float) Math.cos(rad);
+        float sin = (float) Math.sin(rad);
+        float fh = flipHorizontal ? -1.0f : 1.0f;
+        float fv = flipVertical ? -1.0f : 1.0f;
+
+        // Inverse transform, derived once: undo the translate and the zoom, undo the
+        // rotation (transposed rotation matrix), then undo crop+mirror. The 1/a and a
+        // terms enter and leave aspect space around the rotation, which is why they
+        // land only on the off-diagonal.
+        float m00 =  cropWn * fh * cos / z;
+        float m01 =  cropWn * fh * sin / (a * z);
+        float m10 = -cropHn * fv * a * sin / z;
+        float m11 =  cropHn * fv * cos / z;
+
+        // Constant term: the crop centre is what the card centre must land on, after
+        // the same inverse is applied to the centre-plus-translate pivot.
+        float cxn = (cl + 1.0f - cr) * 0.5f;
+        float cyn = (ct + 1.0f - cb) * 0.5f;
+        float px = 0.5f + translateXFrac;
+        float py = 0.5f + translateYFrac;
+        float offX = cxn - (m00 * px + m01 * py);
+        float offY = cyn - (m10 * px + m11 * py);
+
+        synchronized (bsContentLock) {
+            // Column-major mat2: {col0.x, col0.y, col1.x, col1.y} = {m00, m10, m01, m11}.
+            bsContentMat[0] = m00; bsContentMat[1] = m10;
+            bsContentMat[2] = m01; bsContentMat[3] = m11;
+            bsContentOff[0] = offX; bsContentOff[1] = offY;
+            bsContentActive = true;
+        }
+        logger.info(String.format(Locale.US,
+                "BS content transform set: rot=%.1f crop=(%.3f,%.3f,%.3f,%.3f) "
+                        + "flip=(%s,%s) zoom=%.3f translate=(%.4f,%.4f) aspect=%.4f",
+                rotationDeg, cl, ct, cr, cb, flipHorizontal, flipVertical, z,
+                translateXFrac, translateYFrac, a));
+    }
+
+    /** Crop fractions are clamped the same way on every edge: never negative, and
+     *  never so large that the four of them could leave no source rectangle. */
+    private static float clampCrop(float v) {
+        if (v < 0.0f) return 0.0f;
+        return Math.min(v, 0.95f);
+    }
+
+    /**
+     * Drop back to the untransformed card: the shader stops applying the content
+     * affine entirely, so sampling returns to exactly what it was. Safe to call when
+     * no transform was ever set.
+     */
+    public void clearBsContentTransform() {
+        synchronized (bsContentLock) {
+            bsContentMat[0] = 1f; bsContentMat[1] = 0f;
+            bsContentMat[2] = 0f; bsContentMat[3] = 1f;
+            bsContentOff[0] = 0f; bsContentOff[1] = 0f;
+            bsContentActive = false;
+        }
+    }
+
+    /** True while a free-angle content transform is in effect.
+     *
+     *  <p>Test-visible: the render path reads {@link #bsContentActive} directly, so
+     *  nothing in production calls this. It is the only way a test can assert that a
+     *  preset was actually installed — and, more usefully, that clearing one really
+     *  put the transform back to identity rather than leaving a stale matrix that the
+     *  shader would keep applying. */
+    public boolean isBsContentTransformActive() { return bsContentActive; }
+
+    /**
+     * Apply a complete free-angle framing preset to the blind-spot card: reshape the
+     * card to suit the crop, then turn the video inside it.
+     *
+     * <p>Prefer this over calling {@link #setBsContentTransform} directly. The card's
+     * shape and the content transform have to agree — a crop that keeps half the width
+     * needs a card half as wide, or the picture is stretched as well as turned — and
+     * deriving both from the same numbers here is what keeps them from drifting apart.
+     * The caller supplies the framing; the card shape follows from it.
+     *
+     * <p>The card is narrowed inside the buffer, not by shrinking the on-screen rect:
+     * the rect has to keep the buffer's aspect because the rounded corners are baked
+     * into the buffer, so a differently-shaped rect would scale them into ellipses. The
+     * narrowed card is pillarboxed instead, with the empty part transparent — the same
+     * treatment a quarter-turned card already gets. {@code alignX} slides it back
+     * against the edge it is anchored to so it does not float in the middle of its rect.
+     *
+     * <p>The caller must leave the quad rotation at 0 while a preset is active
+     * ({@code setContentRotation(0, …)}), or the card would turn as well as its content.
+     *
+     * @param rotationDeg    clockwise rotation of the video, any angle
+     * @param cropLeft       fraction removed from the source's left edge
+     * @param cropTop        fraction removed from the top edge
+     * @param cropRight      fraction removed from the right edge
+     * @param cropBottom     fraction removed from the bottom edge
+     * @param flipHorizontal mirror across the vertical axis
+     * @param flipVertical   mirror across the horizontal axis
+     * @param zoom           scale about the crop centre
+     * @param translateXFrac shift as a fraction of card width, + = right
+     * @param translateYFrac shift as a fraction of card height, + = down
+     * @param sourcePresentAspect shape to present the source at before cropping; 0 or
+     *                       less presents it as it arrives (the buffer's own shape)
+     * @param alignX         -1 hug the left edge of the rect, 0 centre, +1 hug the right
+     */
+    public void setBsPreset(float rotationDeg,
+                            float cropLeft, float cropTop,
+                            float cropRight, float cropBottom,
+                            boolean flipHorizontal, boolean flipVertical,
+                            float zoom,
+                            float translateXFrac, float translateYFrac,
+                            float sourcePresentAspect,
+                            int alignX) {
+        float cl = clampCrop(cropLeft);
+        float ct = clampCrop(cropTop);
+        float cr = clampCrop(cropRight);
+        float cb = clampCrop(cropBottom);
+        float cropWn = 1.0f - cl - cr;
+        float cropHn = 1.0f - ct - cb;
+        if (cropWn <= 1e-4f || cropHn <= 1e-4f) {
+            clearBsPreset();
+            return;
+        }
+        float bufAspect = (outputHeight > 0)
+                ? (float) outputWidth / (float) outputHeight : 1.0f;
+        // Shape the source is PRESENTED at, which need not be the shape it arrives in.
+        // A framing copied from elsewhere may have been composed against a source shown
+        // at some other ratio; reproducing it means presenting ours the same way, so the
+        // caller states the ratio, and a non-positive value means "as it arrives".
+        float presentAspect = (sourcePresentAspect > 1e-4f) ? sourcePresentAspect : bufAspect;
+        // The card must have the shape of the region being shown, or the turn stretches
+        // as well as turning.
+        float wantAspect = presentAspect * cropWn / cropHn;
+
+        // Solve for the width fraction that gives the card that shape. In the shader's
+        // aspect space the card's half-extents are
+        //     cardHe = (he.x * frac - margin * bufAspect,  he.y - margin)
+        // with he = (bufAspect, 1) * 0.5, and the card's shape is cardHe.x / cardHe.y.
+        float heX = bufAspect * 0.5f;
+        float heY = 0.5f;
+        float mrgX = bsMargin * bufAspect;
+        float mrgY = bsMargin;
+        float wantHeX = wantAspect * (heY - mrgY);
+        float frac = (heX > 1e-6f) ? (wantHeX + mrgX) / heX : 1.0f;
+        // Never widen past the buffer, and never collapse the card to nothing.
+        frac = Math.max(0.05f, Math.min(1.0f, frac));
+
+        // Slide the narrowed card so its outer edge sits where the full-width card's
+        // edge was. Centred when alignX is 0.
+        int ax = (alignX > 0) ? 1 : (alignX < 0 ? -1 : 0);
+        float shift = ax * heX * (1.0f - frac);
+
+        this.bsCardWidthFrac = frac;
+        this.bsCardShiftX = shift;
+        // Feed the transform the shape the card actually ended up with, not the
+        // requested one — the clamp above may have moved it.
+        float actualHeX = heX * frac - mrgX;
+        float actualAspect = (heY - mrgY > 1e-6f) ? actualHeX / (heY - mrgY) : wantAspect;
+        this.bsCardAspect = actualAspect;
+        setBsContentTransform(rotationDeg, cl, ct, cr, cb,
+                flipHorizontal, flipVertical, zoom,
+                translateXFrac, translateYFrac, actualAspect);
+        logger.info(String.format(Locale.US,
+                "BS preset: cardWidthFrac=%.4f shiftX=%.4f cardAspect=%.4f "
+                        + "(buffer %.4f, presented %.4f)",
+                frac, shift, actualAspect, bufAspect, presentAspect));
+    }
+
+    /** Undo {@link #setBsPreset}: full-width card, no shift, no content transform. */
+    public void clearBsPreset() {
+        this.bsCardWidthFrac = 1.0f;
+        this.bsCardShiftX = 0.0f;
+        this.bsCardAspect = 0.0f;
+        clearBsContentTransform();
+    }
+
+    /** Current card width as a fraction of the buffer (1.0 = full width).
+     *
+     *  <p>Test-visible (see {@link #isBsContentTransformActive}). A preset reshapes the
+     *  card by pillarboxing INSIDE the buffer rather than by resizing the destination
+     *  rect, which is invisible from the outside; this is what lets a test pin that
+     *  reshape, and pin that leaving a preset restores the full-width card. */
+    public float getBsCardWidthFrac() { return bsCardWidthFrac; }
+
+    /** Displayed shape of the card the last preset produced, or 0 if none is active.
+     *
+     *  <p>Test-visible (see {@link #isBsContentTransformActive}). The framing's own
+     *  aspect is what a rotation has to be measured against — a turn is only rigid when
+     *  the card matches the crop's shape — so a test cannot check that property
+     *  without reading the shape back. */
+    public float getBsCardAspect() { return bsCardAspect; }
+
+    /**
+     * Copy the live content affine out as {@code [m00, m10, m01, m11, offX, offY]}.
+     * Returns whether it is active. Never called on the GL thread's hot path.
+     *
+     * <p>Test-visible (see {@link #isBsContentTransformActive}). The matrix is what the
+     * fragment shader actually samples with, and it is derived — crop, mirror, zoom and
+     * translate are folded into it and cannot be checked one at a time from the
+     * outside. Reading it back is what lets the tests assert the geometry directly:
+     * that the card's centre maps to the kept crop's centre, that a mirrored framing
+     * has a negative determinant, and that a rotation stays rigid.
+     */
+    public boolean copyBsContentTransform(float[] out6) {
+        if (out6 == null || out6.length < 6) return bsContentActive;
+        synchronized (bsContentLock) {
+            out6[0] = bsContentMat[0]; out6[1] = bsContentMat[1];
+            out6[2] = bsContentMat[2]; out6[3] = bsContentMat[3];
+            out6[4] = bsContentOff[0]; out6[5] = bsContentOff[1];
+            return bsContentActive;
+        }
+    }
 
     /**
      * Bind the OEM Dashcam camera texture as the secondary source. View
@@ -1384,6 +1730,43 @@ public class GpuStreamScaler {
             "uniform float uBsRectifyK1;\n" +
             "uniform float uBsRectifyK2;\n" +
             "uniform float uBsRectifyAspect;\n" +   // tile height/width for the radial metric
+            // ── Free-angle CONTENT transform (views 7/8) ─────────────────────────
+            // Rotates/crops/mirrors/zooms the video INSIDE the card instead of
+            // rotating the card itself. uRotation (vertex stage) turns the output
+            // QUAD, which is right for a quarter turn — the card stays a rectangle
+            // because 90/270 map a rectangle onto a rectangle. At an angle that is
+            // NOT a multiple of 90 the same trick turns the card into a diamond,
+            // which is not what a rotated camera view should look like. Transforming
+            // the SAMPLING coordinate instead keeps the card (and its rounded
+            // corners and lit bevel) a rectangle and spins the picture within it,
+            // clipped at the card edge — the free-angle behaviour.
+            //
+            // uBsContentMat/uBsContentOff map card-local uv → source uv, i.e. they
+            // are the INVERSE of the visual transform, folded into one affine by the
+            // host (see setBsContentTransform). Where the mapped coord leaves [0,1]
+            // there is no source pixel, so the fragment is left transparent rather
+            // than smeared by clamping — matching how a rotated rectangular view
+            // shows empty corners.
+            //
+            // uBsContentActive is 0 for every existing path (including the 0/90/180/
+            // 270 rotations, which keep using uRotation); the branch below is then
+            // not taken at all and sampling is untouched.
+            "uniform mat2  uBsContentMat;\n" +
+            "uniform vec2  uBsContentOff;\n" +
+            "uniform float uBsContentActive;\n" +
+            // Card SHAPE, for the same free-angle work. Turning a picture only looks
+            // right when the card already has the shape of the region being shown; a
+            // preset that keeps half the frame's width therefore needs a card half as
+            // wide, or the picture is stretched as well as turned. The card is narrowed
+            // WITHIN the buffer (pillarboxed, the empty part transparent) rather than by
+            // shrinking the on-screen rect, because the rect must keep the buffer's
+            // aspect — the rounded corners are baked into the buffer, so a rect of a
+            // different shape would scale them into ellipses. uBsCardShiftX then slides
+            // the narrowed card back against the edge it is anchored to, instead of
+            // leaving it floating in the middle of its rect.
+            // 1.0 / 0.0 = full-width, unshifted = every pre-existing path.
+            "uniform float uBsCardWidthFrac;\n" +
+            "uniform float uBsCardShiftX;\n" +
             // Dewarp a 0..1 quadrant tile coord: pull each output pixel toward centre by
             // r_source = r_out / (1 + k1·r² + k2·r⁴), then zoom-to-fill so the corners
             // still reach the tile edge (no black border). Aspect makes the iso-distortion
@@ -1520,18 +1903,35 @@ public class GpuStreamScaler {
             // SDF drives coverage + bevel. Alpha is gated on od coverage so the
             // map shows through any region the projection doesn't fill.
             "        vec2 he     = vec2(uBsAspect, 1.0) * 0.5;\n" +
-            "        vec2 p      = (vTexCoord - 0.5) * vec2(uBsAspect, 1.0);\n" +
+            "        vec2 p      = (vTexCoord - 0.5) * vec2(uBsAspect, 1.0) - vec2(uBsCardShiftX, 0.0);\n" +
             "        float mh    = min(he.x, he.y);\n" +
             "        float rr    = clamp(uBsRadius, 0.0, 1.0) * mh;\n" +
             "        vec2 mrg    = vec2(uBsMargin * uBsAspect, uBsMargin);\n" +
-            "        vec2 cardHe = he - mrg;\n" +
+            "        vec2 cardHe = vec2(he.x * uBsCardWidthFrac, he.y) - mrg;\n" +
             "        float cardR = min(rr, min(cardHe.x, cardHe.y));\n" +
             "        float sd    = bsRoundBoxSDF(p, cardHe, cardR);\n" +
             "        float bsCov = 1.0 - smoothstep(-uBsFeather, uBsFeather, sd);\n" +
             "        vec3 rgb = vec3(0.0);\n" +
             "        float vidCov = 0.0;\n" +    // od coverage; 0 where the projection has no pixels
             "        if (bsCov > 0.0029) {\n" +  // skip the sampler outside the card body
-            "            vec2 cardUv = clamp((vTexCoord - uBsMargin) / max(1.0 - 2.0 * uBsMargin, 1e-4), 0.0, 1.0);\n" +
+            // Card-local uv straight from the SDF's own frame, so it follows the card
+            // when the card is narrowed and shifted. Algebraically identical to the
+            // old (vTexCoord - margin) / (1 - 2*margin) at full width and zero shift.
+            "            vec2 cardRaw = (p + cardHe) / max(2.0 * cardHe, vec2(1e-4));\n" +
+            "            vec2 cardUv = clamp(cardRaw, 0.0, 1.0);\n" +
+            // Free-angle content transform. Inactive by default, and the branch is
+            // uniform across the draw, so every pre-existing path samples exactly
+            // the coordinate it did before. When active, contentCov zeroes the
+            // fragments whose source coord falls outside the frame, so the corners
+            // swept in by a non-quarter rotation stay transparent instead of
+            // repeating the edge texel.
+            "            float contentCov = 1.0;\n" +
+            "            if (uBsContentActive > 0.5) {\n" +
+            "                vec2 xf = uBsContentMat * cardRaw + uBsContentOff;\n" +
+            "                vec2 inR = step(vec2(0.0), xf) * step(xf, vec2(1.0));\n" +
+            "                contentCov = inR.x * inR.y;\n" +
+            "                cardUv = clamp(xf, 0.0, 1.0);\n" +
+            "            }\n" +
             "            vec4 bsCol = vec4(0.0);\n" +
             // Merge mode 1 = SIDE only, 2 = REAR only: CLEAN PASSTHROUGH. Show the
             // one camera's RAW quadrant with NO od dewarp — no FOV/tilt/height/spread
@@ -1560,7 +1960,7 @@ public class GpuStreamScaler {
             "                               vec2(0.5), 0.5,\n" +
             "                               sideSign, cardUv.x, cardUv.y);\n" +
             "            }\n" +
-            "            vidCov = bsCol.a;\n" +   // 1 where video covers, 0 where it doesn't
+            "            vidCov = bsCol.a * contentCov;\n" +   // 1 where video covers, 0 where it doesn't
             "            rgb = bsApplyRim(bsCol.rgb, p, cardHe, cardR, sd);\n" +
             "        }\n" +
             // Alpha = card coverage × video coverage: rounded corners AND any region
@@ -1613,18 +2013,35 @@ public class GpuStreamScaler {
             // the DiLink-4 branch, only the odBlend arg list differs. Separate GLSL
             // block scope, so the bs* locals are re-declared cleanly (no clash).
             "        vec2 he     = vec2(uBsAspect, 1.0) * 0.5;\n" +
-            "        vec2 p      = (vTexCoord - 0.5) * vec2(uBsAspect, 1.0);\n" +
+            "        vec2 p      = (vTexCoord - 0.5) * vec2(uBsAspect, 1.0) - vec2(uBsCardShiftX, 0.0);\n" +
             "        float mh    = min(he.x, he.y);\n" +
             "        float rr    = clamp(uBsRadius, 0.0, 1.0) * mh;\n" +
             "        vec2 mrg    = vec2(uBsMargin * uBsAspect, uBsMargin);\n" +
-            "        vec2 cardHe = he - mrg;\n" +
+            "        vec2 cardHe = vec2(he.x * uBsCardWidthFrac, he.y) - mrg;\n" +
             "        float cardR = min(rr, min(cardHe.x, cardHe.y));\n" +
             "        float sd    = bsRoundBoxSDF(p, cardHe, cardR);\n" +
             "        float bsCov = 1.0 - smoothstep(-uBsFeather, uBsFeather, sd);\n" +
             "        vec3 rgb = vec3(0.0);\n" +
             "        float vidCov = 0.0;\n" +
             "        if (bsCov > 0.0029) {\n" +
-            "            vec2 cardUv = clamp((vTexCoord - uBsMargin) / max(1.0 - 2.0 * uBsMargin, 1e-4), 0.0, 1.0);\n" +
+            // Card-local uv straight from the SDF's own frame, so it follows the card
+            // when the card is narrowed and shifted. Algebraically identical to the
+            // old (vTexCoord - margin) / (1 - 2*margin) at full width and zero shift.
+            "            vec2 cardRaw = (p + cardHe) / max(2.0 * cardHe, vec2(1e-4));\n" +
+            "            vec2 cardUv = clamp(cardRaw, 0.0, 1.0);\n" +
+            // Free-angle content transform. Inactive by default, and the branch is
+            // uniform across the draw, so every pre-existing path samples exactly
+            // the coordinate it did before. When active, contentCov zeroes the
+            // fragments whose source coord falls outside the frame, so the corners
+            // swept in by a non-quarter rotation stay transparent instead of
+            // repeating the edge texel.
+            "            float contentCov = 1.0;\n" +
+            "            if (uBsContentActive > 0.5) {\n" +
+            "                vec2 xf = uBsContentMat * cardRaw + uBsContentOff;\n" +
+            "                vec2 inR = step(vec2(0.0), xf) * step(xf, vec2(1.0));\n" +
+            "                contentCov = inR.x * inR.y;\n" +
+            "                cardUv = clamp(xf, 0.0, 1.0);\n" +
+            "            }\n" +
             "            vec4 bsCol = vec4(0.0);\n" +
             // Same merge-mode switch as the DiLink-4 branch — single-cam modes are a
             // CLEAN PASSTHROUGH of one 4-strip slice with NO od dewarp, sampled exactly
@@ -1645,7 +2062,7 @@ public class GpuStreamScaler {
             "                               vec2(0.25, 1.0), 0.5,\n" +
             "                               sideSign, cardUv.x, cardUv.y);\n" +
             "            }\n" +
-            "            vidCov = bsCol.a;\n" +
+            "            vidCov = bsCol.a * contentCov;\n" +
             "            rgb = bsApplyRim(bsCol.rgb, p, cardHe, cardR, sd);\n" +
             "        }\n" +
             "        float outA = bsCov * vidCov;\n" +   // transparent corners + no-coverage
