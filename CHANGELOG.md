@@ -2,6 +2,25 @@
 
 Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e versionati in corrispondenza delle release ufficiali o dei Version Bump.
 
+## [Unreleased]
+
+- **Integrazione Upstream origin/main (PR #272, PR #275, PR #276, PR #277, PR #278)**:
+  - **PR #272 (Dashboard Visual Redesign - UnrealSalty)**:
+    - Nuova interfaccia nativa Material 3 con Hero Card veicolo riprogettata con schede a raggio 8dp (`fragment_dashboard.xml`, `DashboardFragment.kt`).
+    - Nuova Navigation Rail laterale con raggruppamento delle destinazioni per categorie e selezione migliorata.
+    - Nuovi render grafici dei veicoli in alta definizione, con supporto per BYD Atto 2 e tavolozze vernice specifiche per Sealion 7 e Atto 2.
+    - Nuovi dialoghi nativi per configurazione capacità batteria (con validazione inline) e onboarding "Getting Started".
+    - Interfaccia Web (`app/src/main/assets/web/`) aggiornata con nuovi controlli vettura (`vehicle-control`), grafica sedili con glifi di reclinazione, selezione colore ambient light tramite swatch e indicatore live streaming ripulito.
+  - **PR #275 (Nuove Angolazioni Blind-Spot - mustafabulbul1986)**:
+    - Supporto per angolazioni preimpostate a 40° e 310° e rotazione libera delle inquadrature per le telecamere degli angoli ciechi (`BlindSpotControl.kt`, `GpuStreamScaler.java`).
+  - **PR #276 (Stabilità Relay Bluetooth - mustafabulbul1986)**:
+    - Inizializzazione anticipata di `BluetoothStateMonitor` e `CallStateMonitor` in `OverdriveApplication.onCreate()` per garantire il funzionamento delle automazioni Bluetooth anche in caso di mancato bind del servizio di accessibilità.
+  - **Preservazione & Armonizzazione Fix Sealion 7 / DiLink 5.0**:
+    - Preservato il motore video nativo accelerato a 30 FPS (`HardwareBufferTextureBinder.cpp` con ARM NEON SIMD e `glTexSubImage2D`).
+    - Preservata la telemetria di marcia e velocità specifica per Sealion 7 (`CarSvcTelemetry.kt` VHAL 0x21406006 / 0x21403a0a).
+    - Preservato il bridge `VEHICLE_UNAVAILABLE_HOLD_MS` nel nuovo `DashboardFragment` per eliminare il lampeggio di disconnessione transitoria durante la marcia.
+    - Preservato il range esteso 8–120 kWh per la capacità batteria e il caricamento locale offline di `jmuxer.min.js`.
+
 ## [v51.14] - 2026-09-08
 
 > **NOTA IMPORTANTE / DISCLAIMER**: Questa build è sperimentale e ancora possibilmente soggetta a soft o hard crash del sistema infotainment BYD DiLink. L'uso è a proprio esclusivo rischio.
