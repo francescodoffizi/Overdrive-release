@@ -553,7 +553,7 @@
         <!-- Status Overlay Service - Floating recording/trip status indicator -->
         <service
             android:name="com.overdrive.app.overlay.StatusOverlayService"
-            android:foregroundServiceType="specialUse"
+            android:foregroundServiceType="specialUse|dataSync"
             android:exported="false" />
 
         <!-- Media Playback Service - plays the "Play Audio" automation/keymap sound

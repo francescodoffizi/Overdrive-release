@@ -25,6 +25,7 @@ import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.monitor.ProjectionStateMonitor
 import com.overdrive.app.overlay.OverlayPermissionChecker
+import com.overdrive.app.overlay.SafeOverlayHelper
 import com.overdrive.app.roadsense.config.RoadSenseConfig
 import com.overdrive.app.roadsense.warn.OverlayState
 import com.overdrive.app.services.DaemonKeepaliveService
@@ -251,11 +252,12 @@ class RoadSenseOverlayService : Service() {
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            SafeOverlayHelper.overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT,
         )
+        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED.inv()
         lp.gravity = Gravity.TOP or Gravity.START
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         lp.x = prefs.getInt(PREF_X, DEFAULT_X)
@@ -264,20 +266,16 @@ class RoadSenseOverlayService : Service() {
 
         setupInteractions()
         applyExpanded()
-        try {
-            windowManager.addView(overlayView, lp)
-        } catch (e: Exception) {
-            Log.e(TAG, "addView failed: ${e.message}")
+        if (!SafeOverlayHelper.safeAddView(windowManager, overlayView, lp)) {
+            Log.e(TAG, "SafeOverlayHelper.safeAddView failed")
             overlayView = null
         }
     }
 
     private fun removeOverlay() {
         overlayView?.let {
-            try {
-                persistPosition()
-                windowManager.removeView(it)
-            } catch (_: Exception) {}
+            persistPosition()
+            SafeOverlayHelper.safeRemoveView(windowManager, it)
         }
         overlayView = null
         // Drop the cached themed context so a rebuild (config change) re-resolves
@@ -342,7 +340,7 @@ class RoadSenseOverlayService : Service() {
                     val dx = (e.rawX - downX).toInt(); val dy = (e.rawY - downY).toInt()
                     if (kotlin.math.abs(dx) > TOUCH_SLOP || kotlin.math.abs(dy) > TOUCH_SLOP) dragged = true
                     lp.x = startX + dx; lp.y = startY + dy
-                    try { windowManager.updateViewLayout(overlayView, lp) } catch (_: Exception) {}
+                    SafeOverlayHelper.safeUpdateViewLayout(windowManager, overlayView, lp)
                     true
                 }
                 android.view.MotionEvent.ACTION_UP -> {

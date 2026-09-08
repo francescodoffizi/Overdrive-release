@@ -323,12 +323,15 @@ public class AccMonitor {
 
     private static void scheduleWifiRearm() {
         new Thread(() -> {
-            try {
-                Thread.sleep(2500);
-                CameraDaemon.log("ACC-off: re-arming Wi-Fi subsystem to counteract BYD TsCarPower turnOffWifi...");
-                Runtime.getRuntime().exec(new String[]{"sh", "-c", "cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null"}).waitFor();
-            } catch (Throwable t) {
-                CameraDaemon.log("scheduleWifiRearm error: " + t.getMessage());
+            int[] delaysMs = {2500, 3500, 5000};
+            for (int delay : delaysMs) {
+                try {
+                    Thread.sleep(delay);
+                    CameraDaemon.log("ACC-off: re-arming Wi-Fi subsystem step to counteract BYD TsCarPower turnOffWifi...");
+                    Runtime.getRuntime().exec(new String[]{"sh", "-c", "cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null"}).waitFor();
+                } catch (Throwable t) {
+                    CameraDaemon.log("scheduleWifiRearm error: " + t.getMessage());
+                }
             }
         }, "WifiRearmThread").start();
     }

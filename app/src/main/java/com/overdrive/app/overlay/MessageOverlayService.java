@@ -235,16 +235,20 @@ public final class MessageOverlayService extends Service {
 
     private boolean replaceOverlay(View view, WindowManager.LayoutParams lp) {
         removeOverlay();
+        if (!SafeOverlayHelper.isSafeToDisplay()) {
+            logger.warn("replaceOverlay suppressed: projection or 360 camera active");
+            stopSelf();
+            return false;
+        }
         overlayView = view;
-        try {
-            windowManager.addView(overlayView, lp);
-            return true;
-        } catch (Throwable t) {
-            logger.error("addView failed: " + t.getMessage());
+        boolean added = SafeOverlayHelper.safeAddView(windowManager, overlayView, lp);
+        if (!added) {
+            logger.error("safeAddView failed in replaceOverlay");
             overlayView = null;
             stopSelf();
             return false;
         }
+        return true;
     }
 
     /**
@@ -266,7 +270,7 @@ public final class MessageOverlayService extends Service {
 
         Thread callback = new Thread(() -> {
             try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress("127.0.0.1", port), 1000);
+                socket.connect(new InetSocketAddress("127.0.0.1", port), 500);
                 DataOutputStream output =
                         new DataOutputStream(socket.getOutputStream());
                 output.writeUTF(token);
@@ -285,7 +289,7 @@ public final class MessageOverlayService extends Service {
 
     private void removeOverlay() {
         if (overlayView != null) {
-            try { windowManager.removeView(overlayView); } catch (Throwable ignored) {}
+            SafeOverlayHelper.safeRemoveView(windowManager, overlayView);
             overlayView = null;
         }
     }
@@ -295,11 +299,12 @@ public final class MessageOverlayService extends Service {
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                overlayWindowType(),
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
                 PixelFormat.TRANSLUCENT);
+        lp.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         lp.gravity = gravity;
         int m = dp(this, 40);
         lp.y = m;
@@ -308,18 +313,18 @@ public final class MessageOverlayService extends Service {
 
     /** Dialog window: non-focusable (no focus steal) but touchable (OK / scrim tap). */
     private WindowManager.LayoutParams dialogLayoutParams() {
-        return new WindowManager.LayoutParams(
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
-                overlayWindowType(),
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
+        lp.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
+        return lp;
     }
 
     private static int overlayWindowType() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
+        return SafeOverlayHelper.overlayWindowType();
     }
 
     private void scheduleDismiss(long ms) {

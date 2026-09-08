@@ -199,12 +199,15 @@ class AccMonitorController(
 
     private fun scheduleWifiRearm() {
         Thread({
-            try {
-                Thread.sleep(2500)
-                logger.info("ACC-OFF: re-arming Wi-Fi subsystem to counteract BYD TsCarPower turnOffWifi...")
-                execShell("cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null")
-            } catch (t: Throwable) {
-                logger.warn("scheduleWifiRearm error: ${t.message}")
+            val delaysMs = longArrayOf(2500L, 3500L, 5000L)
+            for (delay in delaysMs) {
+                try {
+                    Thread.sleep(delay)
+                    logger.info("ACC-OFF: re-arming Wi-Fi subsystem step to counteract BYD TsCarPower turnOffWifi...")
+                    execShell("cmd wifi set-wifi-enabled enabled 2>/dev/null || svc wifi enable 2>/dev/null")
+                } catch (t: Throwable) {
+                    logger.warn("scheduleWifiRearm error: ${t.message}")
+                }
             }
         }, "WifiRearmThread").start()
     }

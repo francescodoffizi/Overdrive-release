@@ -25,6 +25,7 @@ import com.google.android.material.color.MaterialColors
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
 import com.overdrive.app.overlay.OverlayPermissionChecker
+import com.overdrive.app.overlay.SafeOverlayHelper
 import kotlin.math.abs
 
 /**
@@ -144,18 +145,14 @@ object NavPromptOverlay {
         card.addView(body)
         card.addView(row)
 
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-        }
         val lp = WindowManager.LayoutParams(
             dp(320),
             WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
+            SafeOverlayHelper.overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT,
         ).apply {
+            flags = flags and WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED.inv()
             val pos = runCatching { UnifiedConfigManager.getNavPromptPos() }.getOrNull()
             if (pos != null) {
                 gravity = Gravity.TOP or Gravity.START
@@ -191,7 +188,7 @@ object NavPromptOverlay {
                             lp.gravity = Gravity.TOP or Gravity.START
                             lp.x = startX + dx
                             lp.y = startY + dy
-                            runCatching { wm?.updateViewLayout(card, lp) }
+                            SafeOverlayHelper.safeUpdateViewLayout(wm, card, lp)
                         }
                         return true
                     }
@@ -207,14 +204,13 @@ object NavPromptOverlay {
         body.setOnTouchListener(dragListener)
 
         wm = app.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        try {
-            wm?.addView(card, lp)
+        if (SafeOverlayHelper.safeAddView(wm, card, lp)) {
             view = card
             main.postDelayed(dismissRunnable, AUTO_DISMISS_MS)
             Log.i(TAG, "prompt shown for '$name' (night=$nightYes)")
             return true
-        } catch (t: Throwable) {
-            Log.w(TAG, "addView failed: ${t.message}")
+        } else {
+            Log.w(TAG, "SafeOverlayHelper.safeAddView failed for NavPromptOverlay")
             view = null
             return false
         }
@@ -224,7 +220,7 @@ object NavPromptOverlay {
     fun dismiss() {
         main.removeCallbacks(dismissRunnable)
         val v = view ?: return
-        runCatching { wm?.removeView(v) }
+        SafeOverlayHelper.safeRemoveView(wm, v)
         view = null
     }
 }

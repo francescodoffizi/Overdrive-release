@@ -778,9 +778,10 @@ public class StatusOverlayService extends Service {
         int size = camDp(CLOSE_BTN_SIZE_DP);
         camCloseParams = new WindowManager.LayoutParams(
                 size, size,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
+        camCloseParams.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         camCloseParams.gravity = Gravity.TOP | Gravity.END;
         camCloseParams.x = camDp(16);
         camCloseParams.y = camDp(16);
@@ -799,10 +800,10 @@ public class StatusOverlayService extends Service {
                     // See setBsCloseVisible: position before attach so the ✕ never lands
                     // under the card's SurfaceControl layer.
                     positionCloseParams(camCloseParams);
-                    windowManager.addView(camCloseButton, camCloseParams);
+                    SafeOverlayHelper.safeAddView(windowManager, camCloseButton, camCloseParams);
                     camCloseAttached = true;
                 } else if (!visible && camCloseAttached) {
-                    windowManager.removeView(camCloseButton);
+                    SafeOverlayHelper.safeRemoveView(windowManager, camCloseButton);
                     camCloseAttached = false;
                 }
             } catch (Exception e) {
@@ -893,9 +894,10 @@ public class StatusOverlayService extends Service {
         int size = camDp(CLOSE_BTN_SIZE_DP);
         bsCloseParams = new WindowManager.LayoutParams(
                 size, size,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
+        bsCloseParams.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         bsCloseParams.gravity = Gravity.TOP | Gravity.END;
         bsCloseParams.x = camDp(16);
         bsCloseParams.y = camDp(16);
@@ -913,10 +915,10 @@ public class StatusOverlayService extends Service {
                     // Place it clear of the card BEFORE attaching, so it is never drawn
                     // (even for one frame) underneath the SurfaceControl layer.
                     positionCloseParams(bsCloseParams);
-                    windowManager.addView(bsCloseButton, bsCloseParams);
+                    SafeOverlayHelper.safeAddView(windowManager, bsCloseButton, bsCloseParams);
                     bsCloseAttached = true;
                 } else if (!visible && bsCloseAttached) {
-                    windowManager.removeView(bsCloseButton);
+                    SafeOverlayHelper.safeRemoveView(windowManager, bsCloseButton);
                     bsCloseAttached = false;
                 }
             } catch (Exception e) {
@@ -1132,11 +1134,12 @@ public class StatusOverlayService extends Service {
         layoutParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
         );
+        layoutParams.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         layoutParams.gravity = Gravity.TOP | Gravity.START;
         // Restore last user-placed position (falls back to defaults on first run)
         android.content.SharedPreferences prefs =
@@ -1147,20 +1150,17 @@ public class StatusOverlayService extends Service {
         bindViews();
         setupDrag();
 
-        try {
-            windowManager.addView(overlayView, layoutParams);
+        if (SafeOverlayHelper.safeAddView(windowManager, overlayView, layoutParams)) {
             Log.i(TAG, "Overlay window added");
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to add overlay: " + e.getMessage());
+        } else {
+            Log.e(TAG, "Failed to add overlay via SafeOverlayHelper");
             overlayView = null;
         }
     }
 
     private void removeOverlay() {
         if (overlayView != null && windowManager != null) {
-            try {
-                windowManager.removeView(overlayView);
-            } catch (Exception ignored) {}
+            SafeOverlayHelper.safeRemoveView(windowManager, overlayView);
             overlayView = null;
         }
         // Cancel any pending auto-collapse and reset the expanded flag —
@@ -1496,9 +1496,7 @@ public class StatusOverlayService extends Service {
                     if (isDragging) {
                         layoutParams.x = initialX + (int) dx;
                         layoutParams.y = initialY + (int) dy;
-                        try {
-                            windowManager.updateViewLayout(overlayView, layoutParams);
-                        } catch (Exception ignored) {}
+                        SafeOverlayHelper.safeUpdateViewLayout(windowManager, overlayView, layoutParams);
                     }
                     return true;
                 case MotionEvent.ACTION_UP:

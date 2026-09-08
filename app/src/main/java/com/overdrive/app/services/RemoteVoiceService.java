@@ -33,6 +33,7 @@ import android.widget.TextView;
 import androidx.core.content.ContextCompat;
 
 import com.overdrive.app.R;
+import com.overdrive.app.overlay.SafeOverlayHelper;
 import com.overdrive.app.byd.BydDeviceHelper;
 import com.overdrive.app.communication.RemoteCommunicationPolicy;
 import com.overdrive.app.communication.RemoteCommunicationSettings;
@@ -819,23 +820,20 @@ public final class RemoteVoiceService extends Service {
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                        : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
+                SafeOverlayHelper.overlayWindowType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
+        params.flags &= ~WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
         params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         params.y = dp(context, 24);
 
-        try {
-            windowManager.addView(root, params);
+        if (SafeOverlayHelper.safeAddView(windowManager, root, params)) {
             overlayView = root;
             startElapsedTicker();
             return true;
-        } catch (Throwable error) {
-            logger.warn(
-                    "Could not add remote voice overlay: " + error.getMessage());
+        } else {
+            logger.warn("Could not add remote voice overlay via SafeOverlayHelper");
             overlayView = null;
             return false;
         }
@@ -1173,7 +1171,7 @@ public final class RemoteVoiceService extends Service {
     private void removeOverlay() {
         stopElapsedTicker();
         if (overlayView != null) {
-            try { windowManager.removeView(overlayView); } catch (Throwable ignored) {}
+            SafeOverlayHelper.safeRemoveView(windowManager, overlayView);
         }
         overlayView = null;
         elapsedView = null;
