@@ -9752,7 +9752,22 @@ public class BydDataCollector {
 
     private void collectAdas(BydVehicleData.Builder b) {
         if (isDiLink5Vehicle()) {
+            Object dp = ensureDiLink5DiPilotDevice();
+            if (dp != null) {
+                int isla = readDiLink5DiPilotSwitch(dp, "getIntelligentSpeedLimitAlert2B4State");
+                if (isla != 0 && isla != 1) {
+                    isla = readDiLink5DiPilotSwitch(dp, "getIntelligentSpeedLimitAlertState");
+                }
+                if (isla != 0 && isla != 1) {
+                    isla = readDiLink5DiPilotSwitch(dp, "getIntelligentSpeedLimitAlert2D5State");
+                }
+                if (isla == 0 || isla == 1) {
+                    b.speedLimitWarning(isla == 1);
+                    return;
+                }
+            }
             b.speedLimitWarningKnown(false);
+            return;
         }
         if (adasDevice == null) return;
         try {
@@ -21619,6 +21634,9 @@ public class BydDataCollector {
      * (0 = accepted).
      */
     public boolean setSpeedLimitWarning(boolean enable) {
+        if (isDiLink5Vehicle()) {
+            return setDiLink5SpeedLimitWarning(enable);
+        }
         int v = enable ? 2 : 1;
         try {
             // Route through setAdasFeature → sendSetCommand (success = code >= 0), the SAME
@@ -21638,6 +21656,28 @@ public class BydDataCollector {
             logger.debug("setSpeedLimitWarning failed: " + e.getMessage());
         }
         return false;
+    }
+
+    /**
+     * DiLink 5 Speed Limit Warning (ISLA/SLW) control via BYDAutoDiPilotDevice.
+     * Tries the Sealion 7 / DiLink 5 2B4 frame variant first (getIntelligentSpeedLimitAlert2B4State),
+     * followed by standard DiPilot alert state, 2D5 variant, and TSR lit speed change switch.
+     */
+    private boolean setDiLink5SpeedLimitWarning(boolean enable) {
+        if (setDiLink5DiPilotSwitch("setIntelligentSpeedLimitAlert2B4State",
+                "getIntelligentSpeedLimitAlert2B4State", enable)) {
+            return true;
+        }
+        if (setDiLink5DiPilotSwitch("setIntelligentSpeedLimitAlertState",
+                "getIntelligentSpeedLimitAlertState", enable)) {
+            return true;
+        }
+        if (setDiLink5DiPilotSwitch("setIntelligentSpeedLimitAlert2D5State",
+                "getIntelligentSpeedLimitAlert2D5State", enable)) {
+            return true;
+        }
+        return setDiLink5DiPilotSwitch("setTSRLitSpdChgSwitchState",
+                "getTSRLitSpdChgSwitchState", enable);
     }
 
     /**
@@ -22096,7 +22136,23 @@ public class BydDataCollector {
 
     /** Speed Limit Control (ISLC) on/off (on=2/off=1, per OEM convention). */
     public boolean setSpeedLimitControl(boolean enabled) {
+        if (isDiLink5Vehicle()) {
+            return setDiLink5SpeedLimitControl(enabled);
+        }
         return setAdasFeature(BydFeatureIds.ADAS_ISLC_SWITCH_SET, enabled ? 2 : 1);
+    }
+
+    private boolean setDiLink5SpeedLimitControl(boolean enabled) {
+        if (setDiLink5DiPilotSwitch("setIntelligentSpeedLimitControlState",
+                "getIntelligentSpeedLimitControlState", enabled)) {
+            return true;
+        }
+        if (setDiLink5DiPilotSwitch("setIntelligentSpeedLimitControl2D5State",
+                "getIntelligentSpeedLimitControl2D5State", enabled)) {
+            return true;
+        }
+        return setDiLink5DiPilotSwitch("setIntelligentSpeedLimitControl32FState",
+                "getIntelligentSpeedLimitControl32FState", enabled);
     }
 
     /** Emergency / Urgent Lane Keeping (ELKA) on/off (on=2/off=1). SAFETY (auto-steer). */

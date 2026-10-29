@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Supporto Controllo & Telemetria Speed Limit Warning (ISLA/SLW) su DiLink 5.0 / DiPilot (`BydDataCollector.java`)**:
+  - Implementato l'instradamento del controllo `setSpeedLimitWarning` e `setSpeedLimitControl` su `BYDAutoDiPilotDevice` per i veicoli DiLink 5 (BYD Sealion 7), superando il precedente rifiuto esplicito `setAdasFeature: not supported on DiLink 5`.
+  - Configurato il fallback prioritario su CAN frame `2B4` (`setIntelligentSpeedLimitAlert2B4State` / `getIntelligentSpeedLimitAlert2B4State`), variante calibrata e verificata attiva su Sealion 7, con fallback su `setIntelligentSpeedLimitAlertState`, variante `2D5` e `setTSRLitSpdChgSwitchState`.
+  - Aggiornato `collectAdas` per interrogare `BYDAutoDiPilotDevice` su DiLink 5 e pubblicare lo stato reale di `speedLimitWarning` / `speedLimitWarningKnown` verso la dashboard e le integrazioni MQTT/Home Assistant.
+
 - **Fix Attuazione Comandi Remoti Generici su DiLink 5 / 100 Headless Daemon (`VehicleActuatorBridge.java`)**:
   - Risolto il rifiuto immediato dei comandi con frame generico (`FlashLightsCommand`, `FindCarCommand`, `VehiclePowerOnCommand`, `VehiclePowerOffCommand`) inviati via API/Cloudflare: il demone headless (UID 2000 `shell`) invoca ora prioritariamente `startDiLink5ServiceAsShell` con identità shell tramite reflection su `IActivityManager.startService`, evitando il fallimento sistematico del contesto sintetico su AMS.
   - Rafforzato `isDefiniteServiceStartRejection` per trattare come rifiuto definitivo gli errori IPC Binder (`RemoteException`, `DeadObjectException`) ed eccezioni AMS `"Unable to find app for caller"`, impedendo che `serviceMayOwnRequest` venga erroneamente marcato come attivo e causi l'abort prematuro `"vehicle request ownership uncertain after launch"`.
