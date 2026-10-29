@@ -141,7 +141,53 @@ public class QualitySettingsApiHandler {
             sendTelegramStatus(out);
             return true;
         }
+        if (path.equals("/api/settings/logging") && method.equals("GET")) {
+            handleLoggingSettingsGet(out);
+            return true;
+        }
+        if (path.equals("/api/settings/logging") && method.equals("POST")) {
+            handleLoggingSettingsPost(out, body);
+            return true;
+        }
         return false;
+    }
+
+    private static void handleLoggingSettingsGet(OutputStream out) throws Exception {
+        JSONObject r = new JSONObject();
+        try {
+            String level = com.overdrive.app.config.UnifiedConfigManager.getLogLevel();
+            r.put("success", true);
+            r.put("minLevel", level);
+            org.json.JSONArray levels = new org.json.JSONArray();
+            levels.put("DEBUG");
+            levels.put("INFO");
+            levels.put("WARN");
+            levels.put("ERROR");
+            r.put("availableLevels", levels);
+        } catch (Exception e) {
+            r.put("success", false);
+            r.put("error", e.getMessage());
+        }
+        HttpResponse.sendJson(out, 200, r.toString());
+    }
+
+    private static void handleLoggingSettingsPost(OutputStream out, String body) throws Exception {
+        JSONObject r = new JSONObject();
+        try {
+            JSONObject req = new JSONObject(body);
+            String level = req.optString("minLevel", req.optString("level", "INFO")).toUpperCase();
+            if (!level.equals("DEBUG") && !level.equals("INFO") && !level.equals("WARN") && !level.equals("ERROR")) {
+                HttpResponse.sendJson(out, 400, "{\"success\":false,\"error\":\"Invalid level. Expected DEBUG, INFO, WARN, or ERROR.\"}");
+                return;
+            }
+            boolean ok = com.overdrive.app.config.UnifiedConfigManager.setLogLevel(level);
+            r.put("success", ok);
+            r.put("minLevel", level);
+        } catch (Exception e) {
+            r.put("success", false);
+            r.put("error", e.getMessage());
+        }
+        HttpResponse.sendJson(out, 200, r.toString());
     }
 
     /**

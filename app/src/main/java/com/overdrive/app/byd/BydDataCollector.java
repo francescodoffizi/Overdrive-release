@@ -512,7 +512,7 @@ public class BydDataCollector {
     // Daemon: per-rail lock evidence for CameraDaemon's lock gate. With the default enabled set
     // (typed-cabin only) it is byte-for-byte the former single DiLink5LockSafetyCache.
     private final DiLink5LockEvidenceLedger diLink5GateLock =
-            new DiLink5LockEvidenceLedger(logger::info);
+            new DiLink5LockEvidenceLedger(logger::debug);
     // Daemon: carsvc rail HAL-event age bound (setting di5CarSvcLockMaxEventAgeSec, default 900 s).
     private volatile long diLink5CarSvcLockMaxEventAgeNs =
             DILINK5_CARSVC_LOCK_MAX_EVENT_AGE_DEFAULT_SEC * 1_000_000_000L;
@@ -1867,7 +1867,7 @@ public class BydDataCollector {
                 || now - lastDiLink5ProducerLockDiagLogAtElapsedMs >= 60_000L) {
             lastDiLink5ProducerLockDiag = text;
             lastDiLink5ProducerLockDiagLogAtElapsedMs = now;
-            logger.info("DI5 producer lock diag: " + text);
+            logger.debug("DI5 producer lock diag: " + text);
         }
     }
 

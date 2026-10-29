@@ -425,7 +425,9 @@ public class HttpServer {
                     || requestLine.startsWith("GET /status")
                     || requestLine.startsWith("GET /api/widgets/live")
                     || requestLine.startsWith("GET /api/widgets/foreground")
-                    || requestLine.startsWith("POST /api/vehicle/media?poll="))) {
+                    || requestLine.startsWith("POST /api/vehicle/media?poll=")
+                    || requestLine.contains("/api/remote-access/relay")
+                    || requestLine.contains("/api/automations/list"))) {
                 CameraDaemon.log("HTTP: " + redactQueryToken(requestLine));
             }
 

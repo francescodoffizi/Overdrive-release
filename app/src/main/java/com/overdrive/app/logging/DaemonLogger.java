@@ -166,6 +166,40 @@ public class DaemonLogger {
     }
     
     /**
+     * Sets the minimum log level globally.
+     */
+    public static void setMinLevel(Level level) {
+        if (level == null) return;
+        synchronized (globalLock) {
+            globalConfig.minLevel = level;
+        }
+    }
+
+    /**
+     * Synchronizes minLevel with the persistent UnifiedConfigManager configuration.
+     */
+    public static void applyConfigFromUnifiedConfig() {
+        try {
+            String levelStr = com.overdrive.app.config.UnifiedConfigManager.getLogLevel();
+            if (levelStr != null && !levelStr.isEmpty()) {
+                Level level = Level.valueOf(levelStr.toUpperCase(Locale.US));
+                setMinLevel(level);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    static {
+        try {
+            applyConfigFromUnifiedConfig();
+            com.overdrive.app.config.UnifiedConfigManager.addListener((section, config) -> {
+                if ("logging".equals(section)) {
+                    applyConfigFromUnifiedConfig();
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+    
+    /**
      * Get current global configuration.
      */
     public static Config getConfig() {

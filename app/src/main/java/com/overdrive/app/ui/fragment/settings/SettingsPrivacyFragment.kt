@@ -120,7 +120,11 @@ class SettingsPrivacyFragment : Fragment() {
             }
         }
 
-        val current = ConfigManager.getInstance(ctx).getLoggingConfig().minLevel
+        val current = try {
+            LogLevel.valueOf(com.overdrive.app.config.UnifiedConfigManager.getLogLevel())
+        } catch (_: Exception) {
+            ConfigManager.getInstance(ctx).getLoggingConfig().minLevel
+        }
 
         // Seed BEFORE registering the listener: addOnButtonCheckedListener fires on a
         // programmatic check() too, which would re-persist the value and re-schedule the
@@ -140,6 +144,9 @@ class SettingsPrivacyFragment : Fragment() {
             // gate — afterwards the new stricter gate would drop its own audit line.
             LogManager.getInstance().warn(TAG, "Log level changed: ${existing.minLevel} → $chosen")
             cfg.updateLoggingConfig(existing.copy(minLevel = chosen))
+            try {
+                com.overdrive.app.config.UnifiedConfigManager.setLogLevel(chosen.name)
+            } catch (_: Exception) {}
         }
     }
 

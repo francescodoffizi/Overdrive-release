@@ -4,6 +4,22 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Riduzione Rumore di Log, Unificazione LogLevel Demoni & Web API, Soppressione SELinux Audit Storm (`YoloDetector.kt`, `BydDataCollector.java`, `HttpServer.java`, `PanoramicCameraGpu.java`, `SurveillanceEngineGpu.java`, `UnifiedConfigManager.kt`, `DaemonLogger.java`, `SettingsPrivacyFragment.kt`, `QualitySettingsApiHandler.java`, `LogsApiHandler.java`)**:
+  - **Declassamento Polling & Telemetrie Rumorose da INFO a DEBUG**:
+    - `YoloDetector.kt`: `Detected 0 objects: ...` e `YOLO raw funnel` declassati a `logger.debug()` quando nessun oggetto sopravvive ai filtri, mantenendo `logger.info()` solo all'effettivo rilevamento di oggetti.
+    - `BydDataCollector.java`: `diLink5GateLock` ledger inizializzato con `logger::debug` invece di `logger::info`; telemetria `DI5 producer lock diag:` registrata a livello `logger.debug()`.
+    - `HttpServer.java`: escluse dal log INFO le richieste ad alta frequenza di relay tunnel e automazioni (`/api/remote-access/relay`, `/api/automations/list`), azzerando il logging continuo a 0.5-1 Hz.
+    - `PanoramicCameraGpu.java`: telemetria periodica `BS render diag:` declassata da INFO a DEBUG.
+    - `SurveillanceEngineGpu.java`: heartbeat periodico `Surveillance frame #N received` declassato da INFO a DEBUG.
+  - **Soppressione SELinux Audit Storm su `overdrive_config.json.lock` (`UnifiedConfigManager.kt`)**:
+    - Vincolate le chiamate di cambio permessi `lockFile.setReadable/setWritable` e di truncate/owner recording (`recordStableLockOwner`) unicamente all'UID shell daemon (`android.os.Process.myUid() == SHELL_DAEMON_UID`). Questo elimina alla radice la tempesta di violazioni SELinux `setattr` sul file di lock generata dal processo `untrusted_app_25` (`com.overdrive.app`).
+  - **Unificazione Dinamica LogLevel nei Demoni & Sincronizzazione Cross-Process (`UnifiedConfigManager.kt`, `DaemonLogger.java`, `SettingsPrivacyFragment.kt`)**:
+    - Aggiunta la sezione `"logging"` con chiave `"minLevel"` in `UnifiedConfigManager.kt` (`getLogLevel()`, `setLogLevel()`).
+    - `DaemonLogger.java`: implementato `applyConfigFromUnifiedConfig()` e registrato il listener reattivo su `UnifiedConfigManager` per propagare runtime le modifiche del livello minimo di log (DEBUG, INFO, WARN, ERROR) a tutti i demoni in background senza riavvio.
+    - `SettingsPrivacyFragment.kt`: sincronizzato il selettore del livello di log dell'app UI direttamente con `UnifiedConfigManager.setLogLevel()`.
+  - **Esposizione Impostazioni Log Level su Web Dashboard & API REST (`QualitySettingsApiHandler.java`, `LogsApiHandler.java`)**:
+    - Introdotti gli endpoint `GET /api/settings/logging` e `POST /api/settings/logging` (e gli alias `GET /api/logs/level` e `POST /api/logs/level`) per consentire la visualizzazione e la modifica runtime del livello di verbosità dei log direttamente dalla Web Dashboard o via cURL/automazioni remote.
+
 - **Allineamento con Upstream `origin/main` & Risoluzione Conflitti PR**:
   - Eseguito il merge dei commit più recenti di `origin/main` (`ead978a4`).
   - Risolto il conflitto `modify/delete` causato dalla dismissione upstream della cartella `dilink-probe/`.

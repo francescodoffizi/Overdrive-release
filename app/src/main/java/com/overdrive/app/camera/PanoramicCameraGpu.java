@@ -7482,7 +7482,7 @@ public class PanoramicCameraGpu {
                         && (bsDiagFrames > 0 || bsDiagSkipScaler > 0 || bsDiagSkipHidden > 0)) {
                     boolean odReady = false;
                     try { odReady = com.overdrive.app.od.Od.INSTANCE.isReady(); } catch (Throwable ignored) {}
-                    logger.info("BS render diag: drawn=" + bsDiagFrames
+                    logger.debug("BS render diag: drawn=" + bsDiagFrames
                             + " skipNoScaler=" + bsDiagSkipScaler
                             + " skipHidden=" + bsDiagSkipHidden
                             + " camTex=" + cameraTextureId

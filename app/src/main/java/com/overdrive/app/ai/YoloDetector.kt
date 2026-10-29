@@ -895,7 +895,11 @@ class YoloDetector(private val context: Context) {
             }
         }
 
-        logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass)")
+        if (final.isNotEmpty()) {
+            logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass)")
+        } else {
+            logger.debug("Detected 0 objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass)")
+        }
 
         // Raw-funnel line — only when NOTHING survived, which is the case that was
         // previously unattributable. `raw` is the model's true peak before any gate,
@@ -907,7 +911,7 @@ class YoloDetector(private val context: Context) {
         // class-filter mismatch. Emitted at most once per inference and only on the
         // empty path, so it costs nothing in the common case.
         if (final.isEmpty()) {
-            logger.info(("YOLO raw funnel: raw=%.3f class=%d person=%.3f | " +
+            logger.debug(("YOLO raw funnel: raw=%.3f class=%d person=%.3f | " +
                     "rej conf=%d implausible=%d unwanted=%d size=%d | " +
                     "confThr=%.2f minRelH=%.3f in=%dx%d quad=%dx%d")
                 .format(rawPeakConf, rawPeakClass, peakPersonConf,
@@ -1124,10 +1128,14 @@ class YoloDetector(private val context: Context) {
             }
         }
 
-        logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass) [e2e]")
+        if (final.isNotEmpty()) {
+            logger.info("Detected ${final.size} objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass) [e2e]")
+        } else {
+            logger.debug("Detected 0 objects: person=$personCount car=$carCount bike=$bikeCount animal=$animalCount (max_conf=${"%.3f".format(bestKeptConf)} class=$bestKeptClass) [e2e]")
+        }
 
         if (final.isEmpty()) {
-            logger.info(("YOLO raw funnel [e2e]: raw=%.3f class=%d person=%.3f | " +
+            logger.debug(("YOLO raw funnel [e2e]: raw=%.3f class=%d person=%.3f | " +
                     "rej conf=%d implausible=%d unwanted=%d size=%d | " +
                     "confThr=%.2f minRelH=%.3f in=%dx%d quad=%dx%d")
                 .format(rawPeakConf, rawPeakClass, peakPersonConf,

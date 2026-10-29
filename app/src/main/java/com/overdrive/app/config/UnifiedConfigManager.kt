@@ -542,6 +542,10 @@ object UnifiedConfigManager {
         val recording = config.optJSONObject("recording") ?: JSONObject().also {
             config.put("recording", it)
         }
+        val logging = config.optJSONObject("logging") ?: JSONObject().also {
+            config.put("logging", it)
+        }
+        if (!logging.has("minLevel")) logging.put("minLevel", "INFO")
         val streaming = config.optJSONObject("streaming") ?: JSONObject().also {
             config.put("streaming", it)
         }
@@ -2290,6 +2294,37 @@ object UnifiedConfigManager {
     @JvmStatic
     fun getStreaming(): JSONObject {
         return loadConfig().optJSONObject("streaming") ?: JSONObject()
+    }
+
+    /**
+     * Get logging config section.
+     */
+    @JvmStatic
+    fun getLogging(): JSONObject {
+        return loadConfig().optJSONObject("logging") ?: JSONObject()
+    }
+
+    /**
+     * Get the active minimum log level (DEBUG, INFO, WARN, ERROR). Defaults to INFO.
+     */
+    @JvmStatic
+    fun getLogLevel(): String {
+        return getLogging().optString("minLevel", "INFO").uppercase()
+    }
+
+    /**
+     * Persist the active minimum log level across all processes and daemons.
+     */
+    @JvmStatic
+    fun setLogLevel(level: String): Boolean {
+        val canonical = when (level.uppercase()) {
+            "DEBUG" -> "DEBUG"
+            "INFO" -> "INFO"
+            "WARN" -> "WARN"
+            "ERROR" -> "ERROR"
+            else -> "INFO"
+        }
+        return updateValues("logging", mapOf("minLevel" to canonical))
     }
 
     /** Blind Spot overlay config section: {enabled, rearFov, sideFov, yaw, roll,
@@ -4518,7 +4553,9 @@ object UnifiedConfigManager {
 
     // Diagnostics only: SELinux denies /proc/locks to the shell and app domains,
     // so the holder leaves its identity in the (otherwise empty) lock file.
+    // Untrusted app cannot truncate shell_data_file without triggering an SELinux setattr denial.
     private fun recordStableLockOwner(channel: FileChannel) {
+        if (android.os.Process.myUid() != SHELL_DAEMON_UID) return
         try {
             val record = ("pid=${android.os.Process.myPid()} uid=${android.os.Process.myUid()} " +
                 "thread=${Thread.currentThread().name} since=${System.currentTimeMillis()} " +
@@ -4622,11 +4659,13 @@ object UnifiedConfigManager {
                         minOf(deadline, SystemClock.elapsedRealtime() + lockWaitMs())
                     )
                     if (lock != null) {
-                        try {
-                            lockFile.setReadable(true, false)
-                            lockFile.setWritable(true, false)
-                        } catch (_: Exception) {}
-                        recordStableLockOwner(channel)
+                        if (android.os.Process.myUid() == SHELL_DAEMON_UID) {
+                            try {
+                                lockFile.setReadable(true, false)
+                                lockFile.setWritable(true, false)
+                            } catch (_: Exception) {}
+                            recordStableLockOwner(channel)
+                        }
                     }
                 } catch (e: Exception) {
                     throw ConfigLockUnavailableException(

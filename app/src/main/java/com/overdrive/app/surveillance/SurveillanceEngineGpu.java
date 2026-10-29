@@ -2398,7 +2398,7 @@ public class SurveillanceEngineGpu {
             
             // Log frame count every 100 frames to confirm frames are arriving
             if (frameCount % 100 == 0) {
-                logger.info("Surveillance frame #" + frameCount + " received");
+                logger.debug("Surveillance frame #" + frameCount + " received");
             }
             
             // MOTION THROTTLING: Skip frames to achieve 10 FPS (saves 66% CPU)
