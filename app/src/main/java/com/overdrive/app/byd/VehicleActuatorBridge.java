@@ -738,23 +738,7 @@ public final class VehicleActuatorBridge {
         try {
             android.content.ComponentName started = null;
             Throwable directFailure = null;
-            try {
-                started = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O
-                        ? startContext.startForegroundService(intent)
-                        : startContext.startService(intent);
-                if (started != null) serviceMayOwnRequest.set(true);
-            } catch (Throwable directStart) {
-                directFailure = directStart;
-                if (!isDefiniteServiceStartRejection(directStart)) serviceMayOwnRequest.set(true);
-            }
-            if (started == null) {
-                if (genericFrameCommand && serviceMayOwnRequest.get()) {
-                    cancellation.cancel();
-                    RemoteKeyControl.noteAbort(new LocalActuationAbort(
-                            LocalActuationAbort.Kind.REQUEST_EXPIRED,
-                            "vehicle request ownership uncertain after launch"));
-                    return null;
-                }
+            if (android.os.Process.myUid() == ANDROID_SHELL_UID) {
                 // Field evidence (on-car log, 16:05): AMS rejects the daemon's
                 // synthetic-context start with "Unable to find app for caller
                 // ... when starting service" — the forged IApplicationThread
@@ -767,17 +751,52 @@ public final class VehicleActuatorBridge {
                 started = startDiLink5ServiceAsShell(startContext, intent);
                 if (Boolean.TRUE.equals(SHELL_START_UNCERTAIN.get())) serviceMayOwnRequest.set(true);
                 SHELL_START_UNCERTAIN.remove();
-                if (started != null) serviceMayOwnRequest.set(true);
                 if (started != null) {
+                    serviceMayOwnRequest.set(true);
                     if (!diLink5ShellStartLogged) {
                         diLink5ShellStartLogged = true;
                         logger.info("DI5 app-process vehicle request started via "
                                 + "shell-identity ActivityManager fallback");
                     }
-                } else if (directFailure != null) {
-                    diLink5ShellStartLogged = false;
-                    logger.warn("DI5 app-process vehicle request failed: "
-                            + directFailure.getMessage());
+                }
+            } else {
+                try {
+                    started = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O
+                            ? startContext.startForegroundService(intent)
+                            : startContext.startService(intent);
+                    if (started != null) serviceMayOwnRequest.set(true);
+                } catch (Throwable directStart) {
+                    directFailure = directStart;
+                    if (!isDefiniteServiceStartRejection(directStart)) serviceMayOwnRequest.set(true);
+                }
+            }
+            if (started == null) {
+                if (genericFrameCommand && serviceMayOwnRequest.get()) {
+                    cancellation.cancel();
+                    RemoteKeyControl.noteAbort(new LocalActuationAbort(
+                            LocalActuationAbort.Kind.REQUEST_EXPIRED,
+                            "vehicle request ownership uncertain after launch"));
+                    return null;
+                }
+                if (android.os.Process.myUid() != ANDROID_SHELL_UID) {
+                    started = startDiLink5ServiceAsShell(startContext, intent);
+                    if (Boolean.TRUE.equals(SHELL_START_UNCERTAIN.get())) serviceMayOwnRequest.set(true);
+                    SHELL_START_UNCERTAIN.remove();
+                    if (started != null) serviceMayOwnRequest.set(true);
+                    if (started != null) {
+                        if (!diLink5ShellStartLogged) {
+                            diLink5ShellStartLogged = true;
+                            logger.info("DI5 app-process vehicle request started via "
+                                    + "shell-identity ActivityManager fallback");
+                        }
+                    }
+                }
+                if (started == null) {
+                    if (directFailure != null) {
+                        diLink5ShellStartLogged = false;
+                        logger.warn("DI5 app-process vehicle request failed: "
+                                + directFailure.getMessage());
+                    }
                     if (genericFrameCommand && serviceMayOwnRequest.get()) {
                         cancellation.cancel();
                         RemoteKeyControl.noteAbort(new LocalActuationAbort(
@@ -825,8 +844,15 @@ public final class VehicleActuatorBridge {
 
     private static boolean isDefiniteServiceStartRejection(Throwable failure) {
         Throwable cause = failure.getCause() != null ? failure.getCause() : failure;
-        return cause instanceof SecurityException || cause instanceof IllegalArgumentException
-                || cause instanceof IllegalStateException || cause instanceof NoSuchMethodException;
+        if (cause instanceof SecurityException || cause instanceof IllegalArgumentException
+                || cause instanceof IllegalStateException || cause instanceof NoSuchMethodException
+                || cause instanceof android.os.RemoteException || cause instanceof android.os.DeadObjectException) {
+            return true;
+        }
+        String msg = cause.getMessage();
+        return msg != null && (msg.contains("Unable to find app for caller")
+                || msg.contains("not allowed to start service")
+                || msg.contains("requires permission"));
     }
 
     /**

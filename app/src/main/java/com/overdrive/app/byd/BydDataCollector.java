@@ -23780,6 +23780,9 @@ public class BydDataCollector {
             int rawOperationMode,
             int roadSurfaceMode,
             int targetDrivingMode) {
+        if (com.overdrive.app.camera.dilink5.DiLink5Platform.isSelected()) {
+            return rawOperationMode == setterMode;
+        }
         // This head unit reports the same live operation value for Normal and Eco. A successful
         // Normal setter followed by that shared value is the strongest acknowledgement available.
         if (setterMode == 3
@@ -23869,6 +23872,9 @@ public class BydDataCollector {
      * The SDK remaps these setter values onto a different getter axis.
      */
     static int energyOperationModeForDriveConfig(int configMode) {
+        if (com.overdrive.app.camera.dilink5.DiLink5Platform.isSelected()) {
+            return configMode >= 1 && configMode <= 4 ? configMode : -1;
+        }
         switch (configMode) {
             case 1: return 3; // ENERGY_OPERATION_NORMAL
             case 2: return 1; // ENERGY_OPERATION_ECONOMY
@@ -24211,6 +24217,14 @@ public class BydDataCollector {
     static int driveModeFromEnergyAxis(
             int rawOperationMode, int roadSurfaceMode, int targetDrivingMode) {
         if (roadSurfaceMode == 2 || rawOperationMode == 4) return 4;
+        if (com.overdrive.app.camera.dilink5.DiLink5Platform.isSelected()) {
+            switch (rawOperationMode) {
+                case 1: return 1; // NORMAL
+                case 2: return 2; // ECO
+                case 3: return 3; // SPORT
+                default: return -1;
+            }
+        }
         switch (rawOperationMode) {
             case 1: return targetDrivingMode == 3 ? 1 : 2; // NORMAL or ECO
             case 2: return 3; // SPORT

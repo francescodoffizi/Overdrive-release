@@ -4,6 +4,14 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Fix Attuazione Comandi Remoti Generici su DiLink 5 / 100 Headless Daemon (`VehicleActuatorBridge.java`)**:
+  - Risolto il rifiuto immediato dei comandi con frame generico (`FlashLightsCommand`, `FindCarCommand`, `VehiclePowerOnCommand`, `VehiclePowerOffCommand`) inviati via API/Cloudflare: il demone headless (UID 2000 `shell`) invoca ora prioritariamente `startDiLink5ServiceAsShell` con identità shell tramite reflection su `IActivityManager.startService`, evitando il fallimento sistematico del contesto sintetico su AMS.
+  - Rafforzato `isDefiniteServiceStartRejection` per trattare come rifiuto definitivo gli errori IPC Binder (`RemoteException`, `DeadObjectException`) ed eccezioni AMS `"Unable to find app for caller"`, impedendo che `serviceMayOwnRequest` venga erroneamente marcato come attivo e causi l'abort prematuro `"vehicle request ownership uncertain after launch"`.
+
+- **Fix Mappatura Modalità di Guida (Sport/Normal/Eco) su DiLink 5.0 / Sealion 7 (`BydDataCollector.java`)**:
+  - Corretta la permutazione ciclica delle modalità di guida su DiLink 5.0: sui veicoli legacy (DiLink 3/4) l'enum HAL `setOperationMode` utilizzava `1=Eco, 2=Sport, 3=Normal`, mentre sui veicoli DiLink 5.0 (BYD Sealion 7) l'enum è stato normalizzato a `1=Normal, 2=Eco, 3=Sport, 4=Snow`.
+  - Allineati `energyOperationModeForDriveConfig`, `driveModeFromEnergyAxis` e `operationModeMatchesSetter` per applicare la mappatura diretta 1:1 su piattaforma DiLink 5, risolvendo l'inversione nelle automazioni dove Sport attivava Eco, Normal attivava Sport ed Eco attivava Normal.
+
 - **Allineamento con Upstream `origin/main` & Risoluzione Conflitti PR**:
   - Eseguito il merge dei commit più recenti di `origin/main` (`ead978a4`).
   - Risolto il conflitto `modify/delete` causato dalla dismissione upstream della cartella `dilink-probe/`.
