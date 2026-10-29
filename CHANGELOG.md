@@ -4,6 +4,11 @@ Tutte le modifiche e gli sviluppi in corso vengono tracciati in questo file e ve
 
 ## [In corso / Unreleased]
 
+- **Rafforzamento Stabilità Demoni & Scoped Storage (`AccSentryDaemon.java`, `BatteryPowerMonitor.java`, `DaemonParkingEnvironment.java`, `ParkingSnapshotter.java`)**:
+  - Risolto il fallimento per assenza di Looper su `BYDAutoPowerDevice`: garantita l'inizializzazione del Looper locale nel worker thread prima dell'istanziazione del dispositivo hardware BYD, eliminando l'eccezione `Looper.mQueue on null object reference`.
+  - Inibito il tentativo di binding del servizio OTA TS (`OtaTsUpdateService`) nei demoni headless su DiLink 5, evitando il ciclo infinito di fallimento per assenza di `ProcessRecord` in AMS (`Unable to find app for caller`).
+  - Aggiunta la creazione automatica del marker `.nomedia` nella directory delle istantanee di parcheggio (`/storage/emulated/0/Overdrive/parking/`), prevenendo i warning di aggiornamento database da parte di Android MediaProvider durante la scrittura atomica dei frame.
+
 - **Supporto Controllo & Telemetria Speed Limit Warning (ISLA/SLW) su DiLink 5.0 / DiPilot (`BydDataCollector.java`)**:
   - Implementato l'instradamento del controllo `setSpeedLimitWarning` e `setSpeedLimitControl` su `BYDAutoDiPilotDevice` per i veicoli DiLink 5 (BYD Sealion 7), superando il precedente rifiuto esplicito `setAdasFeature: not supported on DiLink 5`.
   - Configurato il fallback prioritario su CAN frame `2B4` (`setIntelligentSpeedLimitAlert2B4State` / `getIntelligentSpeedLimitAlert2B4State`), variante calibrata e verificata attiva su Sealion 7, con fallback su `setIntelligentSpeedLimitAlertState`, variante `2D5` e `setTSRLitSpdChgSwitchState`.

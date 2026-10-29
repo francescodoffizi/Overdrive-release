@@ -322,6 +322,10 @@ public final class DaemonParkingEnvironment implements ParkingEnvironment {
             // Other UIDs (Telegram bot daemon) read the stills: keep the tree traversable.
             try { d.setReadable(true, false); d.setExecutable(true, false); } catch (Throwable ignored) {}
         }
+        File nomedia = new File(d, ".nomedia");
+        if (!nomedia.exists()) {
+            try { nomedia.createNewFile(); } catch (Throwable ignored) {}
+        }
         return d;
     }
 

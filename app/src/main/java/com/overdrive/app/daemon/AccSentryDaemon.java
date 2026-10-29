@@ -270,9 +270,17 @@ public class AccSentryDaemon {
      * Get or create the cached BYDAutoPowerDevice instance.
      * Uses PermissionBypassContext for BYD hardware access.
      */
-    private static BYDAutoPowerDevice getPowerDevice() {
+    private static synchronized BYDAutoPowerDevice getPowerDevice() {
         if (cachedPowerDevice != null) return cachedPowerDevice;
         if (appContext == null) return null;
+
+        try {
+            if (Looper.myLooper() == null) {
+                Looper.prepare();
+            }
+        } catch (Throwable ignored) {
+            // Already prepared or cannot prepare on this thread
+        }
 
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
